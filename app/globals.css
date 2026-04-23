@@ -162,6 +162,49 @@ h1 {
   line-height: 1.65;
 }
 
+/* Select */
+
+.select-wrap {
+  position: relative;
+}
+
+.select-wrap::after {
+  content: "";
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--ash);
+}
+
+.select {
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--black);
+  border: 1px solid var(--rule-light);
+  color: var(--bone);
+  padding: 12px 36px 12px 14px;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.select:focus {
+  outline: none;
+  border-color: var(--rose);
+}
+
+.select option {
+  background: var(--black);
+  color: var(--bone);
+}
+
 /* Toggles */
 
 .toggle-list {

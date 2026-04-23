@@ -55,6 +55,7 @@ export async function POST(request: Request): Promise<Response> {
   let payload: {
     title?: unknown;
     text?: unknown;
+    voiceId?: unknown;
     singlePassMode?: unknown;
     fallbackChunkingOnFailure?: unknown;
     debugForceSinglePassFailure?: unknown;
@@ -64,6 +65,7 @@ export async function POST(request: Request): Promise<Response> {
     payload = (await request.json()) as {
       title?: unknown;
       text?: unknown;
+      voiceId?: unknown;
       singlePassMode?: unknown;
       fallbackChunkingOnFailure?: unknown;
       debugForceSinglePassFailure?: unknown;
@@ -74,6 +76,10 @@ export async function POST(request: Request): Promise<Response> {
 
   const title = typeof payload.title === "string" ? payload.title : "";
   const text = typeof payload.text === "string" ? payload.text : "";
+  const voiceId =
+    typeof payload.voiceId === "string" && payload.voiceId.trim()
+      ? payload.voiceId.trim()
+      : (process.env.MISTRAL_VOICE_ID ?? "");
   const singlePassMode = payload.singlePassMode !== false;
   const fallbackChunkingOnFailure = payload.fallbackChunkingOnFailure !== false;
   const debugForceSinglePassFailure = payload.debugForceSinglePassFailure === true;
@@ -84,6 +90,7 @@ export async function POST(request: Request): Promise<Response> {
         controller,
         title,
         text,
+        voiceId,
         singlePassMode,
         fallbackChunkingOnFailure,
         debugForceSinglePassFailure
@@ -104,6 +111,7 @@ async function runGeneration({
   controller,
   title,
   text,
+  voiceId,
   singlePassMode,
   fallbackChunkingOnFailure,
   debugForceSinglePassFailure
@@ -111,6 +119,7 @@ async function runGeneration({
   controller: ReadableStreamDefaultController<Uint8Array>;
   title: string;
   text: string;
+  voiceId: string;
   singlePassMode: boolean;
   fallbackChunkingOnFailure: boolean;
   debugForceSinglePassFailure: boolean;
@@ -153,6 +162,7 @@ async function runGeneration({
       try {
         const audioBuffer = await generateSinglePassSpeech({
           input: cleanedText,
+          voiceId,
           debugForceSinglePassFailure
         });
 
@@ -194,6 +204,7 @@ async function runGeneration({
 
     const chunkedResult = await generateChunkedSpeech({
       cleanedText,
+      voiceId,
       sendEvent
     });
 
@@ -231,21 +242,18 @@ async function runGeneration({
 }
 
 function validateEnvironment(): void {
-  const missingVariables = [
-    !process.env.MISTRAL_API_KEY ? "MISTRAL_API_KEY" : null,
-    !process.env.MISTRAL_VOICE_ID ? "MISTRAL_VOICE_ID" : null
-  ].filter(Boolean);
-
-  if (missingVariables.length > 0) {
-    throw new Error(`Missing required env vars: ${missingVariables.join(", ")}`);
+  if (!process.env.MISTRAL_API_KEY) {
+    throw new Error("Missing required env var: MISTRAL_API_KEY");
   }
 }
 
 async function generateSinglePassSpeech({
   input,
+  voiceId,
   debugForceSinglePassFailure
 }: {
   input: string;
+  voiceId: string;
   debugForceSinglePassFailure: boolean;
 }): Promise<Buffer> {
   if (debugForceSinglePassFailure) {
@@ -266,7 +274,7 @@ async function generateSinglePassSpeech({
       body: JSON.stringify({
         model: MISTRAL_MODEL,
         input,
-        voice_id: process.env.MISTRAL_VOICE_ID,
+        voice_id: voiceId,
         response_format: "mp3",
         stream: false
       }),
@@ -307,9 +315,11 @@ async function generateSinglePassSpeech({
 
 async function generateChunkedSpeech({
   cleanedText,
+  voiceId,
   sendEvent
 }: {
   cleanedText: string;
+  voiceId: string;
   sendEvent: (event: StreamEvent) => void;
 }): Promise<{
   audioBase64: string;
@@ -349,6 +359,7 @@ async function generateChunkedSpeech({
 
       const audioBuffer = await generateChunkSpeech({
         input: chunks[index].text,
+        voiceId,
         chunkNumber,
         totalChunks: chunks.length
       });
@@ -421,10 +432,12 @@ async function assertFfmpegAvailable(): Promise<void> {
 
 async function generateChunkSpeech({
   input,
+  voiceId,
   chunkNumber,
   totalChunks
 }: {
   input: string;
+  voiceId: string;
   chunkNumber: number;
   totalChunks: number;
 }): Promise<Buffer> {
@@ -440,7 +453,7 @@ async function generateChunkSpeech({
       body: JSON.stringify({
         model: MISTRAL_MODEL,
         input,
-        voice_id: process.env.MISTRAL_VOICE_ID,
+        voice_id: voiceId,
         response_format: "mp3",
         stream: false
       }),

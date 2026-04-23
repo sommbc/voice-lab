@@ -2,6 +2,22 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 
+const VOICES = [
+  { name: "Brandon",             id: "29511880-fc64-4d77-af2f-59ea3eb3efb1" },
+  { name: "Paul — Neutral",      id: "c69964a6-ab8b-4f8a-9465-ec0925096ec8" },
+  { name: "Paul — Confident",    id: "98559b22-62b5-4a64-a7cd-fc78ca41faa8" },
+  { name: "Paul — Cheerful",     id: "01d985cd-5e0c-4457-bfd8-80ba31a5bc03" },
+  { name: "Oliver — Neutral",    id: "e3596645-b1af-469e-b857-f18ddedc7652" },
+  { name: "Oliver — Confident",  id: "8169ab87-bc99-4669-a5ec-6855860ace24" },
+  { name: "Oliver — Curious",    id: "390c8a2b-60a6-4882-8437-c49a8bd33b63" },
+  { name: "Jane — Neutral",      id: "82c99ee6-f932-423f-a4a3-d403c8914b8d" },
+  { name: "Jane — Confident",    id: "cbe96cf0-85ec-4a10-accb-0b35c93b6dfd" },
+  { name: "Jane — Curious",      id: "5de47977-6e47-4266-a938-3bc1d76b4676" },
+];
+
+const DEFAULT_VOICE_ID = "29511880-fc64-4d77-af2f-59ea3eb3efb1";
+const VOICE_STORAGE_KEY = "voiceover-selected-voice-id";
+
 type ProgressEvent = {
   type: "progress";
   stage: "cleaning" | "single-pass" | "chunking" | "generating" | "merging" | "done";
@@ -29,6 +45,7 @@ type StreamEvent = ProgressEvent | ErrorEvent | CompleteEvent;
 export default function HomePage() {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
+  const [voiceId, setVoiceId] = useState(DEFAULT_VOICE_ID);
   const [singlePassMode, setSinglePassMode] = useState(true);
   const [fallbackChunkingOnFailure, setFallbackChunkingOnFailure] = useState(true);
   const [statusMessage, setStatusMessage] = useState("");
@@ -40,12 +57,24 @@ export default function HomePage() {
   const downloadUrlRef = useRef<string>("");
 
   useEffect(() => {
+    const stored = localStorage.getItem(VOICE_STORAGE_KEY);
+    if (stored && VOICES.some((v) => v.id === stored)) {
+      setVoiceId(stored);
+    }
+  }, []);
+
+  useEffect(() => {
     return () => {
       if (downloadUrlRef.current) {
         URL.revokeObjectURL(downloadUrlRef.current);
       }
     };
   }, []);
+
+  function handleVoiceChange(id: string) {
+    setVoiceId(id);
+    localStorage.setItem(VOICE_STORAGE_KEY, id);
+  }
 
   function handleReset() {
     if (downloadUrlRef.current) {
@@ -92,6 +121,7 @@ export default function HomePage() {
         body: JSON.stringify({
           title,
           text,
+          voiceId,
           singlePassMode,
           fallbackChunkingOnFailure,
         }),
@@ -201,6 +231,21 @@ export default function HomePage() {
                   value={title}
                   onChange={(event) => setTitle(event.target.value)}
                 />
+              </label>
+
+              <label className="field-label">
+                <span className="field-name">Voice</span>
+                <div className="select-wrap">
+                  <select
+                    className="select"
+                    value={voiceId}
+                    onChange={(e) => handleVoiceChange(e.target.value)}
+                  >
+                    {VOICES.map((v) => (
+                      <option key={v.id} value={v.id}>{v.name}</option>
+                    ))}
+                  </select>
+                </div>
               </label>
 
               <div className="toggle-list">
