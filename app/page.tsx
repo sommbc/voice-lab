@@ -26,14 +26,12 @@ type CompleteEvent = {
 
 type StreamEvent = ProgressEvent | ErrorEvent | CompleteEvent;
 
-const DEFAULT_STATUS = "Paste text, then generate one MP3. Single-pass mode is the default.";
-
 export default function HomePage() {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
   const [singlePassMode, setSinglePassMode] = useState(true);
   const [fallbackChunkingOnFailure, setFallbackChunkingOnFailure] = useState(true);
-  const [statusMessage, setStatusMessage] = useState(DEFAULT_STATUS);
+  const [statusMessage, setStatusMessage] = useState("");
   const [statusDetail, setStatusDetail] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
@@ -49,11 +47,27 @@ export default function HomePage() {
     };
   }, []);
 
+  function handleReset() {
+    if (downloadUrlRef.current) {
+      URL.revokeObjectURL(downloadUrlRef.current);
+      downloadUrlRef.current = "";
+    }
+    setTitle("");
+    setText("");
+    setSinglePassMode(true);
+    setFallbackChunkingOnFailure(true);
+    setDownloadUrl("");
+    setDownloadFilename("");
+    setErrorMessage("");
+    setStatusMessage("");
+    setStatusDetail("");
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     if (!text.trim()) {
-      setErrorMessage("Paste some text before generating audio.");
+      setErrorMessage("Paste some text first.");
       return;
     }
 
@@ -73,14 +87,14 @@ export default function HomePage() {
       const response = await fetch("/api/generate", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({
           title,
           text,
           singlePassMode,
-          fallbackChunkingOnFailure
-        })
+          fallbackChunkingOnFailure,
+        }),
       });
 
       if (!response.ok) {
@@ -89,7 +103,7 @@ export default function HomePage() {
       }
 
       if (!response.body) {
-        throw new Error("The server returned no response body.");
+        throw new Error("Server returned no response body.");
       }
 
       const reader = response.body.getReader();
@@ -123,7 +137,7 @@ export default function HomePage() {
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Generation failed.");
       setStatusDetail("");
-      setStatusMessage(DEFAULT_STATUS);
+      setStatusMessage("");
     } finally {
       setIsGenerating(false);
     }
@@ -138,7 +152,7 @@ export default function HomePage() {
       setStatusMessage(event.message);
 
       if (event.stage === "generating" && event.currentChunk && event.totalChunks) {
-        setStatusDetail(`Chunk ${event.currentChunk} of ${event.totalChunks}`);
+        setStatusDetail(`chunk ${event.currentChunk} of ${event.totalChunks}`);
       } else {
         setStatusDetail("");
       }
@@ -164,30 +178,26 @@ export default function HomePage() {
     anchor.click();
   }
 
+  const showStatus = isGenerating || !!statusMessage;
+
   return (
     <main className="page">
       <div className="stack">
-        <header className="panel stack">
-          <div>
-            <h1 style={{ margin: 0, fontSize: "2rem" }}>Voiceover</h1>
-            <p className="meta" style={{ marginBottom: 0 }}>
-              Paste long-form text, generate one MP3 with your saved Mistral voice, and download it.
-            </p>
-          </div>
-          <div className="meta">
-            Required env vars: <code>MISTRAL_API_KEY</code> and <code>MISTRAL_VOICE_ID</code>.
-          </div>
+        <header className="header">
+          <p className="sec-label">Private Tool</p>
+          <h1>Voiceover</h1>
+          <p className="subtitle">Paste text. Get an MP3.</p>
         </header>
 
         <form className="stack" onSubmit={handleSubmit}>
-          <div className="panel row">
-            <div className="stack">
-              <label className="label">
-                Optional title
+          <div className="row">
+            <div className="card stack">
+              <label className="field-label">
+                <span className="field-name">File name</span>
                 <input
                   className="input"
                   name="title"
-                  placeholder="substack-post"
+                  placeholder="my-article"
                   value={title}
                   onChange={(event) => setTitle(event.target.value)}
                 />
@@ -201,10 +211,8 @@ export default function HomePage() {
                     type="checkbox"
                   />
                   <span>
-                    Single pass mode
-                    <span className="toggle-note">
-                      Try one full cleaned document request first.
-                    </span>
+                    <span className="toggle-text">Single pass</span>
+                    <span className="toggle-note">Full document in one request.</span>
                   </span>
                 </label>
 
@@ -216,22 +224,22 @@ export default function HomePage() {
                     type="checkbox"
                   />
                   <span>
-                    Fallback chunking on failure
+                    <span className="toggle-text">Chunk on failure</span>
                     <span className="toggle-note">
-                      If single-pass fails in a chunking-worthy way, split and merge automatically.
+                      Split and merge if single-pass hits limits.
                     </span>
                   </span>
                 </label>
               </div>
             </div>
 
-            <div className="stack">
-              <label className="label">
-                Text to speak
+            <div className="card">
+              <label className="field-label">
+                <span className="field-name">Text</span>
                 <textarea
                   className="textarea"
                   name="text"
-                  placeholder="Paste markdown or plain text here"
+                  placeholder="Paste markdown or plain text."
                   value={text}
                   onChange={(event) => setText(event.target.value)}
                 />
@@ -239,41 +247,48 @@ export default function HomePage() {
             </div>
           </div>
 
-          <div className="panel stack">
+          <div className="controls">
             <div className="actions">
-              <button className="button" disabled={isGenerating} type="submit">
-                {isGenerating ? "Generating..." : "Generate MP3"}
+              <button className="btn-primary" disabled={isGenerating} type="submit">
+                {isGenerating ? "Generating..." : "Generate"}
               </button>
-              <span className="meta">
-                Default path: one cleaned full-document TTS request. If that fails and fallback is on,
-                the server chunks and merges automatically.
-              </span>
             </div>
 
-            <div className="status">
-              <strong>Status:</strong> {statusMessage}
-              {statusDetail ? ` (${statusDetail})` : ""}
-            </div>
+            {showStatus && (
+              <div className="status-box">
+                <div className="status-label">Status</div>
+                <div className="status-message">
+                  {statusMessage}
+                  {statusDetail ? ` — ${statusDetail}` : ""}
+                </div>
+              </div>
+            )}
 
-            {errorMessage ? (
-              <div className="error">
+            {errorMessage && (
+              <div className="error-box">
                 <strong>Error:</strong> {errorMessage}
               </div>
-            ) : null}
+            )}
 
-            {downloadUrl ? (
-              <div className="download stack">
-                <div>
-                  <strong>Ready:</strong> {downloadFilename}
-                </div>
+            {downloadUrl && (
+              <div className="output-box">
+                <div className="output-file">{downloadFilename}</div>
                 <div className="actions">
-                  <a className="button" href={downloadUrl} download={downloadFilename}>
-                    Download MP3
+                  <a className="btn-primary" href={downloadUrl} download={downloadFilename}>
+                    Download
                   </a>
-                  <audio controls preload="metadata" src={downloadUrl} />
+                  <audio
+                    className="audio-player"
+                    controls
+                    preload="metadata"
+                    src={downloadUrl}
+                  />
+                  <button className="btn-secondary" type="button" onClick={handleReset}>
+                    New Transcription
+                  </button>
                 </div>
               </div>
-            ) : null}
+            )}
           </div>
         </form>
       </div>
@@ -283,24 +298,22 @@ export default function HomePage() {
 
 function buildCompletionDetail(event: CompleteEvent): string {
   if (event.mode === "single-pass") {
-    return "Used single-pass mode";
+    return "single-pass";
   }
 
   if (event.totalChunks === 1) {
-    return `Used ${event.usedFallbackChunking ? "fallback chunk" : "chunk"} mode with 1 chunk`;
+    return `${event.usedFallbackChunking ? "fallback, " : ""}1 chunk`;
   }
 
-  return `Used ${
-    event.usedFallbackChunking ? "fallback chunk" : "chunk"
-  } mode with ${event.totalChunks} merged chunks`;
+  return `${event.usedFallbackChunking ? "fallback, " : ""}${event.totalChunks} chunks merged`;
 }
 
 async function readErrorResponse(response: Response): Promise<string> {
   try {
     const data = (await response.json()) as { error?: string };
-    return data.error || `Request failed with ${response.status}.`;
+    return data.error ?? `Request failed with status ${response.status}.`;
   } catch {
-    return `Request failed with ${response.status}.`;
+    return `Request failed with status ${response.status}.`;
   }
 }
 
@@ -308,8 +321,8 @@ function decodeBase64(base64: string): Uint8Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
 
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
   }
 
   return bytes;
