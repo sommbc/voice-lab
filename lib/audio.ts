@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import ffmpegStatic from "ffmpeg-static";
 
 export type OutputFormat = "mp3" | "wav";
 
@@ -12,9 +11,15 @@ export const FFMPEG_MISSING_MESSAGE =
   "ffmpeg is required for narration segmentation and normalization, but no usable binary was found. Install ffmpeg locally (`brew install ffmpeg`) or set FFMPEG_PATH.";
 
 const MP3_BITRATE = "192k";
+const PACKAGED_FFMPEG_EXECUTABLE = path.join(
+  process.cwd(),
+  "node_modules",
+  "ffmpeg-static",
+  `ffmpeg${process.platform === "win32" ? ".exe" : ""}`
+);
 const FFMPEG_CANDIDATES = [
   process.env.FFMPEG_PATH?.trim(),
-  ffmpegStatic ?? undefined,
+  PACKAGED_FFMPEG_EXECUTABLE,
   "ffmpeg"
 ].filter((value): value is string => Boolean(value));
 
