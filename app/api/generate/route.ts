@@ -797,35 +797,7 @@ async function generateSegmentedSpeech({
       );
 
       await writeFile(rawSegmentPath, audioBuffer);
-
-      if (!normalizationEnabled) {
-        segmentPaths.push(rawSegmentPath);
-        continue;
-      }
-
-      const normalizedSegmentPath = path.join(
-        tempDirectoryPath,
-        `segment-${String(segmentNumber).padStart(3, "0")}-normalized.wav`
-      );
-
-      try {
-        await transcodeAudioFile({
-          inputPath: rawSegmentPath,
-          outputPath: normalizedSegmentPath,
-          outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
-          applyLoudnorm: true,
-          volumeBoost: "normal",
-          sampleRate: STANDARD_INTERMEDIATE_SAMPLE_RATE,
-          channels: STANDARD_INTERMEDIATE_CHANNELS,
-          stage: "segment-normalization"
-        });
-      } catch (error) {
-        throw new Error(
-          `Segment ${segmentNumber} of ${segments.length} normalization failed: ${extractErrorReason(error)}`
-        );
-      }
-
-      segmentPaths.push(normalizedSegmentPath);
+      segmentPaths.push(rawSegmentPath);
     }
 
     const joinReadyPaths = await prepareSegmentsForJoinSmoothing({

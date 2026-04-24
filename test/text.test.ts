@@ -4,11 +4,13 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
+  buildLinearMasteringFilter,
   buildMergeArgs,
   buildMasteringFilter,
   buildTranscodeArgs,
   LOUDNORM_FILTER,
   TRIM_SILENCE_FILTER,
+  VOLUME_BOOST_SETTINGS,
   summarizeFfmpegStderr
 } from "../lib/audio";
 import { chunkText, prepareTextForSpeech } from "../lib/text";
@@ -114,6 +116,26 @@ test("audio command helpers expose the mastering path and correction gain hook",
   assert.ok(mergeArgs.includes("copy"));
   assert.ok(mergeReencodeArgs.includes("libmp3lame"));
   assert.ok(mergeReencodeArgs.includes("192k"));
+});
+
+test("linear mastering filter embeds the measured loudness stats and requests linear mode", () => {
+  const filter = buildLinearMasteringFilter(VOLUME_BOOST_SETTINGS.louder, {
+    input_i: "-23.17",
+    input_tp: "-4.52",
+    input_lra: "9.80",
+    input_thresh: "-33.42",
+    target_offset: "0.21"
+  });
+
+  assert.match(filter, /^loudnorm=I=-14:TP=-1:LRA=11:/);
+  assert.match(filter, /measured_I=-23\.17/);
+  assert.match(filter, /measured_TP=-4\.52/);
+  assert.match(filter, /measured_LRA=9\.80/);
+  assert.match(filter, /measured_thresh=-33\.42/);
+  assert.match(filter, /offset=0\.21/);
+  assert.match(filter, /linear=true/);
+  assert.match(filter, /print_format=json/);
+  assert.match(filter, /,alimiter=limit=[0-9.]+:level=disabled$/);
 });
 
 test("ffmpeg stderr summarizer strips banners and keeps actionable lines", () => {

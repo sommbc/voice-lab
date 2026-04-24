@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { open, rename, rm, stat, writeFile } from "node:fs/promises";
+import { open, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export type OutputFormat = "mp3" | "wav";
@@ -19,8 +19,25 @@ type LoudnessSettings = {
   integratedLoudness: number;
   truePeak: number;
   limiter: number;
-  maxCorrectionGainDb: number;
-  targetToleranceLufs: number;
+};
+
+type LoudnormMeasurement = {
+  input_i: string;
+  input_tp: string;
+  input_lra: string;
+  input_thresh: string;
+  target_offset: string;
+};
+
+type LoudnormStats = {
+  input_i?: string;
+  input_tp?: string;
+  input_lra?: string;
+  input_thresh?: string;
+  target_offset?: string;
+  output_i?: string;
+  output_tp?: string;
+  normalization_type?: string;
 };
 
 export type AudioLoudnessMetrics = {
@@ -31,9 +48,9 @@ export type AudioLoudnessMetrics = {
 };
 
 export type AudioMasteringResult = {
-  attempts: number;
-  correctionGainDb: number;
   metrics: AudioLoudnessMetrics | null;
+  normalizationType: "linear" | "dynamic" | null;
+  linear: boolean;
 };
 
 export const DEFAULT_OUTPUT_FORMAT: OutputFormat = "mp3";
@@ -86,23 +103,17 @@ export const VOLUME_BOOST_SETTINGS: Record<VolumeBoost, LoudnessSettings> = {
   normal: {
     integratedLoudness: -16,
     truePeak: -1.5,
-    limiter: getLimiterLimit(-1.5),
-    maxCorrectionGainDb: 2.5,
-    targetToleranceLufs: 0.35
+    limiter: getLimiterLimit(-1.5)
   },
   louder: {
     integratedLoudness: -14,
     truePeak: -1,
-    limiter: getLimiterLimit(-1),
-    maxCorrectionGainDb: 3.5,
-    targetToleranceLufs: 0.35
+    limiter: getLimiterLimit(-1)
   },
   "very-loud": {
     integratedLoudness: -12.5,
     truePeak: -0.8,
-    limiter: getLimiterLimit(-0.8),
-    maxCorrectionGainDb: 4,
-    targetToleranceLufs: 0.4
+    limiter: getLimiterLimit(-0.8)
   }
 };
 
@@ -302,98 +313,125 @@ export async function masterAudioFile({
   await assertAudioFileReady(inputPath);
 
   const settings = VOLUME_BOOST_SETTINGS[volumeBoost];
-  const outputExtension = getFileExtension(outputFormat);
-  const outputDirectory = path.dirname(outputPath);
-  let correctionGainDb = 0;
-  let bestCandidate:
-    | {
-        path: string;
-        metrics: AudioLoudnessMetrics | null;
-        score: number;
-        attempts: number;
-        correctionGainDb: number;
-      }
-    | null = null;
 
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    const candidatePath = path.join(outputDirectory, `final-output-attempt-${attempt}.${outputExtension}`);
+  const measurement = await measureForLinearMastering(inputPath, settings);
 
-    await transcodeAudioFile({
+  const applyFilter = buildLinearMasteringFilter(settings, measurement);
+
+  const { stderr } = await runFfmpegAndCapture(
+    [
+      "-y",
+      "-i",
       inputPath,
-      outputPath: candidatePath,
-      outputFormat,
-      applyLoudnorm: true,
-      volumeBoost,
-      masteringCorrectionDb: correctionGainDb,
-      stage: "final-normalization"
-    });
+      "-vn",
+      "-af",
+      applyFilter,
+      ...getCodecArgs(outputFormat),
+      outputPath
+    ],
+    { stage: "final-normalization" }
+  );
 
-    const metrics = await measureAudioFile(candidatePath).catch((error) => {
-      console.warn(
-        "[mastering] measurement unavailable",
-        JSON.stringify({
-          attempt,
-          outputPath: candidatePath,
-          reason: error instanceof Error ? error.message : "Unknown measurement failure."
-        })
-      );
-      return null;
-    });
-    const score = getMasteringScore(metrics, settings);
-
-    console.info(
-      "[mastering] attempt",
-      JSON.stringify({
-        attempt,
-        volumeBoost,
-        correctionGainDb: Number(correctionGainDb.toFixed(2)),
-        measuredIntegratedLoudness: metrics?.integratedLoudness ?? null,
-        measuredTruePeak: metrics?.truePeak ?? null,
-        measuredMaxVolume: metrics?.maxVolume ?? null,
-        score
-      })
-    );
-
-    if (!bestCandidate || score < bestCandidate.score) {
-      bestCandidate = {
-        path: candidatePath,
-        metrics,
-        score,
-        attempts: attempt,
-        correctionGainDb
-      };
-    }
-
-    if (isWithinMasteringTarget(metrics, settings)) {
-      break;
-    }
-
-    const nextCorrection = calculateMasteringCorrectionDb(metrics, settings);
-
-    if (nextCorrection === 0) {
-      break;
-    }
-
-    correctionGainDb = clamp(
-      correctionGainDb + nextCorrection,
-      -settings.maxCorrectionGainDb,
-      settings.maxCorrectionGainDb
-    );
-  }
-
-  if (!bestCandidate) {
-    throw new Error("Mastering failed before any output candidate was created.");
-  }
-
-  await rename(bestCandidate.path, outputPath);
-  await rmAttemptFiles(outputDirectory, outputPath);
   await assertAudioFileReady(outputPath);
 
+  const passTwoStats = parseLoudnormStats(stderr);
+  const normalizationType: "linear" | "dynamic" | null =
+    passTwoStats?.normalization_type === "linear"
+      ? "linear"
+      : passTwoStats?.normalization_type === "dynamic"
+        ? "dynamic"
+        : null;
+
+  if (normalizationType !== "linear") {
+    console.warn(
+      "[mastering] ffmpeg did not report linear normalization on pass 2",
+      JSON.stringify({
+        volumeBoost,
+        normalizationType,
+        measurement
+      })
+    );
+  }
+
+  const metrics = await measureAudioFile(outputPath).catch((error) => {
+    console.warn(
+      "[mastering] post-master verification unavailable",
+      JSON.stringify({
+        outputPath,
+        reason: error instanceof Error ? error.message : "Unknown measurement failure."
+      })
+    );
+    return null;
+  });
+
+  console.info(
+    "[mastering] final",
+    JSON.stringify({
+      volumeBoost,
+      targetIntegratedLoudness: settings.integratedLoudness,
+      targetTruePeak: settings.truePeak,
+      measuredIntegratedLoudness: metrics?.integratedLoudness ?? null,
+      measuredTruePeak: metrics?.truePeak ?? null,
+      normalizationType
+    })
+  );
+
   return {
-    attempts: bestCandidate.attempts,
-    correctionGainDb: Number(bestCandidate.correctionGainDb.toFixed(2)),
-    metrics: bestCandidate.metrics
+    metrics,
+    normalizationType,
+    linear: normalizationType === "linear"
   };
+}
+
+async function measureForLinearMastering(
+  inputPath: string,
+  settings: LoudnessSettings
+): Promise<LoudnormMeasurement> {
+  const { stderr } = await runFfmpegAndCapture(
+    [
+      "-hide_banner",
+      "-nostats",
+      "-i",
+      inputPath,
+      "-vn",
+      "-af",
+      `loudnorm=I=${settings.integratedLoudness}:TP=${settings.truePeak}:LRA=11:print_format=json`,
+      "-f",
+      "null",
+      "-"
+    ],
+    { stage: "measurement" }
+  );
+
+  const measurement = toLoudnormMeasurement(parseLoudnormStats(stderr));
+
+  if (!measurement) {
+    throw new Error(
+      "Loudness measurement pass did not return usable statistics (input_i/input_tp/input_lra/input_thresh/target_offset)."
+    );
+  }
+
+  return measurement;
+}
+
+export function buildLinearMasteringFilter(
+  settings: LoudnessSettings,
+  measurement: LoudnormMeasurement
+): string {
+  const loudnorm = [
+    `loudnorm=I=${settings.integratedLoudness}`,
+    `TP=${settings.truePeak}`,
+    `LRA=11`,
+    `measured_I=${measurement.input_i}`,
+    `measured_TP=${measurement.input_tp}`,
+    `measured_LRA=${measurement.input_lra}`,
+    `measured_thresh=${measurement.input_thresh}`,
+    `offset=${measurement.target_offset}`,
+    `linear=true`,
+    `print_format=json`
+  ].join(":");
+
+  return `${loudnorm},alimiter=limit=${settings.limiter}:level=disabled`;
 }
 
 export async function measureAudioFile(inputPath: string): Promise<AudioLoudnessMetrics> {
@@ -784,28 +822,62 @@ function getLimiterLimit(truePeak: number): number {
   return Number((10 ** (truePeak / 20)).toFixed(3));
 }
 
-function parseLoudnormMetrics(output: string): AudioLoudnessMetrics | null {
-  const match = output.match(/\{\s*"input_i"[\s\S]*?\}/);
+function parseLoudnormStats(output: string): LoudnormStats | null {
+  const match = output.match(/\{[\s\S]*?"input_i"[\s\S]*?\}/);
 
   if (!match) {
     return null;
   }
 
   try {
-    const parsed = JSON.parse(match[0]) as {
-      input_i?: string;
-      input_tp?: string;
-    };
-
-    return {
-      integratedLoudness: parseFiniteNumber(parsed.input_i),
-      truePeak: parseFiniteNumber(parsed.input_tp),
-      maxVolume: null,
-      measurementMode: "loudnorm"
-    };
+    return JSON.parse(match[0]) as LoudnormStats;
   } catch {
     return null;
   }
+}
+
+function toLoudnormMeasurement(stats: LoudnormStats | null): LoudnormMeasurement | null {
+  if (!stats) {
+    return null;
+  }
+
+  const { input_i, input_tp, input_lra, input_thresh, target_offset } = stats;
+
+  if (
+    !isFiniteNumericString(input_i) ||
+    !isFiniteNumericString(input_tp) ||
+    !isFiniteNumericString(input_lra) ||
+    !isFiniteNumericString(input_thresh) ||
+    !isFiniteNumericString(target_offset)
+  ) {
+    return null;
+  }
+
+  return { input_i, input_tp, input_lra, input_thresh, target_offset };
+}
+
+function isFiniteNumericString(value: string | undefined): value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    return false;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed);
+}
+
+function parseLoudnormMetrics(output: string): AudioLoudnessMetrics | null {
+  const stats = parseLoudnormStats(output);
+
+  if (!stats) {
+    return null;
+  }
+
+  return {
+    integratedLoudness: parseFiniteNumber(stats.input_i),
+    truePeak: parseFiniteNumber(stats.input_tp),
+    maxVolume: null,
+    measurementMode: "loudnorm"
+  };
 }
 
 function parseMaxVolume(output: string): number | null {
@@ -820,76 +892,6 @@ function parseFiniteNumber(value: string | undefined): number | null {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
-}
-
-function calculateMasteringCorrectionDb(
-  metrics: AudioLoudnessMetrics | null,
-  settings: LoudnessSettings
-): number {
-  if (metrics?.integratedLoudness === null || metrics?.integratedLoudness === undefined) {
-    return 0;
-  }
-
-  const delta = settings.integratedLoudness - metrics.integratedLoudness;
-
-  if (Math.abs(delta) < 0.15) {
-    return 0;
-  }
-
-  return clamp(delta, -2.5, 3);
-}
-
-function isWithinMasteringTarget(
-  metrics: AudioLoudnessMetrics | null,
-  settings: LoudnessSettings
-): boolean {
-  if (metrics?.integratedLoudness === null || metrics?.integratedLoudness === undefined) {
-    return false;
-  }
-
-  const loudnessOk =
-    Math.abs(metrics.integratedLoudness - settings.integratedLoudness) <= settings.targetToleranceLufs;
-  const peakMeasurement = metrics.truePeak ?? metrics.maxVolume;
-  const peakOk = peakMeasurement === null || peakMeasurement <= settings.truePeak + 0.15;
-
-  return loudnessOk && peakOk;
-}
-
-function getMasteringScore(
-  metrics: AudioLoudnessMetrics | null,
-  settings: LoudnessSettings
-): number {
-  if (metrics?.integratedLoudness === null || metrics?.integratedLoudness === undefined) {
-    return Number.POSITIVE_INFINITY;
-  }
-
-  const loudnessDistance = Math.abs(metrics.integratedLoudness - settings.integratedLoudness);
-  const peakMeasurement = metrics.truePeak ?? metrics.maxVolume;
-  const peakOverflow =
-    peakMeasurement === null ? 0 : Math.max(0, peakMeasurement - settings.truePeak);
-
-  return Number((loudnessDistance + peakOverflow * 2).toFixed(3));
-}
-
-async function rmAttemptFiles(outputDirectory: string, preservedPath: string): Promise<void> {
-  const preservedBasename = path.basename(preservedPath);
-
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    const attemptPath = path.join(
-      outputDirectory,
-      `final-output-attempt-${attempt}.${path.extname(preservedPath).slice(1)}`
-    );
-
-    if (path.basename(attemptPath) === preservedBasename) {
-      continue;
-    }
-
-    await rm(attemptPath, { force: true });
-  }
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
 }
 
 function capitalize(text: string): string {
