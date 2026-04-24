@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  AudioProcessingError,
   assertFfmpegAvailable,
   DEFAULT_OUTPUT_FORMAT,
   getFileExtension,
@@ -14,6 +15,7 @@ import { chunkText, prepareTextForSpeech, slugifyFilename } from "@/lib/text";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const maxDuration = 300;
 
 const MISTRAL_SPEECH_ENDPOINT = "https://api.mistral.ai/v1/audio/speech";
 const MISTRAL_MODEL = "voxtral-mini-tts-2603";
@@ -54,6 +56,7 @@ type StreamEvent =
       mimeType: string;
       outputFormat: OutputFormat;
       normalizationApplied: boolean;
+      normalizationFallbackUsed: boolean;
       strategy: GenerationStrategy;
       totalSegments: number;
     }
@@ -208,7 +211,8 @@ async function runGeneration({
         audioBase64: singlePassResult.audioBuffer.toString("base64"),
         mimeType: getMimeType(outputFormat),
         outputFormat,
-        normalizationApplied: normalizationEnabled,
+        normalizationApplied: singlePassResult.normalizationApplied,
+        normalizationFallbackUsed: singlePassResult.normalizationFallbackUsed,
         strategy: "single-pass-short",
         totalSegments: 1
       });
@@ -238,7 +242,8 @@ async function runGeneration({
         audioBase64: segmentedResult.audioBuffer.toString("base64"),
         mimeType: getMimeType(outputFormat),
         outputFormat,
-        normalizationApplied: normalizationEnabled,
+        normalizationApplied: segmentedResult.normalizationApplied,
+        normalizationFallbackUsed: segmentedResult.normalizationFallbackUsed,
         strategy: "narration-segmented",
         totalSegments: segmentedResult.totalSegments
       });
@@ -272,7 +277,8 @@ async function runGeneration({
         audioBase64: singlePassResult.audioBuffer.toString("base64"),
         mimeType: getMimeType(outputFormat),
         outputFormat,
-        normalizationApplied: normalizationEnabled,
+        normalizationApplied: singlePassResult.normalizationApplied,
+        normalizationFallbackUsed: singlePassResult.normalizationFallbackUsed,
         strategy: narrationMode ? "single-pass-experimental" : "legacy-single-pass",
         totalSegments: 1
       });
@@ -313,17 +319,15 @@ async function runGeneration({
       audioBase64: fallbackResult.audioBuffer.toString("base64"),
       mimeType: getMimeType(outputFormat),
       outputFormat,
-      normalizationApplied: normalizationEnabled,
+      normalizationApplied: fallbackResult.normalizationApplied,
+      normalizationFallbackUsed: fallbackResult.normalizationFallbackUsed,
       strategy: "fallback-chunking",
       totalSegments: fallbackResult.totalSegments
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Unexpected error during generation.";
-
     sendEvent({
       type: "error",
-      message
+      message: describeSafeError(error)
     });
   } finally {
     controller.close();
@@ -344,6 +348,200 @@ function validateEnvironment(voiceId: string): void {
   }
 }
 
+async function mergeSegmentsWithFallback({
+  segmentPaths,
+  tempDirectoryPath,
+  outputFormat,
+  sendEvent
+}: {
+  segmentPaths: string[];
+  tempDirectoryPath: string;
+  outputFormat: OutputFormat;
+  sendEvent: (event: StreamEvent) => void;
+}): Promise<string> {
+  if (segmentPaths.length === 1) {
+    return segmentPaths[0];
+  }
+
+  sendEvent({
+    type: "progress",
+    stage: "merging",
+    message: "Merging audio"
+  });
+
+  const copyMergedPath = path.join(tempDirectoryPath, "merged.wav");
+
+  try {
+    await mergeAudioFiles({
+      inputPaths: segmentPaths,
+      outputPath: copyMergedPath,
+      outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
+      strategy: "copy"
+    });
+
+    return copyMergedPath;
+  } catch (error) {
+    const concatFailureReason = extractErrorReason(error);
+    const fallbackFormat = outputFormat === "mp3" ? "mp3" : INTERMEDIATE_SEGMENT_FORMAT;
+    const fallbackMergedPath = path.join(
+      tempDirectoryPath,
+      `merged-reencoded.${getFileExtension(fallbackFormat)}`
+    );
+
+    sendEvent({
+      type: "progress",
+      stage: "merging",
+      message: `Concat copy failed (${truncate(concatFailureReason, 140)}). Retrying with re-encoding`
+    });
+
+    try {
+      await mergeAudioFiles({
+        inputPaths: segmentPaths,
+        outputPath: fallbackMergedPath,
+        outputFormat: fallbackFormat,
+        strategy: "reencode"
+      });
+    } catch (fallbackError) {
+      throw new Error(
+        `Audio merge failed: ${concatFailureReason}. Re-encode retry failed: ${extractErrorReason(
+          fallbackError
+        )}`
+      );
+    }
+
+    return fallbackMergedPath;
+  }
+}
+
+async function finalizeOutput({
+  assembledPath,
+  tempDirectoryPath,
+  outputFormat,
+  normalizationEnabled,
+  sendEvent
+}: {
+  assembledPath: string;
+  tempDirectoryPath: string;
+  outputFormat: OutputFormat;
+  normalizationEnabled: boolean;
+  sendEvent: (event: StreamEvent) => void;
+}): Promise<{
+  deliverPath: string;
+  normalizationApplied: boolean;
+  normalizationFallbackUsed: boolean;
+}> {
+  const targetExtension = `.${getFileExtension(outputFormat)}`;
+  const assembledMatchesOutput = path.extname(assembledPath).toLowerCase() === targetExtension;
+
+  if (!normalizationEnabled) {
+    if (assembledMatchesOutput) {
+      return {
+        deliverPath: assembledPath,
+        normalizationApplied: false,
+        normalizationFallbackUsed: false
+      };
+    }
+
+    const deliverPath = path.join(tempDirectoryPath, `final-output.${getFileExtension(outputFormat)}`);
+
+    await transcodeAudioFile({
+      inputPath: assembledPath,
+      outputPath: deliverPath,
+      outputFormat,
+      applyLoudnorm: false,
+      stage: "encoding"
+    });
+
+    return {
+      deliverPath,
+      normalizationApplied: false,
+      normalizationFallbackUsed: false
+    };
+  }
+
+  const normalizedOutputPath = path.join(
+    tempDirectoryPath,
+    `final-output.${getFileExtension(outputFormat)}`
+  );
+
+  sendEvent({
+    type: "progress",
+    stage: "final-normalization",
+    message: "Final normalization"
+  });
+
+  try {
+    await transcodeAudioFile({
+      inputPath: assembledPath,
+      outputPath: normalizedOutputPath,
+      outputFormat,
+      applyLoudnorm: true,
+      stage: "final-normalization"
+    });
+
+    return {
+      deliverPath: normalizedOutputPath,
+      normalizationApplied: true,
+      normalizationFallbackUsed: false
+    };
+  } catch (error) {
+    const normalizationFailureReason = extractErrorReason(error);
+
+    if (assembledMatchesOutput) {
+      sendEvent({
+        type: "progress",
+        stage: "final-normalization",
+        message: `Final normalization failed (${truncate(
+          normalizationFailureReason,
+          140
+        )}). Using merged audio without normalization`
+      });
+
+      return {
+        deliverPath: assembledPath,
+        normalizationApplied: false,
+        normalizationFallbackUsed: true
+      };
+    }
+
+    const fallbackOutputPath = path.join(
+      tempDirectoryPath,
+      `final-output-fallback.${getFileExtension(outputFormat)}`
+    );
+
+    sendEvent({
+      type: "progress",
+      stage: "final-normalization",
+      message: `Final normalization failed (${truncate(
+        normalizationFailureReason,
+        140
+      )}). Retrying without normalization`
+    });
+
+    try {
+      await transcodeAudioFile({
+        inputPath: assembledPath,
+        outputPath: fallbackOutputPath,
+        outputFormat,
+        applyLoudnorm: false,
+        stage: "encoding"
+      });
+    } catch (fallbackError) {
+      throw new Error(
+        `Final normalization failed: ${normalizationFailureReason}. Fallback export failed: ${extractErrorReason(
+          fallbackError
+        )}`
+      );
+    }
+
+    return {
+      deliverPath: fallbackOutputPath,
+      normalizationApplied: false,
+      normalizationFallbackUsed: true
+    };
+  }
+}
+
 async function generateSinglePassResult({
   input,
   voiceId,
@@ -360,7 +558,12 @@ async function generateSinglePassResult({
   sendEvent: (event: StreamEvent) => void;
   debugForceSinglePassFailure: boolean;
   strategyLabel: string;
-}): Promise<{ audioBuffer: Buffer; tempDirectoryPath: string }> {
+}): Promise<{
+  audioBuffer: Buffer;
+  tempDirectoryPath: string;
+  normalizationApplied: boolean;
+  normalizationFallbackUsed: boolean;
+}> {
   sendEvent({
     type: "progress",
     stage: "single-pass",
@@ -378,7 +581,9 @@ async function generateSinglePassResult({
   if (!normalizationEnabled) {
     return {
       audioBuffer,
-      tempDirectoryPath: ""
+      tempDirectoryPath: "",
+      normalizationApplied: false,
+      normalizationFallbackUsed: false
     };
   }
 
@@ -386,26 +591,22 @@ async function generateSinglePassResult({
 
   const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
   const sourcePath = path.join(tempDirectoryPath, `single-pass-source.${getFileExtension(sourceFormat)}`);
-  const outputPath = path.join(tempDirectoryPath, `single-pass-output.${getFileExtension(outputFormat)}`);
 
   await writeFile(sourcePath, audioBuffer);
 
-  sendEvent({
-    type: "progress",
-    stage: "final-normalization",
-    message: "Final normalization"
-  });
-
-  await transcodeAudioFile({
-    inputPath: sourcePath,
-    outputPath,
+  const finalizedOutput = await finalizeOutput({
+    assembledPath: sourcePath,
+    tempDirectoryPath,
     outputFormat,
-    applyLoudnorm: true
+    normalizationEnabled,
+    sendEvent
   });
 
   return {
-    audioBuffer: await readFile(outputPath),
-    tempDirectoryPath
+    audioBuffer: await readFile(finalizedOutput.deliverPath),
+    tempDirectoryPath,
+    normalizationApplied: finalizedOutput.normalizationApplied,
+    normalizationFallbackUsed: finalizedOutput.normalizationFallbackUsed
   };
 }
 
@@ -493,6 +694,8 @@ async function generateSegmentedSpeech({
   audioBuffer: Buffer;
   totalSegments: number;
   tempDirectoryPath: string;
+  normalizationApplied: boolean;
+  normalizationFallbackUsed: boolean;
 }> {
   const segments = chunkText(paragraphs);
 
@@ -555,71 +758,44 @@ async function generateSegmentedSpeech({
         totalSegments: segments.length
       });
 
-      await transcodeAudioFile({
-        inputPath: rawSegmentPath,
-        outputPath: normalizedSegmentPath,
-        outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
-        applyLoudnorm: true
-      });
+      try {
+        await transcodeAudioFile({
+          inputPath: rawSegmentPath,
+          outputPath: normalizedSegmentPath,
+          outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
+          applyLoudnorm: true,
+          stage: "segment-normalization"
+        });
+      } catch (error) {
+        throw new Error(
+          `Segment ${segmentNumber} of ${segments.length} normalization failed: ${extractErrorReason(error)}`
+        );
+      }
 
       segmentPaths.push(normalizedSegmentPath);
     }
 
-    let assembledPath = segmentPaths[0];
+    const assembledPath = await mergeSegmentsWithFallback({
+      segmentPaths,
+      tempDirectoryPath,
+      outputFormat,
+      sendEvent
+    });
 
-    if (segmentPaths.length > 1) {
-      sendEvent({
-        type: "progress",
-        stage: "merging",
-        message: "Merging audio"
-      });
-
-      assembledPath = path.join(tempDirectoryPath, "merged.wav");
-      await mergeAudioFiles({
-        inputPaths: segmentPaths,
-        outputPath: assembledPath,
-        copyAudio: true
-      });
-    }
-
-    let deliverPath = assembledPath;
-
-    if (normalizationEnabled) {
-      deliverPath = path.join(
-        tempDirectoryPath,
-        `final-output.${getFileExtension(outputFormat)}`
-      );
-
-      sendEvent({
-        type: "progress",
-        stage: "final-normalization",
-        message: "Final normalization"
-      });
-
-      await transcodeAudioFile({
-        inputPath: assembledPath,
-        outputPath: deliverPath,
-        outputFormat,
-        applyLoudnorm: true
-      });
-    } else if (outputFormat !== INTERMEDIATE_SEGMENT_FORMAT) {
-      deliverPath = path.join(
-        tempDirectoryPath,
-        `final-output.${getFileExtension(outputFormat)}`
-      );
-
-      await transcodeAudioFile({
-        inputPath: assembledPath,
-        outputPath: deliverPath,
-        outputFormat,
-        applyLoudnorm: false
-      });
-    }
+    const finalizedOutput = await finalizeOutput({
+      assembledPath,
+      tempDirectoryPath,
+      outputFormat,
+      normalizationEnabled,
+      sendEvent
+    });
 
     return {
-      audioBuffer: await readFile(deliverPath),
+      audioBuffer: await readFile(finalizedOutput.deliverPath),
       totalSegments: segments.length,
-      tempDirectoryPath
+      tempDirectoryPath,
+      normalizationApplied: finalizedOutput.normalizationApplied,
+      normalizationFallbackUsed: finalizedOutput.normalizationFallbackUsed
     };
   } catch (error) {
     await rm(tempDirectoryPath, { force: true, recursive: true });
@@ -715,6 +891,29 @@ async function parseAudioResponse(response: Response): Promise<Buffer> {
   return Buffer.from(data.audio_data, "base64");
 }
 
+function describeSafeError(error: unknown): string {
+  if (error instanceof AudioProcessingError) {
+    return `${formatAudioStageLabel(error.stage)} failed: ${extractErrorReason(error)}`;
+  }
+
+  if (error instanceof Error) {
+    return sanitizeErrorMessage(error.message);
+  }
+
+  return "Unexpected error during generation.";
+}
+
+function extractErrorReason(error: unknown): string {
+  const rawMessage =
+    error instanceof AudioProcessingError
+      ? error.stderrSummary || error.message
+      : error instanceof Error
+        ? error.message
+        : "Unknown error.";
+
+  return stripAudioFailurePrefix(sanitizeErrorMessage(rawMessage));
+}
+
 function toGenerationFailure(error: unknown): GenerationFailure {
   if (error instanceof GenerationFailure) {
     return error;
@@ -756,6 +955,45 @@ function describeUnknownError(error: unknown): string {
   }
 
   return "Unknown error.";
+}
+
+function formatAudioStageLabel(stage: AudioProcessingError["stage"]): string {
+  switch (stage) {
+    case "segment-normalization":
+      return "Segment normalization";
+    case "final-normalization":
+      return "Final normalization";
+    case "merge":
+      return "Audio merge";
+    case "encoding":
+      return "Audio encoding";
+    case "availability-check":
+    default:
+      return "ffmpeg";
+  }
+}
+
+function stripAudioFailurePrefix(message: string): string {
+  return message
+    .replace(/^(audio merge|final normalization|segment normalization|audio encoding|ffmpeg) failed:\s*/i, "")
+    .trim();
+}
+
+function sanitizeErrorMessage(message: string): string {
+  const cleaned = message
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter(
+      (line) =>
+        !/^ffmpeg version /i.test(line) &&
+        !/^built with /i.test(line) &&
+        !/^configuration:/i.test(line) &&
+        !/^libav[a-z]+\s+/i.test(line)
+    )
+    .join(" ");
+
+  return truncate(cleaned || message, 280);
 }
 
 function formatSeconds(milliseconds: number): number {

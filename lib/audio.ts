@@ -1,16 +1,25 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { rm, stat, writeFile } from "node:fs/promises";
+import { open, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export type OutputFormat = "mp3" | "wav";
+export type AudioProcessingStage =
+  | "availability-check"
+  | "segment-normalization"
+  | "merge"
+  | "final-normalization"
+  | "encoding";
+
+type MergeStrategy = "copy" | "reencode";
 
 export const DEFAULT_OUTPUT_FORMAT: OutputFormat = "mp3";
 export const LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11";
 export const FFMPEG_MISSING_MESSAGE =
-  "ffmpeg is required for narration segmentation and normalization, but no usable binary was found. Install ffmpeg locally (`brew install ffmpeg`) or set FFMPEG_PATH.";
+  "ffmpeg executable not found. Checked FFMPEG_PATH, bundled ffmpeg-static, and system ffmpeg on PATH.";
 
 const MP3_BITRATE = "192k";
+const FFMPEG_TIMEOUT_MS = 180_000;
 const PACKAGED_FFMPEG_EXECUTABLE = path.join(
   process.cwd(),
   "node_modules",
@@ -20,10 +29,78 @@ const PACKAGED_FFMPEG_EXECUTABLE = path.join(
 const FFMPEG_CANDIDATES = [
   process.env.FFMPEG_PATH?.trim(),
   PACKAGED_FFMPEG_EXECUTABLE,
-  "ffmpeg"
+  process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg"
 ].filter((value): value is string => Boolean(value));
+const AUDIO_STAGE_LABELS: Record<AudioProcessingStage, string> = {
+  "availability-check": "ffmpeg availability check",
+  "segment-normalization": "segment normalization",
+  merge: "audio merge",
+  "final-normalization": "final normalization",
+  encoding: "audio encoding"
+};
+const FFMPEG_BANNER_LINE_PATTERNS = [
+  /^ffmpeg version /i,
+  /^built with /i,
+  /^configuration:/i,
+  /^libav[a-z]+\s+/i,
+  /^(guessed channel layout|input #\d|output #\d)/i
+];
+const FFMPEG_PROGRESS_LINE_PATTERNS = [/^(size|frame|time|bitrate|speed)=/i, /^video:/i];
+const FFMPEG_INTERESTING_LINE_PATTERN =
+  /(error|invalid|failed|no such|not found|permission denied|unsafe|unable|could not|impossible|conversion failed|does not contain|unsupported|cannot|not yet|mismatch|corrupt|malformed)/i;
 
 let ffmpegExecutablePromise: Promise<string> | null = null;
+
+export class AudioProcessingError extends Error {
+  stage: AudioProcessingStage;
+  executable: string;
+  args: string[];
+  stderrSummary: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  timedOut: boolean;
+
+  constructor({
+    stage,
+    executable,
+    args,
+    stderr,
+    exitCode,
+    signal,
+    timedOut
+  }: {
+    stage: AudioProcessingStage;
+    executable: string;
+    args: string[];
+    stderr: string;
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    timedOut: boolean;
+  }) {
+    const stderrSummary = summarizeFfmpegStderr(stderr);
+    const message = timedOut
+      ? `${AUDIO_STAGE_LABELS[stage]} timed out after ${Math.round(FFMPEG_TIMEOUT_MS / 1000)} seconds.`
+      : `${capitalize(AUDIO_STAGE_LABELS[stage])} failed${
+          stderrSummary
+            ? `: ${stderrSummary}`
+            : exitCode !== null
+              ? `: ffmpeg exited with code ${exitCode}.`
+              : signal
+                ? `: ffmpeg exited from signal ${signal}.`
+                : "."
+        }`;
+
+    super(message);
+    this.name = "AudioProcessingError";
+    this.stage = stage;
+    this.executable = executable;
+    this.args = args;
+    this.stderrSummary = stderrSummary;
+    this.exitCode = exitCode;
+    this.signal = signal;
+    this.timedOut = timedOut;
+  }
+}
 
 export function getFileExtension(format: OutputFormat): string {
   return format;
@@ -41,13 +118,17 @@ export async function transcodeAudioFile({
   inputPath,
   outputPath,
   outputFormat,
-  applyLoudnorm
+  applyLoudnorm,
+  stage
 }: {
   inputPath: string;
   outputPath: string;
   outputFormat: OutputFormat;
   applyLoudnorm: boolean;
+  stage?: AudioProcessingStage;
 }): Promise<void> {
+  await assertAudioFileReady(inputPath);
+
   await runFfmpeg(
     buildTranscodeArgs({
       inputPath,
@@ -55,45 +136,55 @@ export async function transcodeAudioFile({
       outputFormat,
       applyLoudnorm
     }),
-    applyLoudnorm ? "normalizing audio" : "encoding audio"
+    {
+      stage: stage ?? (applyLoudnorm ? "final-normalization" : "encoding")
+    }
   );
 
-  const outputStats = await stat(outputPath);
-  if (outputStats.size === 0) {
-    throw new Error("ffmpeg created an empty audio file.");
-  }
+  await assertAudioFileReady(outputPath);
 }
 
 export async function mergeAudioFiles({
   inputPaths,
   outputPath,
-  copyAudio
+  outputFormat,
+  strategy
 }: {
   inputPaths: string[];
   outputPath: string;
-  copyAudio: boolean;
+  outputFormat: OutputFormat;
+  strategy: MergeStrategy;
 }): Promise<void> {
+  if (inputPaths.length === 0) {
+    throw new Error("Audio merge failed: no input segments were provided.");
+  }
+
+  for (const inputPath of inputPaths) {
+    await assertAudioFileReady(inputPath);
+  }
+
   const listFilePath = path.join(path.dirname(outputPath), `concat-${randomUUID()}.txt`);
   const concatList = inputPaths
-    .map((inputPath) => `file '${escapeForFfmpegConcat(inputPath)}'`)
-    .join("\n");
+    .map((inputPath) => `file '${escapeForFfmpegConcat(path.resolve(inputPath))}'`)
+    .join("\n")
+    .concat("\n");
 
-  await writeFile(listFilePath, concatList);
+  await writeFile(listFilePath, concatList, "utf8");
 
   try {
     await runFfmpeg(
       buildMergeArgs({
         listFilePath,
         outputPath,
-        copyAudio
+        outputFormat,
+        strategy
       }),
-      "merging audio"
+      {
+        stage: "merge"
+      }
     );
 
-    const outputStats = await stat(outputPath);
-    if (outputStats.size === 0) {
-      throw new Error("ffmpeg created an empty merged audio file.");
-    }
+    await assertAudioFileReady(outputPath);
   } finally {
     await rm(listFilePath, { force: true });
   }
@@ -122,11 +213,13 @@ export function buildTranscodeArgs({
 export function buildMergeArgs({
   listFilePath,
   outputPath,
-  copyAudio
+  outputFormat,
+  strategy
 }: {
   listFilePath: string;
   outputPath: string;
-  copyAudio: boolean;
+  outputFormat: OutputFormat;
+  strategy: MergeStrategy;
 }): string[] {
   return [
     "-y",
@@ -137,13 +230,47 @@ export function buildMergeArgs({
     "-i",
     listFilePath,
     "-vn",
-    ...(copyAudio ? ["-c", "copy"] : ["-c:a", "pcm_s16le"]),
+    ...(strategy === "copy" ? ["-c", "copy"] : getCodecArgs(outputFormat)),
     outputPath
   ];
 }
 
-async function runFfmpeg(argumentsList: string[], action: string): Promise<void> {
+export function summarizeFfmpegStderr(stderr: string): string {
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter(
+      (line) =>
+        !FFMPEG_BANNER_LINE_PATTERNS.some((pattern) => pattern.test(line)) &&
+        !FFMPEG_PROGRESS_LINE_PATTERNS.some((pattern) => pattern.test(line))
+    );
+
+  if (lines.length === 0) {
+    return "";
+  }
+
+  const interestingLines = lines.filter((line) => FFMPEG_INTERESTING_LINE_PATTERN.test(line));
+  const selectedLines = (interestingLines.length > 0 ? interestingLines : lines).slice(-4);
+
+  return truncate(selectedLines.join(" | "), 400);
+}
+
+async function runFfmpeg(
+  argumentsList: string[],
+  { stage }: { stage: AudioProcessingStage }
+): Promise<void> {
   const ffmpegExecutable = await getFfmpegExecutable();
+  const startTime = Date.now();
+
+  console.info(
+    "[ffmpeg] starting",
+    JSON.stringify({
+      stage,
+      executable: ffmpegExecutable,
+      args: argumentsList
+    })
+  );
 
   await new Promise<void>((resolve, reject) => {
     const ffmpegProcess = spawn(ffmpegExecutable, argumentsList, {
@@ -151,22 +278,70 @@ async function runFfmpeg(argumentsList: string[], action: string): Promise<void>
     });
 
     let stderr = "";
+    let timedOut = false;
+
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      ffmpegProcess.kill("SIGKILL");
+    }, FFMPEG_TIMEOUT_MS);
 
     ffmpegProcess.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
 
-    ffmpegProcess.once("error", () => {
-      reject(new Error(FFMPEG_MISSING_MESSAGE));
+    ffmpegProcess.once("error", (error) => {
+      clearTimeout(timeoutHandle);
+      const spawnError = error as NodeJS.ErrnoException;
+
+      reject(
+        spawnError.code === "ENOENT"
+          ? new Error(FFMPEG_MISSING_MESSAGE)
+          : new Error(
+              `ffmpeg could not start during ${AUDIO_STAGE_LABELS[stage]}: ${spawnError.message}`
+            )
+      );
     });
 
-    ffmpegProcess.once("exit", (code) => {
-      if (code === 0) {
+    ffmpegProcess.once("exit", (code, signal) => {
+      clearTimeout(timeoutHandle);
+
+      if (code === 0 && !timedOut) {
+        console.info(
+          "[ffmpeg] completed",
+          JSON.stringify({
+            stage,
+            durationMs: Date.now() - startTime
+          })
+        );
         resolve();
         return;
       }
 
-      reject(new Error(`ffmpeg failed while ${action}. ${truncate(stderr, 500)}`));
+      const failure = new AudioProcessingError({
+        stage,
+        executable: ffmpegExecutable,
+        args: argumentsList,
+        stderr,
+        exitCode: code,
+        signal,
+        timedOut
+      });
+
+      console.error(
+        "[ffmpeg] failed",
+        JSON.stringify({
+          stage,
+          durationMs: Date.now() - startTime,
+          executable: ffmpegExecutable,
+          args: argumentsList,
+          exitCode: code,
+          signal,
+          timedOut,
+          stderrSummary: failure.stderrSummary
+        })
+      );
+
+      reject(failure);
     });
   });
 }
@@ -191,7 +366,9 @@ async function resolveFfmpegExecutable(): Promise<string> {
 
 async function canStartFfmpeg(executable: string): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
-    const process = spawn(executable, ["-version"]);
+    const process = spawn(executable, ["-version"], {
+      stdio: ["ignore", "ignore", "ignore"]
+    });
 
     process.once("error", () => {
       resolve(false);
@@ -201,6 +378,48 @@ async function canStartFfmpeg(executable: string): Promise<boolean> {
       resolve(code === 0);
     });
   });
+}
+
+async function assertAudioFileReady(filePath: string): Promise<void> {
+  const fileStats = await stat(filePath);
+
+  if (!fileStats.isFile()) {
+    throw new Error(`Audio file is missing: ${path.basename(filePath)}`);
+  }
+
+  if (fileStats.size === 0) {
+    throw new Error(`Audio file is empty: ${path.basename(filePath)}`);
+  }
+
+  const handle = await open(filePath, "r");
+
+  try {
+    const header = Buffer.alloc(12);
+    const { bytesRead } = await handle.read(header, 0, header.length, 0);
+
+    if (filePath.endsWith(".wav")) {
+      const isWave =
+        bytesRead >= 12 &&
+        header.subarray(0, 4).toString("ascii") === "RIFF" &&
+        header.subarray(8, 12).toString("ascii") === "WAVE";
+
+      if (!isWave) {
+        throw new Error(`Audio file is not a valid WAV: ${path.basename(filePath)}`);
+      }
+    }
+
+    if (filePath.endsWith(".mp3")) {
+      const startsWithId3 = bytesRead >= 3 && header.subarray(0, 3).toString("ascii") === "ID3";
+      const startsWithFrameSync =
+        bytesRead >= 2 && header[0] === 0xff && (header[1] & 0xe0) === 0xe0;
+
+      if (!startsWithId3 && !startsWithFrameSync) {
+        throw new Error(`Audio file is not a valid MP3: ${path.basename(filePath)}`);
+      }
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 function getCodecArgs(outputFormat: OutputFormat): string[] {
@@ -213,6 +432,10 @@ function getCodecArgs(outputFormat: OutputFormat): string[] {
 
 function escapeForFfmpegConcat(filePath: string): string {
   return filePath.replace(/'/g, "'\\''");
+}
+
+function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function truncate(text: string, maxLength: number): string {

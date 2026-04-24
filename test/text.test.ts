@@ -3,7 +3,12 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { buildMergeArgs, buildTranscodeArgs, LOUDNORM_FILTER } from "../lib/audio";
+import {
+  buildMergeArgs,
+  buildTranscodeArgs,
+  LOUDNORM_FILTER,
+  summarizeFfmpegStderr
+} from "../lib/audio";
 import { chunkText, prepareTextForSpeech } from "../lib/text";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -68,7 +73,14 @@ test("audio command helpers expose the loudnorm normalization path", () => {
   const mergeArgs = buildMergeArgs({
     listFilePath: "/tmp/concat.txt",
     outputPath: "/tmp/merged.wav",
-    copyAudio: true
+    outputFormat: "wav",
+    strategy: "copy"
+  });
+  const mergeReencodeArgs = buildMergeArgs({
+    listFilePath: "/tmp/concat.txt",
+    outputPath: "/tmp/merged.mp3",
+    outputFormat: "mp3",
+    strategy: "reencode"
   });
 
   assert.deepEqual(mp3Args.slice(0, 5), ["-y", "-i", "/tmp/in.wav", "-vn", "-af"]);
@@ -77,4 +89,22 @@ test("audio command helpers expose the loudnorm normalization path", () => {
   assert.ok(wavArgs.includes("pcm_s16le"));
   assert.ok(mergeArgs.includes("-c"));
   assert.ok(mergeArgs.includes("copy"));
+  assert.ok(mergeReencodeArgs.includes("libmp3lame"));
+  assert.ok(mergeReencodeArgs.includes("192k"));
+});
+
+test("ffmpeg stderr summarizer strips banners and keeps actionable lines", () => {
+  const summary = summarizeFfmpegStderr(`
+ffmpeg version 7.0.2-static johnvansickle.com
+built with gcc 8
+configuration: --enable-gpl
+libavutil      59.  8.100 / 59.  8.100
+[concat @ 0x123] Impossible to open '/tmp/voiceover/segment-001.wav'
+/tmp/voiceover/concat.txt: Invalid data found when processing input
+Conversion failed!
+  `);
+
+  assert.doesNotMatch(summary, /ffmpeg version/i);
+  assert.match(summary, /Impossible to open/);
+  assert.match(summary, /Invalid data found/);
 });

@@ -55,6 +55,7 @@ type CompleteEvent = {
   mimeType: string;
   outputFormat: OutputFormat;
   normalizationApplied: boolean;
+  normalizationFallbackUsed: boolean;
   strategy: GenerationStrategy;
   totalSegments: number;
 };
@@ -191,7 +192,9 @@ export default function HomePage() {
         }
       }
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Generation failed.");
+      setErrorMessage(
+        sanitizeErrorMessage(error instanceof Error ? error.message : "Generation failed.")
+      );
       setStatusDetail("");
       setStatusMessage("");
     } finally {
@@ -201,7 +204,7 @@ export default function HomePage() {
 
   async function handleStreamEvent(event: StreamEvent) {
     if (event.type === "error") {
-      throw new Error(event.message);
+      throw new Error(sanitizeErrorMessage(event.message));
     }
 
     if (event.type === "progress") {
@@ -419,14 +422,18 @@ function buildCompletionDetail(event: CompleteEvent): string {
   })();
 
   return `${strategyLabel}, ${event.outputFormat.toUpperCase()}, ${
-    event.normalizationApplied ? "normalized" : "normalization off"
+    event.normalizationApplied
+      ? "normalized"
+      : event.normalizationFallbackUsed
+        ? "normalization fallback used"
+        : "normalization off"
   }`;
 }
 
 async function readErrorResponse(response: Response): Promise<string> {
   try {
     const data = (await response.json()) as { error?: string };
-    return data.error ?? `Request failed with status ${response.status}.`;
+    return sanitizeErrorMessage(data.error ?? `Request failed with status ${response.status}.`);
   } catch {
     return `Request failed with status ${response.status}.`;
   }
@@ -441,4 +448,31 @@ function decodeBase64(base64: string): Uint8Array {
   }
 
   return bytes;
+}
+
+function sanitizeErrorMessage(message: string): string {
+  return truncate(
+    message
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter(
+        (line) =>
+          !/^ffmpeg version /i.test(line) &&
+          !/^built with /i.test(line) &&
+          !/^configuration:/i.test(line) &&
+          !/^libav[a-z]+\s+/i.test(line)
+      )
+      .join(" "),
+    280
+  );
+}
+
+function truncate(text: string, maxLength: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) {
+    return compact;
+  }
+
+  return `${compact.slice(0, maxLength)}...`;
 }
