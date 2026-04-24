@@ -4,10 +4,10 @@ Private tool for converting pasted long-form text into one narration file using 
 
 ## Current behavior
 
-- Narration Mode is the default path for long-form essays.
-- Long inputs are cleaned, segmented automatically, generated section by section, normalized with `ffmpeg`, merged, then normalized again before delivery.
-- Short inputs can still run in a single pass.
-- The legacy full-document request path remains available as `Single-pass experimental`.
+- Continuous Read is the default path for long-form essays.
+- The app cleans the full document, sends one Mistral TTS request first, then applies final mastering to the completed file before delivery.
+- If the full-document request fails for a chunking-worthy reason, the app falls back to segmented generation, optional join smoothing, merge, and final mastering.
+- Advanced controls can force segmented generation directly when needed.
 
 ## Running locally
 

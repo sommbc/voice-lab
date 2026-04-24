@@ -11,6 +11,7 @@ import {
   getFileExtension,
   getMimeType,
   generateSilenceAudioFile,
+  masterAudioFile,
   mergeAudioFiles,
   STANDARD_INTERMEDIATE_CHANNELS,
   STANDARD_INTERMEDIATE_SAMPLE_RATE,
@@ -28,7 +29,6 @@ const MISTRAL_SPEECH_ENDPOINT = "https://api.mistral.ai/v1/audio/speech";
 const MISTRAL_MODEL = "voxtral-mini-tts-2603";
 const SINGLE_PASS_TIMEOUT_MS = 180_000;
 const SEGMENT_TIMEOUT_MS = 120_000;
-const SHORT_SINGLE_PASS_MAX_WORDS = 300;
 const INTERMEDIATE_SEGMENT_FORMAT: OutputFormat = "wav";
 
 type ProgressStage =
@@ -43,11 +43,9 @@ type ProgressStage =
   | "done";
 
 type GenerationStrategy =
-  | "narration-segmented"
-  | "fallback-chunking"
-  | "single-pass-experimental"
-  | "single-pass-short"
-  | "legacy-single-pass";
+  | "continuous-read"
+  | "segmented-fallback"
+  | "segmented-only";
 
 type StreamEvent =
   | {
@@ -90,9 +88,9 @@ export async function POST(request: Request): Promise<Response> {
     title?: unknown;
     text?: unknown;
     voiceId?: unknown;
-    narrationMode?: unknown;
-    singlePassExperimental?: unknown;
-    singlePassMode?: unknown;
+    continuousRead?: unknown;
+    fallbackToSegmented?: unknown;
+    forceSegmentedMode?: unknown;
     normalizationEnabled?: unknown;
     volumeBoost?: unknown;
     smoothJoins?: unknown;
@@ -112,10 +110,9 @@ export async function POST(request: Request): Promise<Response> {
     typeof payload.voiceId === "string" && payload.voiceId.trim()
       ? payload.voiceId.trim()
       : (process.env.MISTRAL_VOICE_ID ?? "");
-  const narrationMode = payload.narrationMode !== false;
-  const singlePassExperimental =
-    payload.singlePassExperimental === true ||
-    (payload.singlePassMode === true && payload.singlePassExperimental !== false);
+  const forceSegmentedMode = payload.forceSegmentedMode === true;
+  const continuousRead = forceSegmentedMode ? false : payload.continuousRead !== false;
+  const fallbackToSegmented = payload.fallbackToSegmented !== false;
   const normalizationEnabled = payload.normalizationEnabled !== false;
   const volumeBoost =
     payload.volumeBoost === "normal" ||
@@ -134,8 +131,9 @@ export async function POST(request: Request): Promise<Response> {
         title,
         text,
         voiceId,
-        narrationMode,
-        singlePassExperimental,
+        continuousRead,
+        fallbackToSegmented,
+        forceSegmentedMode,
         normalizationEnabled,
         volumeBoost,
         smoothJoins,
@@ -159,8 +157,9 @@ async function runGeneration({
   title,
   text,
   voiceId,
-  narrationMode,
-  singlePassExperimental,
+  continuousRead,
+  fallbackToSegmented,
+  forceSegmentedMode,
   normalizationEnabled,
   volumeBoost,
   smoothJoins,
@@ -171,8 +170,9 @@ async function runGeneration({
   title: string;
   text: string;
   voiceId: string;
-  narrationMode: boolean;
-  singlePassExperimental: boolean;
+  continuousRead: boolean;
+  fallbackToSegmented: boolean;
+  forceSegmentedMode: boolean;
   normalizationEnabled: boolean;
   volumeBoost: VolumeBoost;
   smoothJoins: boolean;
@@ -196,7 +196,7 @@ async function runGeneration({
     sendEvent({
       type: "progress",
       stage: "cleaning",
-      message: "Preparing narration"
+      message: "Cleaning text"
     });
 
     const preparedText = prepareTextForSpeech(text);
@@ -206,44 +206,8 @@ async function runGeneration({
     }
 
     const filename = `${slugifyFilename(title, "voiceover")}.${getFileExtension(outputFormat)}`;
-    const shouldUseShortSinglePass =
-      narrationMode && preparedText.wordCount <= SHORT_SINGLE_PASS_MAX_WORDS;
 
-    if (shouldUseShortSinglePass) {
-      const singlePassResult = await generateSinglePassResult({
-        input: preparedText.cleanedText,
-        voiceId,
-        outputFormat,
-        normalizationEnabled,
-        volumeBoost,
-        sendEvent,
-        debugForceSinglePassFailure,
-        strategyLabel: "Narration Mode short-form single pass"
-      });
-
-      tempDirectoryPath = singlePassResult.tempDirectoryPath;
-
-      sendEvent({
-        type: "progress",
-        stage: "done",
-        message: "Done"
-      });
-
-      sendEvent({
-        type: "complete",
-        filename,
-        audioBase64: singlePassResult.audioBuffer.toString("base64"),
-        mimeType: getMimeType(outputFormat),
-        outputFormat,
-        normalizationApplied: singlePassResult.normalizationApplied,
-        normalizationFallbackUsed: singlePassResult.normalizationFallbackUsed,
-        strategy: "single-pass-short",
-        totalSegments: 1
-      });
-      return;
-    }
-
-    if (narrationMode && !singlePassExperimental) {
+    if (forceSegmentedMode || !continuousRead) {
       const segmentedResult = await generateSegmentedSpeech({
         paragraphs: preparedText.paragraphs,
         voiceId,
@@ -251,7 +215,8 @@ async function runGeneration({
         normalizationEnabled,
         volumeBoost,
         smoothJoins,
-        sendEvent
+        sendEvent,
+        preparationMessage: "Preparing segmented generation"
       });
 
       tempDirectoryPath = segmentedResult.tempDirectoryPath;
@@ -270,7 +235,7 @@ async function runGeneration({
         outputFormat,
         normalizationApplied: segmentedResult.normalizationApplied,
         normalizationFallbackUsed: segmentedResult.normalizationFallbackUsed,
-        strategy: "narration-segmented",
+        strategy: "segmented-only",
         totalSegments: segmentedResult.totalSegments
       });
       return;
@@ -285,9 +250,7 @@ async function runGeneration({
         volumeBoost,
         sendEvent,
         debugForceSinglePassFailure,
-        strategyLabel: narrationMode
-          ? "Single-pass experimental: trying full document first"
-          : "Narration Mode off: trying full document first"
+        progressMessage: "Generating continuous read"
       });
 
       tempDirectoryPath = singlePassResult.tempDirectoryPath;
@@ -306,21 +269,21 @@ async function runGeneration({
         outputFormat,
         normalizationApplied: singlePassResult.normalizationApplied,
         normalizationFallbackUsed: singlePassResult.normalizationFallbackUsed,
-        strategy: narrationMode ? "single-pass-experimental" : "legacy-single-pass",
+        strategy: "continuous-read",
         totalSegments: 1
       });
       return;
     } catch (error) {
       const failure = toGenerationFailure(error);
 
-      if (!failure.chunkingWorth) {
+      if (!fallbackToSegmented || !failure.chunkingWorth) {
         throw failure;
       }
 
       sendEvent({
         type: "progress",
-        stage: "segmenting",
-        message: `Single-pass failed (${truncate(failure.message, 160)}). Preparing narration segments`
+        stage: "single-pass",
+        message: "Continuous read failed. Falling back to segmented generation."
       });
     }
 
@@ -331,7 +294,8 @@ async function runGeneration({
       normalizationEnabled,
       volumeBoost,
       smoothJoins,
-      sendEvent
+      sendEvent,
+      preparationMessage: "Preparing segmented fallback"
     });
 
     tempDirectoryPath = fallbackResult.tempDirectoryPath;
@@ -350,7 +314,7 @@ async function runGeneration({
       outputFormat,
       normalizationApplied: fallbackResult.normalizationApplied,
       normalizationFallbackUsed: fallbackResult.normalizationFallbackUsed,
-      strategy: "fallback-chunking",
+      strategy: "segmented-fallback",
       totalSegments: fallbackResult.totalSegments
     });
   } catch (error) {
@@ -380,23 +344,15 @@ function validateEnvironment(voiceId: string): void {
 async function prepareSegmentsForJoinSmoothing({
   segmentPaths,
   tempDirectoryPath,
-  smoothJoins,
-  sendEvent
+  smoothJoins
 }: {
   segmentPaths: string[];
   tempDirectoryPath: string;
   smoothJoins: boolean;
-  sendEvent: (event: StreamEvent) => void;
 }): Promise<string[]> {
   if (!smoothJoins || segmentPaths.length < 2) {
     return segmentPaths;
   }
-
-  sendEvent({
-    type: "progress",
-    stage: "smoothing",
-    message: "Smoothing joins"
-  });
 
   const joinGapPath = path.join(tempDirectoryPath, "join-gap.wav");
 
@@ -458,7 +414,7 @@ async function mergeSegmentsWithFallback({
   sendEvent({
     type: "progress",
     stage: "merging",
-    message: "Joining sections"
+    message: "Merging audio"
   });
 
   const copyMergedPath = path.join(tempDirectoryPath, "merged.wav");
@@ -483,7 +439,7 @@ async function mergeSegmentsWithFallback({
     sendEvent({
       type: "progress",
       stage: "merging",
-      message: `Concat copy failed (${truncate(concatFailureReason, 140)}). Retrying with re-encoding`
+      message: `Merging audio again with re-encoding (${truncate(concatFailureReason, 120)})`
     });
 
     try {
@@ -561,17 +517,15 @@ async function finalizeOutput({
   sendEvent({
     type: "progress",
     stage: "final-normalization",
-    message: "Final mastering"
+    message: "Mastering final audio"
   });
 
   try {
-    await transcodeAudioFile({
+    await masterAudioFile({
       inputPath: assembledPath,
       outputPath: normalizedOutputPath,
       outputFormat,
-      applyLoudnorm: true,
-      volumeBoost,
-      stage: "final-normalization"
+      volumeBoost
     });
 
     return {
@@ -586,10 +540,10 @@ async function finalizeOutput({
       sendEvent({
         type: "progress",
         stage: "final-normalization",
-        message: `Final mastering failed (${truncate(
+        message: `Mastering final audio failed (${truncate(
           normalizationFailureReason,
           140
-        )}). Using merged audio without mastering`
+        )}). Using the unmastered audio instead`
       });
 
       return {
@@ -607,7 +561,7 @@ async function finalizeOutput({
     sendEvent({
       type: "progress",
       stage: "final-normalization",
-      message: `Final mastering failed (${truncate(
+      message: `Mastering final audio failed (${truncate(
         normalizationFailureReason,
         140
       )}). Retrying without mastering`
@@ -623,7 +577,7 @@ async function finalizeOutput({
       });
     } catch (fallbackError) {
       throw new Error(
-        `Final normalization failed: ${normalizationFailureReason}. Fallback export failed: ${extractErrorReason(
+        `Mastering final audio failed: ${normalizationFailureReason}. Fallback export failed: ${extractErrorReason(
           fallbackError
         )}`
       );
@@ -645,7 +599,7 @@ async function generateSinglePassResult({
   volumeBoost,
   sendEvent,
   debugForceSinglePassFailure,
-  strategyLabel
+  progressMessage
 }: {
   input: string;
   voiceId: string;
@@ -654,7 +608,7 @@ async function generateSinglePassResult({
   volumeBoost: VolumeBoost;
   sendEvent: (event: StreamEvent) => void;
   debugForceSinglePassFailure: boolean;
-  strategyLabel: string;
+  progressMessage: string;
 }): Promise<{
   audioBuffer: Buffer;
   tempDirectoryPath: string;
@@ -664,7 +618,7 @@ async function generateSinglePassResult({
   sendEvent({
     type: "progress",
     stage: "single-pass",
-    message: strategyLabel
+    message: progressMessage
   });
 
   const sourceFormat = normalizationEnabled ? INTERMEDIATE_SEGMENT_FORMAT : outputFormat;
@@ -783,7 +737,8 @@ async function generateSegmentedSpeech({
   normalizationEnabled,
   volumeBoost,
   smoothJoins,
-  sendEvent
+  sendEvent,
+  preparationMessage
 }: {
   paragraphs: Parameters<typeof chunkText>[0];
   voiceId: string;
@@ -792,6 +747,7 @@ async function generateSegmentedSpeech({
   volumeBoost: VolumeBoost;
   smoothJoins: boolean;
   sendEvent: (event: StreamEvent) => void;
+  preparationMessage: string;
 }): Promise<{
   audioBuffer: Buffer;
   totalSegments: number;
@@ -808,7 +764,7 @@ async function generateSegmentedSpeech({
   sendEvent({
     type: "progress",
     stage: "segmenting",
-    message: "Preparing narration"
+    message: preparationMessage
   });
 
   const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
@@ -852,14 +808,6 @@ async function generateSegmentedSpeech({
         `segment-${String(segmentNumber).padStart(3, "0")}-normalized.wav`
       );
 
-      sendEvent({
-        type: "progress",
-        stage: "normalizing",
-        message: `Normalizing section ${segmentNumber} of ${segments.length}`,
-        currentSegment: segmentNumber,
-        totalSegments: segments.length
-      });
-
       try {
         await transcodeAudioFile({
           inputPath: rawSegmentPath,
@@ -883,8 +831,7 @@ async function generateSegmentedSpeech({
     const joinReadyPaths = await prepareSegmentsForJoinSmoothing({
       segmentPaths,
       tempDirectoryPath,
-      smoothJoins,
-      sendEvent
+      smoothJoins
     });
 
     const assembledPath = await mergeSegmentsWithFallback({
@@ -1044,6 +991,14 @@ function isChunkingWorthyApiFailure(status: number, errorBody: string): boolean 
     return true;
   }
 
+  if (status === 429 || status >= 500) {
+    return true;
+  }
+
+  if (status === 401 || status === 403 || status === 404) {
+    return false;
+  }
+
   if (status !== 400) {
     return false;
   }
@@ -1075,7 +1030,7 @@ function formatAudioStageLabel(stage: AudioProcessingError["stage"]): string {
     case "segment-normalization":
       return "Segment normalization";
     case "final-normalization":
-      return "Final mastering";
+      return "Mastering final audio";
     case "join-smoothing":
       return "Join smoothing";
     case "merge":

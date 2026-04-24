@@ -246,6 +246,30 @@ h1 {
   line-height: 1.5;
 }
 
+.advanced-panel {
+  margin-top: 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+}
+
+.advanced-summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ash-dim);
+}
+
+.advanced-summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-body {
+  padding-top: 14px;
+}
+
 /* Controls panel */
 
 .controls {

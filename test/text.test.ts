@@ -68,7 +68,7 @@ test("speech cleanup converts common symbols and abbreviations into spoken-frien
   assert.doesNotMatch(prepared.cleanedText, /😄/);
 });
 
-test("audio command helpers expose the loudnorm normalization path", () => {
+test("audio command helpers expose the mastering path and correction gain hook", () => {
   const mp3Args = buildTranscodeArgs({
     inputPath: "/tmp/in.wav",
     outputPath: "/tmp/out.mp3",
@@ -98,10 +98,14 @@ test("audio command helpers expose the loudnorm normalization path", () => {
     outputFormat: "mp3",
     strategy: "reencode"
   });
+  const correctedFilter = buildMasteringFilter("louder", 1.25);
+  const tinyCorrectionFilter = buildMasteringFilter("louder", 0.04);
 
   assert.deepEqual(mp3Args.slice(0, 5), ["-y", "-i", "/tmp/in.wav", "-vn", "-af"]);
   assert.equal(LOUDNORM_FILTER, buildMasteringFilter("normal"));
   assert.equal(mp3Args[5], buildMasteringFilter("louder"));
+  assert.match(correctedFilter, /volume=1\.25dB/);
+  assert.doesNotMatch(tinyCorrectionFilter, /volume=/);
   assert.ok(mp3Args.includes("libmp3lame"));
   assert.ok(wavArgs[5].includes(TRIM_SILENCE_FILTER));
   assert.ok(wavArgs[5].includes(buildMasteringFilter("normal")));

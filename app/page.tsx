@@ -31,12 +31,7 @@ type ProgressStage =
   | "merging"
   | "final-normalization"
   | "done";
-type GenerationStrategy =
-  | "narration-segmented"
-  | "fallback-chunking"
-  | "single-pass-experimental"
-  | "single-pass-short"
-  | "legacy-single-pass";
+type GenerationStrategy = "continuous-read" | "segmented-fallback" | "segmented-only";
 
 type ProgressEvent = {
   type: "progress";
@@ -69,8 +64,9 @@ export default function HomePage() {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
   const [voiceId, setVoiceId] = useState(DEFAULT_VOICE_ID);
-  const [narrationMode, setNarrationMode] = useState(true);
-  const [singlePassExperimental, setSinglePassExperimental] = useState(false);
+  const [continuousRead, setContinuousRead] = useState(true);
+  const [fallbackToSegmented, setFallbackToSegmented] = useState(true);
+  const [forceSegmentedMode, setForceSegmentedMode] = useState(false);
   const [normalizationEnabled, setNormalizationEnabled] = useState(true);
   const [volumeBoost, setVolumeBoost] = useState<VolumeBoost>(DEFAULT_VOLUME_BOOST);
   const [smoothJoins, setSmoothJoins] = useState(true);
@@ -82,6 +78,8 @@ export default function HomePage() {
   const [downloadUrl, setDownloadUrl] = useState("");
   const [downloadFilename, setDownloadFilename] = useState("");
   const downloadUrlRef = useRef<string>("");
+
+  const segmentedControlsActive = forceSegmentedMode || !continuousRead || fallbackToSegmented;
 
   useEffect(() => {
     const stored = localStorage.getItem(VOICE_STORAGE_KEY);
@@ -111,8 +109,9 @@ export default function HomePage() {
 
     setTitle("");
     setText("");
-    setNarrationMode(true);
-    setSinglePassExperimental(false);
+    setContinuousRead(true);
+    setFallbackToSegmented(true);
+    setForceSegmentedMode(false);
     setNormalizationEnabled(true);
     setVolumeBoost(DEFAULT_VOLUME_BOOST);
     setSmoothJoins(true);
@@ -154,8 +153,9 @@ export default function HomePage() {
           title,
           text,
           voiceId,
-          narrationMode,
-          singlePassExperimental,
+          continuousRead,
+          fallbackToSegmented,
+          forceSegmentedMode,
           normalizationEnabled,
           volumeBoost,
           smoothJoins,
@@ -219,11 +219,7 @@ export default function HomePage() {
     if (event.type === "progress") {
       setStatusMessage(event.message);
 
-      if (
-        (event.stage === "generating" || event.stage === "normalizing") &&
-        event.currentSegment &&
-        event.totalSegments
-      ) {
+      if (event.stage === "generating" && event.currentSegment && event.totalSegments) {
         setStatusDetail(`section ${event.currentSegment} of ${event.totalSegments}`);
       } else {
         setStatusDetail("");
@@ -293,7 +289,7 @@ export default function HomePage() {
               </label>
 
               <label className="field-label">
-                <span className="field-name">Output format</span>
+                <span className="field-name">Output Format</span>
                 <div className="select-wrap">
                   <select
                     className="select"
@@ -325,65 +321,96 @@ export default function HomePage() {
               <div className="toggle-list">
                 <label className="toggle">
                   <input
-                    checked={narrationMode}
-                    onChange={(event) => setNarrationMode(event.target.checked)}
+                    checked={continuousRead}
+                    onChange={(event) => {
+                      setContinuousRead(event.target.checked);
+                      if (event.target.checked) {
+                        setForceSegmentedMode(false);
+                      }
+                    }}
                     type="checkbox"
                   />
                   <span>
-                    <span className="toggle-text">Narration Mode</span>
+                    <span className="toggle-text">Continuous Read</span>
                     <span className="toggle-note">
-                      Default on. Automatically segments long-form essays into narration-safe
-                      sections and still returns one file.
+                      Default on. Sends the full cleaned document in one Mistral request, then
+                      masters the final file.
                     </span>
                   </span>
                 </label>
 
                 <label className="toggle">
                   <input
-                    checked={singlePassExperimental}
-                    disabled={!narrationMode}
-                    onChange={(event) => setSinglePassExperimental(event.target.checked)}
+                    checked={fallbackToSegmented}
+                    disabled={!continuousRead || forceSegmentedMode}
+                    onChange={(event) => setFallbackToSegmented(event.target.checked)}
                     type="checkbox"
                   />
                   <span>
-                    <span className="toggle-text">Single-pass experimental</span>
+                    <span className="toggle-text">Fallback to segmented mode if needed</span>
                     <span className="toggle-note">
-                      {narrationMode
-                        ? "Try one full-document request first, then fall back to narration segments if it fails."
-                        : "Narration Mode off already uses the legacy full-document path first."}
-                    </span>
-                  </span>
-                </label>
-
-                <label className="toggle">
-                  <input
-                    checked={normalizationEnabled}
-                    onChange={(event) => setNormalizationEnabled(event.target.checked)}
-                    type="checkbox"
-                  />
-                  <span>
-                    <span className="toggle-text">Audio normalization</span>
-                    <span className="toggle-note">
-                      Normalize narration loudness automatically before delivery.
-                    </span>
-                  </span>
-                </label>
-
-                <label className="toggle">
-                  <input
-                    checked={smoothJoins}
-                    disabled={!narrationMode}
-                    onChange={(event) => setSmoothJoins(event.target.checked)}
-                    type="checkbox"
-                  />
-                  <span>
-                    <span className="toggle-text">Smooth joins</span>
-                    <span className="toggle-note">
-                      Trim awkward silence and add a natural pause between narration sections.
+                      {!continuousRead || forceSegmentedMode
+                        ? "Continuous Read is off, so segmented generation runs directly."
+                        : "If continuous read fails, retry section by section and still return one file."}
                     </span>
                   </span>
                 </label>
               </div>
+
+              <details className="advanced-panel">
+                <summary className="advanced-summary">Advanced</summary>
+                <div className="advanced-body toggle-list">
+                  <label className="toggle">
+                    <input
+                      checked={forceSegmentedMode}
+                      onChange={(event) => {
+                        setForceSegmentedMode(event.target.checked);
+                        if (event.target.checked) {
+                          setContinuousRead(false);
+                        }
+                      }}
+                      type="checkbox"
+                    />
+                    <span>
+                      <span className="toggle-text">Force segmented mode</span>
+                      <span className="toggle-note">
+                        Skip continuous read and generate section by section from the start.
+                      </span>
+                    </span>
+                  </label>
+
+                  <label className="toggle">
+                    <input
+                      checked={normalizationEnabled}
+                      onChange={(event) => setNormalizationEnabled(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span>
+                      <span className="toggle-text">Audio normalization</span>
+                      <span className="toggle-note">
+                        Apply final mastering before delivery.
+                      </span>
+                    </span>
+                  </label>
+
+                  {segmentedControlsActive && (
+                    <label className="toggle">
+                      <input
+                        checked={smoothJoins}
+                        disabled={!segmentedControlsActive}
+                        onChange={(event) => setSmoothJoins(event.target.checked)}
+                        type="checkbox"
+                      />
+                      <span>
+                        <span className="toggle-text">Smooth joins</span>
+                        <span className="toggle-note">
+                          Only used during segmented generation to soften section boundaries.
+                        </span>
+                      </span>
+                    </label>
+                  )}
+                </div>
+              </details>
             </div>
 
             <div className="card">
@@ -447,26 +474,22 @@ export default function HomePage() {
 function buildCompletionDetail(event: CompleteEvent): string {
   const strategyLabel = (() => {
     switch (event.strategy) {
-      case "narration-segmented":
-        return `Narration Mode segmented generation, ${event.totalSegments} sections`;
-      case "fallback-chunking":
-        return `Fallback chunking after single-pass failure, ${event.totalSegments} sections`;
-      case "single-pass-experimental":
-        return "Single-pass experimental";
-      case "legacy-single-pass":
-        return "Narration Mode off, legacy single-pass";
-      case "single-pass-short":
+      case "segmented-fallback":
+        return `Segmented fallback, ${event.totalSegments} sections`;
+      case "segmented-only":
+        return `Segmented only, ${event.totalSegments} sections`;
+      case "continuous-read":
       default:
-        return "Short-form single-pass";
+        return "Continuous read";
     }
   })();
 
   return `${strategyLabel}, ${event.outputFormat.toUpperCase()}, ${
     event.normalizationApplied
-      ? "normalized"
+      ? "mastered"
       : event.normalizationFallbackUsed
-        ? "normalization fallback used"
-        : "normalization off"
+        ? "mastering fallback used"
+        : "mastering off"
   }`;
 }
 
