@@ -247,122 +247,164 @@ export default function HomePage() {
   }
 
   const showStatus = isGenerating || !!statusMessage;
+  const showFeedbackPlaceholder = !showStatus && !errorMessage && !downloadUrl;
 
   return (
-    <main className="page">
-      <div className="stack">
-        <header className="header">
-          <p className="sec-label">Private Tool</p>
-          <h1>Voiceover</h1>
-          <p className="subtitle">Paste text. Get one narration file.</p>
+    <main className="app-shell">
+      <div className="page">
+        <header className="hero">
+          <div className="hero-copy">
+            <p className="eyebrow">Private Tool</p>
+            <h1 className="hero-title">VOICEOVER</h1>
+            <p className="hero-subtitle">
+              Paste long-form text. Get one finished narration file.
+            </p>
+          </div>
+
+          <div className="hero-note">
+            <p className="hero-note-label">Private Workflow</p>
+            <h2 className="hero-note-title">A clean generation surface for serious narration runs.</h2>
+            <p className="hero-note-copy">
+              Voice selection, fallback behavior, and the input surface all stay on one page. The
+              output still arrives as one file.
+            </p>
+          </div>
         </header>
 
-        <form className="stack" onSubmit={handleSubmit}>
-          <div className="row">
-            <div className="card stack">
-              <label className="field-label">
-                <span className="field-name">File name</span>
-                <input
-                  className="input"
-                  name="title"
-                  placeholder="my-article"
-                  value={title}
-                  onChange={(event) => setTitle(event.target.value)}
-                />
-              </label>
-
-              <label className="field-label">
-                <span className="field-name">Voice</span>
-                <div className="select-wrap">
-                  <select
-                    className="select"
-                    value={voiceId}
-                    onChange={(event) => handleVoiceChange(event.target.value)}
-                  >
-                    {VOICES.map((voice) => (
-                      <option key={voice.id} value={voice.id}>
-                        {voice.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </label>
-
-              <label className="field-label">
-                <span className="field-name">Output Format</span>
-                <div className="select-wrap">
-                  <select
-                    className="select"
-                    value={outputFormat}
-                    onChange={(event) => setOutputFormat(event.target.value as OutputFormat)}
-                  >
-                    <option value="mp3">MP3</option>
-                    <option value="wav">WAV</option>
-                  </select>
-                </div>
-              </label>
-
-              <label className="field-label">
-                <span className="field-name">Volume Boost</span>
-                <div className="select-wrap">
-                  <select
-                    className="select"
-                    disabled={!normalizationEnabled}
-                    value={volumeBoost}
-                    onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
-                  >
-                    <option value="normal">Normal</option>
-                    <option value="louder">Louder</option>
-                    <option value="very-loud">Very Loud</option>
-                  </select>
-                </div>
-              </label>
-
-              <div className="toggle-list">
-                <label className="toggle">
-                  <input
-                    checked={continuousRead}
-                    onChange={(event) => {
-                      setContinuousRead(event.target.checked);
-                      if (event.target.checked) {
-                        setForceSegmentedMode(false);
-                      }
-                    }}
-                    type="checkbox"
-                  />
-                  <span>
-                    <span className="toggle-text">Continuous Read</span>
-                    <span className="toggle-note">
-                      Default on. Sends the full cleaned document in one Mistral request, then
-                      masters the final file.
-                    </span>
-                  </span>
-                </label>
-
-                <label className="toggle">
-                  <input
-                    checked={fallbackToSegmented}
-                    disabled={!continuousRead || forceSegmentedMode}
-                    onChange={(event) => setFallbackToSegmented(event.target.checked)}
-                    type="checkbox"
-                  />
-                  <span>
-                    <span className="toggle-text">Fallback to segmented mode if needed</span>
-                    <span className="toggle-note">
-                      {!continuousRead || forceSegmentedMode
-                        ? "Continuous Read is off, so segmented generation runs directly."
-                        : "If continuous read fails, retry section by section and still return one file."}
-                    </span>
-                  </span>
-                </label>
+        <form className="workspace" onSubmit={handleSubmit}>
+          <div className="workspace-grid">
+            <aside className="panel panel-rail">
+              <div className="panel-head">
+                <p className="panel-kicker">Controls</p>
+                <h2 className="panel-title">Generation setup</h2>
+                <p className="panel-copy">
+                  Configure the output, then decide how aggressive the narration path should be.
+                </p>
               </div>
 
+              <section className="section">
+                <p className="section-heading">Output</p>
+                <div className="field-grid">
+                  <label className="field-label">
+                    <span className="field-name">File Name</span>
+                    <input
+                      className="input"
+                      name="title"
+                      placeholder="my-article"
+                      value={title}
+                      onChange={(event) => setTitle(event.target.value)}
+                    />
+                  </label>
+
+                  <label className="field-label">
+                    <span className="field-name">Voice</span>
+                    <div className="select-wrap">
+                      <select
+                        className="select"
+                        value={voiceId}
+                        onChange={(event) => handleVoiceChange(event.target.value)}
+                      >
+                        {VOICES.map((voice) => (
+                          <option key={voice.id} value={voice.id}>
+                            {voice.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </label>
+
+                  <div className="field-pair">
+                    <label className="field-label">
+                      <span className="field-name">Output Format</span>
+                      <div className="select-wrap">
+                        <select
+                          className="select"
+                          value={outputFormat}
+                          onChange={(event) => setOutputFormat(event.target.value as OutputFormat)}
+                        >
+                          <option value="mp3">MP3</option>
+                          <option value="wav">WAV</option>
+                        </select>
+                      </div>
+                    </label>
+
+                    <label className="field-label">
+                      <span className="field-name">Volume Boost</span>
+                      <div className="select-wrap">
+                        <select
+                          className="select"
+                          disabled={!normalizationEnabled}
+                          value={volumeBoost}
+                          onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
+                        >
+                          <option value="normal">Normal</option>
+                          <option value="louder">Louder</option>
+                          <option value="very-loud">Very Loud</option>
+                        </select>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section className="section">
+                <p className="section-heading">Narration Path</p>
+                <div className="toggle-list">
+                  <label className="toggle">
+                    <input
+                      checked={continuousRead}
+                      className="toggle-input"
+                      onChange={(event) => {
+                        setContinuousRead(event.target.checked);
+                        if (event.target.checked) {
+                          setForceSegmentedMode(false);
+                        }
+                      }}
+                      type="checkbox"
+                    />
+                    <span className="toggle-copy">
+                      <span className="toggle-text">Continuous Read</span>
+                      <span className="toggle-note">
+                        Default on. Sends the cleaned document in one Mistral request, then
+                        masters the final file.
+                      </span>
+                    </span>
+                  </label>
+
+                  <label className="toggle">
+                    <input
+                      checked={fallbackToSegmented}
+                      className="toggle-input"
+                      disabled={!continuousRead || forceSegmentedMode}
+                      onChange={(event) => setFallbackToSegmented(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span className="toggle-copy">
+                      <span className="toggle-text">Fallback to segmented mode if needed</span>
+                      <span className="toggle-note">
+                        {!continuousRead || forceSegmentedMode
+                          ? "Continuous Read is off, so segmented generation runs directly."
+                          : "If continuous read fails, retry section by section and still return one file."}
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              </section>
+
               <details className="advanced-panel">
-                <summary className="advanced-summary">Advanced</summary>
+                <summary className="advanced-summary">
+                  <span className="advanced-summary-copy">
+                    <span className="advanced-summary-title">Advanced</span>
+                    <span className="advanced-summary-note">Secondary processing controls</span>
+                  </span>
+                  <span aria-hidden="true" className="advanced-summary-icon" />
+                </summary>
+
                 <div className="advanced-body toggle-list">
                   <label className="toggle">
                     <input
                       checked={forceSegmentedMode}
+                      className="toggle-input"
                       onChange={(event) => {
                         setForceSegmentedMode(event.target.checked);
                         if (event.target.checked) {
@@ -371,7 +413,7 @@ export default function HomePage() {
                       }}
                       type="checkbox"
                     />
-                    <span>
+                    <span className="toggle-copy">
                       <span className="toggle-text">Force segmented mode</span>
                       <span className="toggle-note">
                         Skip continuous read and generate section by section from the start.
@@ -382,10 +424,11 @@ export default function HomePage() {
                   <label className="toggle">
                     <input
                       checked={normalizationEnabled}
+                      className="toggle-input"
                       onChange={(event) => setNormalizationEnabled(event.target.checked)}
                       type="checkbox"
                     />
-                    <span>
+                    <span className="toggle-copy">
                       <span className="toggle-text">Audio normalization</span>
                       <span className="toggle-note">
                         Apply final mastering before delivery.
@@ -397,11 +440,12 @@ export default function HomePage() {
                     <label className="toggle">
                       <input
                         checked={smoothJoins}
+                        className="toggle-input"
                         disabled={!segmentedControlsActive}
                         onChange={(event) => setSmoothJoins(event.target.checked)}
                         type="checkbox"
                       />
-                      <span>
+                      <span className="toggle-copy">
                         <span className="toggle-text">Smooth joins</span>
                         <span className="toggle-note">
                           Only used during segmented generation to soften section boundaries.
@@ -411,11 +455,21 @@ export default function HomePage() {
                   )}
                 </div>
               </details>
-            </div>
+            </aside>
 
-            <div className="card">
-              <label className="field-label">
-                <span className="field-name">Text</span>
+            <section className="panel panel-editor">
+              <div className="panel-head panel-head-editor">
+                <div>
+                  <p className="panel-kicker">Text Input</p>
+                  <h2 className="panel-title">Source text</h2>
+                </div>
+                <p className="panel-copy">
+                  Paste markdown or plain text. Cleanup still runs before narration.
+                </p>
+              </div>
+
+              <label className="field-label field-label-editor">
+                <span className="sr-only">Text</span>
                 <textarea
                   className="textarea"
                   name="text"
@@ -424,46 +478,67 @@ export default function HomePage() {
                   onChange={(event) => setText(event.target.value)}
                 />
               </label>
-            </div>
+            </section>
           </div>
 
-          <div className="controls">
-            <div className="actions">
-              <button className="btn-primary" disabled={isGenerating} type="submit">
-                {isGenerating ? "Generating..." : "Generate"}
-              </button>
-            </div>
+          <div className="workspace-footer">
+            <section className="action-card">
+              <div className="action-copy">
+                <p className="action-label">Run</p>
+                <h2 className="action-title">Generate the final narration file</h2>
+                <p className="action-note">
+                  Generation starts immediately and downloads the finished file when it is ready.
+                </p>
+              </div>
 
-            {showStatus && (
-              <div className="status-box">
-                <div className="status-label">Status</div>
-                <div className="status-message">
-                  {statusMessage}
-                  {statusDetail ? ` | ${statusDetail}` : ""}
+              <div className="actions actions-primary">
+                <button className="btn-primary" disabled={isGenerating} type="submit">
+                  {isGenerating ? "Generating..." : "Generate"}
+                </button>
+              </div>
+            </section>
+
+            <section className="feedback-stack">
+              {showStatus && (
+                <div aria-live="polite" className="feedback-card status-box" role="status">
+                  <div className="status-label">Status</div>
+                  <div className="status-message">{statusMessage}</div>
+                  {statusDetail && <div className="status-detail">{statusDetail}</div>}
                 </div>
-              </div>
-            )}
+              )}
 
-            {errorMessage && (
-              <div className="error-box">
-                <strong>Error:</strong> {errorMessage}
-              </div>
-            )}
+              {errorMessage && (
+                <div className="feedback-card error-box" role="alert">
+                  <div className="status-label">Error</div>
+                  <div className="error-message">{errorMessage}</div>
+                </div>
+              )}
 
-            {downloadUrl && (
-              <div className="output-box">
-                <div className="output-file">{downloadFilename}</div>
-                <div className="actions">
-                  <a className="btn-primary" href={downloadUrl} download={downloadFilename}>
-                    Download
-                  </a>
+              {downloadUrl && (
+                <div className="feedback-card output-box">
+                  <div className="status-label">Result</div>
+                  <div className="output-file">{downloadFilename}</div>
                   <audio className="audio-player" controls preload="metadata" src={downloadUrl} />
-                  <button className="btn-secondary" type="button" onClick={handleReset}>
-                    New Narration
-                  </button>
+                  <div className="output-actions">
+                    <a className="btn-secondary" href={downloadUrl} download={downloadFilename}>
+                      Download
+                    </a>
+                    <button className="btn-secondary" type="button" onClick={handleReset}>
+                      New Narration
+                    </button>
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+
+              {showFeedbackPlaceholder && (
+                <div className="feedback-card placeholder-box">
+                  <div className="status-label">Session</div>
+                  <div className="status-message">
+                    Progress, errors, and the finished file appear here during generation.
+                  </div>
+                </div>
+              )}
+            </section>
           </div>
         </form>
       </div>
