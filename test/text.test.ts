@@ -7,8 +7,12 @@ import {
   buildLinearMasteringFilter,
   buildMergeArgs,
   buildMasteringFilter,
+  buildStaticGainMasteringFilter,
   buildTranscodeArgs,
+  canLinearLoudnormEngage,
+  computeStaticMasteringGainDb,
   LOUDNORM_FILTER,
+  SPEECH_PREMASTER_FILTER,
   TRIM_SILENCE_FILTER,
   VOLUME_BOOST_SETTINGS,
   summarizeFfmpegStderr
@@ -136,6 +140,75 @@ test("linear mastering filter embeds the measured loudness stats and requests li
   assert.match(filter, /linear=true/);
   assert.match(filter, /print_format=json/);
   assert.match(filter, /,alimiter=limit=[0-9.]+:level=disabled$/);
+});
+
+test("speech pre-master filter chains highpass, compressor, and limiter for crest reduction", () => {
+  assert.equal(
+    SPEECH_PREMASTER_FILTER,
+    "highpass=f=70,acompressor=threshold=0.063:ratio=4:attack=2:release=120:makeup=2.51,alimiter=limit=0.708:level=disabled"
+  );
+});
+
+test("linear loudnorm feasibility predicate matches loud-quiet input crest constraints", () => {
+  const easy = canLinearLoudnormEngage(
+    {
+      input_i: "-19.50",
+      input_tp: "-7.20",
+      input_lra: "8.00",
+      input_thresh: "-29.50",
+      target_offset: "0.00"
+    },
+    VOLUME_BOOST_SETTINGS.normal
+  );
+  assert.equal(easy, true);
+
+  const hot = canLinearLoudnormEngage(
+    {
+      input_i: "-28.00",
+      input_tp: "-4.00",
+      input_lra: "12.50",
+      input_thresh: "-39.00",
+      target_offset: "0.00"
+    },
+    VOLUME_BOOST_SETTINGS.louder
+  );
+  assert.equal(hot, false);
+});
+
+test("static gain mastering filter caps gain at peak headroom and ends with limiter", () => {
+  const measurement = {
+    input_i: "-22.00",
+    input_tp: "-6.00",
+    input_lra: "9.00",
+    input_thresh: "-32.00",
+    target_offset: "0.00"
+  } as const;
+
+  const gain = computeStaticMasteringGainDb(VOLUME_BOOST_SETTINGS.louder, measurement);
+  assert.equal(gain, 5);
+
+  const filter = buildStaticGainMasteringFilter(VOLUME_BOOST_SETTINGS.louder, measurement);
+  assert.match(filter, /^volume=5\.00dB,/);
+  assert.match(filter, /,alimiter=limit=[0-9.]+:level=disabled$/);
+
+  const tooHotMeasurement = {
+    input_i: "-10.00",
+    input_tp: "-0.50",
+    input_lra: "9.00",
+    input_thresh: "-20.00",
+    target_offset: "0.00"
+  } as const;
+
+  const tooHot = computeStaticMasteringGainDb(
+    VOLUME_BOOST_SETTINGS.louder,
+    tooHotMeasurement
+  );
+  assert.equal(tooHot, -4);
+  const tooHotFilter = buildStaticGainMasteringFilter(
+    VOLUME_BOOST_SETTINGS.louder,
+    tooHotMeasurement
+  );
+  assert.match(tooHotFilter, /^volume=-4\.00dB,/);
 });
 
 test("ffmpeg stderr summarizer strips banners and keeps actionable lines", () => {

@@ -1018,7 +1018,7 @@ function formatAudioStageLabel(stage: AudioProcessingError["stage"]): string {
 function stripAudioFailurePrefix(message: string): string {
   return message
     .replace(
-      /^(audio merge|final mastering|final normalization|join smoothing|segment normalization|audio encoding|ffmpeg) failed:\s*/i,
+      /^(audio merge|final mastering|final normalization|join smoothing|segment normalization|speech pre-master|audio encoding|ffmpeg) failed:\s*/i,
       ""
     )
     .trim();

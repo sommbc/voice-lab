@@ -10,9 +10,15 @@ export type AudioProcessingStage =
   | "segment-normalization"
   | "merge"
   | "join-smoothing"
+  | "premaster"
   | "final-normalization"
   | "measurement"
   | "encoding";
+
+export type MasteringStrategy =
+  | "linear-loudnorm"
+  | "static-gain-limited"
+  | "dynamic-loudnorm";
 
 type MergeStrategy = "copy" | "reencode";
 type LoudnessSettings = {
@@ -49,8 +55,9 @@ export type AudioLoudnessMetrics = {
 
 export type AudioMasteringResult = {
   metrics: AudioLoudnessMetrics | null;
-  normalizationType: "linear" | "dynamic" | null;
-  linear: boolean;
+  preMasterMetrics: AudioLoudnessMetrics | null;
+  strategy: MasteringStrategy;
+  appliedGainDb: number | null;
 };
 
 export const DEFAULT_OUTPUT_FORMAT: OutputFormat = "mp3";
@@ -63,6 +70,11 @@ export const TRIM_SILENCE_FILTER =
   "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB:start_silence=0.04:detection=rms,areverse,silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB:start_silence=0.08:detection=rms,areverse";
 export const LOUDNORM_FILTER =
   "loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.841:level=disabled";
+export const SPEECH_PREMASTER_FILTER =
+  "highpass=f=70,acompressor=threshold=0.063:ratio=4:attack=2:release=120:makeup=2.51,alimiter=limit=0.708:level=disabled";
+const PREMASTER_INTERMEDIATE_SAMPLE_RATE = 24_000;
+const PREMASTER_INTERMEDIATE_CHANNELS = 1;
+const LINEAR_LOUDNORM_HEADROOM_DB = 0.2;
 export const FFMPEG_MISSING_MESSAGE =
   "ffmpeg executable not found. Checked FFMPEG_PATH, bundled ffmpeg-static, and system ffmpeg on PATH.";
 
@@ -85,6 +97,7 @@ const AUDIO_STAGE_LABELS: Record<AudioProcessingStage, string> = {
   "segment-normalization": "segment normalization",
   merge: "audio merge",
   "join-smoothing": "join smoothing",
+  premaster: "speech pre-master",
   "final-normalization": "final normalization",
   measurement: "audio measurement",
   encoding: "audio encoding"
@@ -314,18 +327,183 @@ export async function masterAudioFile({
 
   const settings = VOLUME_BOOST_SETTINGS[volumeBoost];
 
-  const measurement = await measureForLinearMastering(inputPath, settings);
+  const preMasterPath = path.join(
+    path.dirname(outputPath),
+    `premaster-${randomUUID()}.wav`
+  );
 
-  const applyFilter = buildLinearMasteringFilter(settings, measurement);
+  try {
+    await applySpeechPreMaster({
+      inputPath,
+      outputPath: preMasterPath
+    });
 
-  const { stderr } = await runFfmpegAndCapture(
+    const preMasterMetrics = await measureAudioFile(preMasterPath).catch((error) => {
+      console.warn(
+        "[mastering] pre-master verification unavailable",
+        JSON.stringify({
+          preMasterPath,
+          reason: error instanceof Error ? error.message : "Unknown measurement failure."
+        })
+      );
+      return null;
+    });
+
+    const measurement = await measureForLinearMastering(preMasterPath, settings);
+    const linearFeasible = canLinearLoudnormEngage(measurement, settings);
+
+    let strategy: MasteringStrategy;
+    let appliedGainDb: number | null = null;
+
+    if (linearFeasible) {
+      const linearFilter = buildLinearMasteringFilter(settings, measurement);
+
+      const { stderr } = await runFfmpegAndCapture(
+        [
+          "-y",
+          "-i",
+          preMasterPath,
+          "-vn",
+          "-af",
+          linearFilter,
+          ...getCodecArgs(outputFormat),
+          outputPath
+        ],
+        { stage: "final-normalization" }
+      );
+
+      await assertAudioFileReady(outputPath);
+
+      const passTwoStats = parseLoudnormStats(stderr);
+      const reportedType = passTwoStats?.normalization_type ?? null;
+
+      if (reportedType === "linear") {
+        strategy = "linear-loudnorm";
+        appliedGainDb = parseFiniteNumber(measurement.target_offset);
+      } else {
+        console.warn(
+          "[mastering] linear loudnorm did not engage despite headroom; falling back to static gain",
+          JSON.stringify({
+            volumeBoost,
+            reportedType,
+            measurement
+          })
+        );
+
+        const fallbackResult = await applyStaticGainMaster({
+          inputPath: preMasterPath,
+          outputPath,
+          outputFormat,
+          settings,
+          measurement
+        });
+
+        strategy = "static-gain-limited";
+        appliedGainDb = fallbackResult.appliedGainDb;
+      }
+    } else {
+      const fallbackResult = await applyStaticGainMaster({
+        inputPath: preMasterPath,
+        outputPath,
+        outputFormat,
+        settings,
+        measurement
+      });
+
+      strategy = "static-gain-limited";
+      appliedGainDb = fallbackResult.appliedGainDb;
+    }
+
+    const metrics = await measureAudioFile(outputPath).catch((error) => {
+      console.warn(
+        "[mastering] post-master verification unavailable",
+        JSON.stringify({
+          outputPath,
+          reason: error instanceof Error ? error.message : "Unknown measurement failure."
+        })
+      );
+      return null;
+    });
+
+    console.info(
+      "[mastering] final",
+      JSON.stringify({
+        volumeBoost,
+        strategy,
+        appliedGainDb,
+        targetIntegratedLoudness: settings.integratedLoudness,
+        targetTruePeak: settings.truePeak,
+        preMasterIntegratedLoudness: preMasterMetrics?.integratedLoudness ?? null,
+        preMasterTruePeak: preMasterMetrics?.truePeak ?? null,
+        measuredIntegratedLoudness: metrics?.integratedLoudness ?? null,
+        measuredTruePeak: metrics?.truePeak ?? null
+      })
+    );
+
+    return {
+      metrics,
+      preMasterMetrics,
+      strategy,
+      appliedGainDb
+    };
+  } finally {
+    await rm(preMasterPath, { force: true });
+  }
+}
+
+async function applySpeechPreMaster({
+  inputPath,
+  outputPath
+}: {
+  inputPath: string;
+  outputPath: string;
+}): Promise<void> {
+  await runFfmpeg(
     [
       "-y",
       "-i",
       inputPath,
       "-vn",
       "-af",
-      applyFilter,
+      SPEECH_PREMASTER_FILTER,
+      "-ar",
+      String(PREMASTER_INTERMEDIATE_SAMPLE_RATE),
+      "-ac",
+      String(PREMASTER_INTERMEDIATE_CHANNELS),
+      "-c:a",
+      "pcm_s16le",
+      outputPath
+    ],
+    { stage: "premaster" }
+  );
+
+  await assertAudioFileReady(outputPath);
+}
+
+async function applyStaticGainMaster({
+  inputPath,
+  outputPath,
+  outputFormat,
+  settings,
+  measurement
+}: {
+  inputPath: string;
+  outputPath: string;
+  outputFormat: OutputFormat;
+  settings: LoudnessSettings;
+  measurement: LoudnormMeasurement;
+}): Promise<{ appliedGainDb: number }> {
+  const filter = buildStaticGainMasteringFilter(settings, measurement);
+  const appliedGainDb = computeStaticMasteringGainDb(settings, measurement);
+
+  await runFfmpeg(
+    [
+      "-y",
+      "-i",
+      inputPath,
+      "-vn",
+      "-af",
+      filter,
       ...getCodecArgs(outputFormat),
       outputPath
     ],
@@ -334,53 +512,54 @@ export async function masterAudioFile({
 
   await assertAudioFileReady(outputPath);
 
-  const passTwoStats = parseLoudnormStats(stderr);
-  const normalizationType: "linear" | "dynamic" | null =
-    passTwoStats?.normalization_type === "linear"
-      ? "linear"
-      : passTwoStats?.normalization_type === "dynamic"
-        ? "dynamic"
-        : null;
+  return { appliedGainDb };
+}
 
-  if (normalizationType !== "linear") {
-    console.warn(
-      "[mastering] ffmpeg did not report linear normalization on pass 2",
-      JSON.stringify({
-        volumeBoost,
-        normalizationType,
-        measurement
-      })
-    );
+export function buildStaticGainMasteringFilter(
+  settings: LoudnessSettings,
+  measurement: LoudnormMeasurement
+): string {
+  const gainDb = computeStaticMasteringGainDb(settings, measurement);
+  const filters: string[] = [];
+
+  if (Math.abs(gainDb) >= 0.05) {
+    filters.push(`volume=${gainDb.toFixed(2)}dB`);
   }
 
-  const metrics = await measureAudioFile(outputPath).catch((error) => {
-    console.warn(
-      "[mastering] post-master verification unavailable",
-      JSON.stringify({
-        outputPath,
-        reason: error instanceof Error ? error.message : "Unknown measurement failure."
-      })
-    );
-    return null;
-  });
+  filters.push(`alimiter=limit=${settings.limiter}:level=disabled`);
+  return filters.join(",");
+}
 
-  console.info(
-    "[mastering] final",
-    JSON.stringify({
-      volumeBoost,
-      targetIntegratedLoudness: settings.integratedLoudness,
-      targetTruePeak: settings.truePeak,
-      measuredIntegratedLoudness: metrics?.integratedLoudness ?? null,
-      measuredTruePeak: metrics?.truePeak ?? null,
-      normalizationType
-    })
-  );
+export function computeStaticMasteringGainDb(
+  settings: LoudnessSettings,
+  measurement: LoudnormMeasurement
+): number {
+  const measuredI = Number(measurement.input_i);
+  const measuredTP = Number(measurement.input_tp);
 
-  return {
-    metrics,
-    normalizationType,
-    linear: normalizationType === "linear"
-  };
+  if (!Number.isFinite(measuredI) || !Number.isFinite(measuredTP)) {
+    return 0;
+  }
+
+  const requiredGainDb = settings.integratedLoudness - measuredI;
+  const peakHeadroomDb = settings.truePeak - measuredTP;
+  return Math.min(requiredGainDb, peakHeadroomDb);
+}
+
+export function canLinearLoudnormEngage(
+  measurement: LoudnormMeasurement,
+  settings: LoudnessSettings
+): boolean {
+  const measuredI = Number(measurement.input_i);
+  const measuredTP = Number(measurement.input_tp);
+
+  if (!Number.isFinite(measuredI) || !Number.isFinite(measuredTP)) {
+    return false;
+  }
+
+  const requiredGainDb = settings.integratedLoudness - measuredI;
+  const peakHeadroomDb = settings.truePeak - measuredTP;
+  return requiredGainDb <= peakHeadroomDb - LINEAR_LOUDNORM_HEADROOM_DB;
 }
 
 async function measureForLinearMastering(
