@@ -1,9 +1,16 @@
-import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { cleanText, chunkText, slugifyFilename } from "@/lib/text";
+import {
+  assertFfmpegAvailable,
+  DEFAULT_OUTPUT_FORMAT,
+  getFileExtension,
+  getMimeType,
+  mergeAudioFiles,
+  transcodeAudioFile,
+  type OutputFormat
+} from "@/lib/audio";
+import { chunkText, prepareTextForSpeech, slugifyFilename } from "@/lib/text";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -11,32 +18,50 @@ export const runtime = "nodejs";
 const MISTRAL_SPEECH_ENDPOINT = "https://api.mistral.ai/v1/audio/speech";
 const MISTRAL_MODEL = "voxtral-mini-tts-2603";
 const SINGLE_PASS_TIMEOUT_MS = 180_000;
-const CHUNK_TIMEOUT_MS = 120_000;
+const SEGMENT_TIMEOUT_MS = 120_000;
+const SHORT_SINGLE_PASS_MAX_WORDS = 300;
+const INTERMEDIATE_SEGMENT_FORMAT: OutputFormat = "wav";
 
-type ProgressStage = "cleaning" | "single-pass" | "chunking" | "generating" | "merging" | "done";
-type GenerationMode = "single-pass" | "chunked";
+type ProgressStage =
+  | "cleaning"
+  | "segmenting"
+  | "single-pass"
+  | "generating"
+  | "normalizing"
+  | "merging"
+  | "final-normalization"
+  | "done";
+
+type GenerationStrategy =
+  | "narration-segmented"
+  | "fallback-chunking"
+  | "single-pass-experimental"
+  | "single-pass-short"
+  | "legacy-single-pass";
 
 type StreamEvent =
   | {
       type: "progress";
       stage: ProgressStage;
       message: string;
-      currentChunk?: number;
-      totalChunks?: number;
+      currentSegment?: number;
+      totalSegments?: number;
     }
   | {
       type: "complete";
       filename: string;
       audioBase64: string;
-      totalChunks: number;
-      mode: GenerationMode;
-      usedFallbackChunking: boolean;
+      mimeType: string;
+      outputFormat: OutputFormat;
+      normalizationApplied: boolean;
+      strategy: GenerationStrategy;
+      totalSegments: number;
     }
   | {
       type: "error";
       message: string;
-      chunkIndex?: number;
-      totalChunks?: number;
+      segmentIndex?: number;
+      totalSegments?: number;
     };
 
 class GenerationFailure extends Error {
@@ -49,27 +74,21 @@ class GenerationFailure extends Error {
   }
 }
 
-let ffmpegReadyPromise: Promise<void> | null = null;
-
 export async function POST(request: Request): Promise<Response> {
   let payload: {
     title?: unknown;
     text?: unknown;
     voiceId?: unknown;
+    narrationMode?: unknown;
+    singlePassExperimental?: unknown;
     singlePassMode?: unknown;
-    fallbackChunkingOnFailure?: unknown;
+    normalizationEnabled?: unknown;
+    outputFormat?: unknown;
     debugForceSinglePassFailure?: unknown;
   };
 
   try {
-    payload = (await request.json()) as {
-      title?: unknown;
-      text?: unknown;
-      voiceId?: unknown;
-      singlePassMode?: unknown;
-      fallbackChunkingOnFailure?: unknown;
-      debugForceSinglePassFailure?: unknown;
-    };
+    payload = (await request.json()) as typeof payload;
   } catch {
     return Response.json({ error: "Request body must be valid JSON." }, { status: 400 });
   }
@@ -80,8 +99,12 @@ export async function POST(request: Request): Promise<Response> {
     typeof payload.voiceId === "string" && payload.voiceId.trim()
       ? payload.voiceId.trim()
       : (process.env.MISTRAL_VOICE_ID ?? "");
-  const singlePassMode = payload.singlePassMode !== false;
-  const fallbackChunkingOnFailure = payload.fallbackChunkingOnFailure !== false;
+  const narrationMode = payload.narrationMode !== false;
+  const singlePassExperimental =
+    payload.singlePassExperimental === true ||
+    (payload.singlePassMode === true && payload.singlePassExperimental !== false);
+  const normalizationEnabled = payload.normalizationEnabled !== false;
+  const outputFormat = payload.outputFormat === "wav" ? "wav" : DEFAULT_OUTPUT_FORMAT;
   const debugForceSinglePassFailure = payload.debugForceSinglePassFailure === true;
 
   const stream = new ReadableStream<Uint8Array>({
@@ -91,8 +114,10 @@ export async function POST(request: Request): Promise<Response> {
         title,
         text,
         voiceId,
-        singlePassMode,
-        fallbackChunkingOnFailure,
+        narrationMode,
+        singlePassExperimental,
+        normalizationEnabled,
+        outputFormat,
         debugForceSinglePassFailure
       });
     }
@@ -112,16 +137,20 @@ async function runGeneration({
   title,
   text,
   voiceId,
-  singlePassMode,
-  fallbackChunkingOnFailure,
+  narrationMode,
+  singlePassExperimental,
+  normalizationEnabled,
+  outputFormat,
   debugForceSinglePassFailure
 }: {
   controller: ReadableStreamDefaultController<Uint8Array>;
   title: string;
   text: string;
   voiceId: string;
-  singlePassMode: boolean;
-  fallbackChunkingOnFailure: boolean;
+  narrationMode: boolean;
+  singlePassExperimental: boolean;
+  normalizationEnabled: boolean;
+  outputFormat: OutputFormat;
   debugForceSinglePassFailure: boolean;
 }): Promise<void> {
   const encoder = new TextEncoder();
@@ -136,7 +165,7 @@ async function runGeneration({
       throw new Error("Paste some text before generating audio.");
     }
 
-    validateEnvironment();
+    validateEnvironment(voiceId);
 
     sendEvent({
       type: "progress",
@@ -144,71 +173,133 @@ async function runGeneration({
       message: "Cleaning text"
     });
 
-    const cleanedText = cleanText(text);
+    const preparedText = prepareTextForSpeech(text);
 
-    if (!cleanedText) {
+    if (!preparedText.cleanedText) {
       throw new Error("The cleaned text is empty. Paste longer plain-language content.");
     }
 
-    const filename = `${slugifyFilename(title, "voiceover")}.mp3`;
+    const filename = `${slugifyFilename(title, "voiceover")}.${getFileExtension(outputFormat)}`;
+    const shouldUseShortSinglePass =
+      narrationMode && preparedText.wordCount <= SHORT_SINGLE_PASS_MAX_WORDS;
 
-    if (singlePassMode) {
-      sendEvent({
-        type: "progress",
-        stage: "single-pass",
-        message: "Generating full document in single-pass mode"
+    if (shouldUseShortSinglePass) {
+      const singlePassResult = await generateSinglePassResult({
+        input: preparedText.cleanedText,
+        voiceId,
+        outputFormat,
+        normalizationEnabled,
+        sendEvent,
+        debugForceSinglePassFailure,
+        strategyLabel: "Narration Mode short-form single pass"
       });
 
-      try {
-        const audioBuffer = await generateSinglePassSpeech({
-          input: cleanedText,
-          voiceId,
-          debugForceSinglePassFailure
-        });
+      tempDirectoryPath = singlePassResult.tempDirectoryPath;
 
-        sendEvent({
-          type: "progress",
-          stage: "done",
-          message: "Done"
-        });
-
-        sendEvent({
-          type: "complete",
-          filename,
-          audioBase64: audioBuffer.toString("base64"),
-          totalChunks: 1,
-          mode: "single-pass",
-          usedFallbackChunking: false
-        });
-        return;
-      } catch (error) {
-        const failure = toGenerationFailure(error);
-
-        if (!fallbackChunkingOnFailure || !failure.chunkingWorth) {
-          throw failure;
-        }
-
-        sendEvent({
-          type: "progress",
-          stage: "chunking",
-          message: `Single-pass failed (${truncate(failure.message, 160)}). Falling back to chunking`
-        });
-      }
-    } else {
       sendEvent({
         type: "progress",
-        stage: "chunking",
-        message: "Single-pass disabled. Chunking text before generation"
+        stage: "done",
+        message: "Done"
+      });
+
+      sendEvent({
+        type: "complete",
+        filename,
+        audioBase64: singlePassResult.audioBuffer.toString("base64"),
+        mimeType: getMimeType(outputFormat),
+        outputFormat,
+        normalizationApplied: normalizationEnabled,
+        strategy: "single-pass-short",
+        totalSegments: 1
+      });
+      return;
+    }
+
+    if (narrationMode && !singlePassExperimental) {
+      const segmentedResult = await generateSegmentedSpeech({
+        paragraphs: preparedText.paragraphs,
+        voiceId,
+        outputFormat,
+        normalizationEnabled,
+        sendEvent
+      });
+
+      tempDirectoryPath = segmentedResult.tempDirectoryPath;
+
+      sendEvent({
+        type: "progress",
+        stage: "done",
+        message: "Done"
+      });
+
+      sendEvent({
+        type: "complete",
+        filename,
+        audioBase64: segmentedResult.audioBuffer.toString("base64"),
+        mimeType: getMimeType(outputFormat),
+        outputFormat,
+        normalizationApplied: normalizationEnabled,
+        strategy: "narration-segmented",
+        totalSegments: segmentedResult.totalSegments
+      });
+      return;
+    }
+
+    try {
+      const singlePassResult = await generateSinglePassResult({
+        input: preparedText.cleanedText,
+        voiceId,
+        outputFormat,
+        normalizationEnabled,
+        sendEvent,
+        debugForceSinglePassFailure,
+        strategyLabel: narrationMode
+          ? "Single-pass experimental: trying full document first"
+          : "Narration Mode off: trying full document first"
+      });
+
+      tempDirectoryPath = singlePassResult.tempDirectoryPath;
+
+      sendEvent({
+        type: "progress",
+        stage: "done",
+        message: "Done"
+      });
+
+      sendEvent({
+        type: "complete",
+        filename,
+        audioBase64: singlePassResult.audioBuffer.toString("base64"),
+        mimeType: getMimeType(outputFormat),
+        outputFormat,
+        normalizationApplied: normalizationEnabled,
+        strategy: narrationMode ? "single-pass-experimental" : "legacy-single-pass",
+        totalSegments: 1
+      });
+      return;
+    } catch (error) {
+      const failure = toGenerationFailure(error);
+
+      if (!failure.chunkingWorth) {
+        throw failure;
+      }
+
+      sendEvent({
+        type: "progress",
+        stage: "segmenting",
+        message: `Single-pass failed (${truncate(failure.message, 160)}). Preparing narration segments`
       });
     }
 
-    const chunkedResult = await generateChunkedSpeech({
-      cleanedText,
+    const fallbackResult = await generateSegmentedSpeech({
+      paragraphs: preparedText.paragraphs,
       voiceId,
+      outputFormat,
+      normalizationEnabled,
       sendEvent
     });
 
-    tempDirectoryPath = chunkedResult.tempDirectoryPath;
+    tempDirectoryPath = fallbackResult.tempDirectoryPath;
 
     sendEvent({
       type: "progress",
@@ -219,10 +310,12 @@ async function runGeneration({
     sendEvent({
       type: "complete",
       filename,
-      audioBase64: chunkedResult.audioBase64,
-      totalChunks: chunkedResult.totalChunks,
-      mode: "chunked",
-      usedFallbackChunking: singlePassMode
+      audioBase64: fallbackResult.audioBuffer.toString("base64"),
+      mimeType: getMimeType(outputFormat),
+      outputFormat,
+      normalizationApplied: normalizationEnabled,
+      strategy: "fallback-chunking",
+      totalSegments: fallbackResult.totalSegments
     });
   } catch (error) {
     const message =
@@ -241,19 +334,90 @@ async function runGeneration({
   }
 }
 
-function validateEnvironment(): void {
+function validateEnvironment(voiceId: string): void {
   if (!process.env.MISTRAL_API_KEY) {
     throw new Error("Missing required env var: MISTRAL_API_KEY");
   }
+
+  if (!voiceId) {
+    throw new Error("Missing voice ID. Pick a saved voice or set MISTRAL_VOICE_ID server-side.");
+  }
+}
+
+async function generateSinglePassResult({
+  input,
+  voiceId,
+  outputFormat,
+  normalizationEnabled,
+  sendEvent,
+  debugForceSinglePassFailure,
+  strategyLabel
+}: {
+  input: string;
+  voiceId: string;
+  outputFormat: OutputFormat;
+  normalizationEnabled: boolean;
+  sendEvent: (event: StreamEvent) => void;
+  debugForceSinglePassFailure: boolean;
+  strategyLabel: string;
+}): Promise<{ audioBuffer: Buffer; tempDirectoryPath: string }> {
+  sendEvent({
+    type: "progress",
+    stage: "single-pass",
+    message: strategyLabel
+  });
+
+  const sourceFormat = normalizationEnabled ? INTERMEDIATE_SEGMENT_FORMAT : outputFormat;
+  const audioBuffer = await generateSinglePassSpeech({
+    input,
+    voiceId,
+    responseFormat: sourceFormat,
+    debugForceSinglePassFailure
+  });
+
+  if (!normalizationEnabled) {
+    return {
+      audioBuffer,
+      tempDirectoryPath: ""
+    };
+  }
+
+  await assertFfmpegAvailable();
+
+  const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
+  const sourcePath = path.join(tempDirectoryPath, `single-pass-source.${getFileExtension(sourceFormat)}`);
+  const outputPath = path.join(tempDirectoryPath, `single-pass-output.${getFileExtension(outputFormat)}`);
+
+  await writeFile(sourcePath, audioBuffer);
+
+  sendEvent({
+    type: "progress",
+    stage: "final-normalization",
+    message: "Final normalization"
+  });
+
+  await transcodeAudioFile({
+    inputPath: sourcePath,
+    outputPath,
+    outputFormat,
+    applyLoudnorm: true
+  });
+
+  return {
+    audioBuffer: await readFile(outputPath),
+    tempDirectoryPath
+  };
 }
 
 async function generateSinglePassSpeech({
   input,
   voiceId,
+  responseFormat,
   debugForceSinglePassFailure
 }: {
   input: string;
   voiceId: string;
+  responseFormat: OutputFormat;
   debugForceSinglePassFailure: boolean;
 }): Promise<Buffer> {
   if (debugForceSinglePassFailure) {
@@ -275,7 +439,7 @@ async function generateSinglePassSpeech({
         model: MISTRAL_MODEL,
         input,
         voice_id: voiceId,
-        response_format: "mp3",
+        response_format: responseFormat,
         stream: false
       }),
       signal: AbortSignal.timeout(SINGLE_PASS_TIMEOUT_MS)
@@ -313,88 +477,148 @@ async function generateSinglePassSpeech({
   return audioBuffer;
 }
 
-async function generateChunkedSpeech({
-  cleanedText,
+async function generateSegmentedSpeech({
+  paragraphs,
   voiceId,
+  outputFormat,
+  normalizationEnabled,
   sendEvent
 }: {
-  cleanedText: string;
+  paragraphs: Parameters<typeof chunkText>[0];
   voiceId: string;
+  outputFormat: OutputFormat;
+  normalizationEnabled: boolean;
   sendEvent: (event: StreamEvent) => void;
 }): Promise<{
-  audioBase64: string;
-  totalChunks: number;
+  audioBuffer: Buffer;
+  totalSegments: number;
   tempDirectoryPath: string;
 }> {
-  const chunks = chunkText(cleanedText);
+  const segments = chunkText(paragraphs);
 
-  if (chunks.length === 0) {
-    throw new Error("No fallback speech chunks were created after cleaning.");
+  if (segments.length === 0) {
+    throw new Error("No narration segments were created after cleaning.");
   }
 
   sendEvent({
     type: "progress",
-    stage: "chunking",
-    message: `Chunking text into ${chunks.length} part${chunks.length === 1 ? "" : "s"}`
+    stage: "segmenting",
+    message: `Preparing narration segments (${segments.length} total)`
   });
 
   const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
-  const chunkPaths: string[] = [];
-  const chunkBuffers: Buffer[] = [];
+  const segmentPaths: string[] = [];
 
   try {
-    if (chunks.length > 1) {
-      await assertFfmpegAvailable();
-    }
+    await assertFfmpegAvailable();
 
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunkNumber = index + 1;
+    for (let index = 0; index < segments.length; index += 1) {
+      const segmentNumber = index + 1;
+
       sendEvent({
         type: "progress",
         stage: "generating",
-        message: `Generating chunk ${chunkNumber} of ${chunks.length}`,
-        currentChunk: chunkNumber,
-        totalChunks: chunks.length
+        message: `Generating segment ${segmentNumber} of ${segments.length}`,
+        currentSegment: segmentNumber,
+        totalSegments: segments.length
       });
 
-      const audioBuffer = await generateChunkSpeech({
-        input: chunks[index].text,
+      const audioBuffer = await generateSegmentSpeech({
+        input: segments[index].text,
         voiceId,
-        chunkNumber,
-        totalChunks: chunks.length
+        segmentNumber,
+        totalSegments: segments.length
       });
 
-      chunkBuffers.push(audioBuffer);
-
-      const chunkPath = path.join(
+      const rawSegmentPath = path.join(
         tempDirectoryPath,
-        `chunk-${String(chunkNumber).padStart(3, "0")}.mp3`
+        `segment-${String(segmentNumber).padStart(3, "0")}.wav`
       );
 
-      await writeFile(chunkPath, audioBuffer);
-      chunkPaths.push(chunkPath);
+      await writeFile(rawSegmentPath, audioBuffer);
+
+      if (!normalizationEnabled) {
+        segmentPaths.push(rawSegmentPath);
+        continue;
+      }
+
+      const normalizedSegmentPath = path.join(
+        tempDirectoryPath,
+        `segment-${String(segmentNumber).padStart(3, "0")}-normalized.wav`
+      );
+
+      sendEvent({
+        type: "progress",
+        stage: "normalizing",
+        message: `Normalizing segment ${segmentNumber} of ${segments.length}`,
+        currentSegment: segmentNumber,
+        totalSegments: segments.length
+      });
+
+      await transcodeAudioFile({
+        inputPath: rawSegmentPath,
+        outputPath: normalizedSegmentPath,
+        outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
+        applyLoudnorm: true
+      });
+
+      segmentPaths.push(normalizedSegmentPath);
     }
 
-    if (chunkBuffers.length === 1) {
-      return {
-        audioBase64: chunkBuffers[0].toString("base64"),
-        totalChunks: 1,
-        tempDirectoryPath
-      };
+    let assembledPath = segmentPaths[0];
+
+    if (segmentPaths.length > 1) {
+      sendEvent({
+        type: "progress",
+        stage: "merging",
+        message: "Merging audio"
+      });
+
+      assembledPath = path.join(tempDirectoryPath, "merged.wav");
+      await mergeAudioFiles({
+        inputPaths: segmentPaths,
+        outputPath: assembledPath,
+        copyAudio: true
+      });
     }
 
-    sendEvent({
-      type: "progress",
-      stage: "merging",
-      message: "Merging chunk MP3s"
-    });
+    let deliverPath = assembledPath;
 
-    const mergedOutputPath = path.join(tempDirectoryPath, "merged-output.mp3");
-    await mergeChunkFiles(chunkPaths, mergedOutputPath);
+    if (normalizationEnabled) {
+      deliverPath = path.join(
+        tempDirectoryPath,
+        `final-output.${getFileExtension(outputFormat)}`
+      );
+
+      sendEvent({
+        type: "progress",
+        stage: "final-normalization",
+        message: "Final normalization"
+      });
+
+      await transcodeAudioFile({
+        inputPath: assembledPath,
+        outputPath: deliverPath,
+        outputFormat,
+        applyLoudnorm: true
+      });
+    } else if (outputFormat !== INTERMEDIATE_SEGMENT_FORMAT) {
+      deliverPath = path.join(
+        tempDirectoryPath,
+        `final-output.${getFileExtension(outputFormat)}`
+      );
+
+      await transcodeAudioFile({
+        inputPath: assembledPath,
+        outputPath: deliverPath,
+        outputFormat,
+        applyLoudnorm: false
+      });
+    }
 
     return {
-      audioBase64: (await readFile(mergedOutputPath)).toString("base64"),
-      totalChunks: chunks.length,
+      audioBuffer: await readFile(deliverPath),
+      totalSegments: segments.length,
       tempDirectoryPath
     };
   } catch (error) {
@@ -403,43 +627,16 @@ async function generateChunkedSpeech({
   }
 }
 
-async function assertFfmpegAvailable(): Promise<void> {
-  if (!ffmpegReadyPromise) {
-    ffmpegReadyPromise = new Promise((resolve, reject) => {
-      const process = spawn("ffmpeg", ["-version"]);
-
-      process.once("error", () => {
-        reject(
-          new Error(
-            "ffmpeg is not installed or not available on PATH. On macOS: brew install ffmpeg"
-          )
-        );
-      });
-
-      process.once("exit", (code) => {
-        if (code === 0) {
-          resolve();
-          return;
-        }
-
-        reject(new Error("ffmpeg is installed but did not start cleanly."));
-      });
-    });
-  }
-
-  await ffmpegReadyPromise;
-}
-
-async function generateChunkSpeech({
+async function generateSegmentSpeech({
   input,
   voiceId,
-  chunkNumber,
-  totalChunks
+  segmentNumber,
+  totalSegments
 }: {
   input: string;
   voiceId: string;
-  chunkNumber: number;
-  totalChunks: number;
+  segmentNumber: number;
+  totalSegments: number;
 }): Promise<Buffer> {
   let response: Response;
 
@@ -454,20 +651,20 @@ async function generateChunkSpeech({
         model: MISTRAL_MODEL,
         input,
         voice_id: voiceId,
-        response_format: "mp3",
+        response_format: INTERMEDIATE_SEGMENT_FORMAT,
         stream: false
       }),
-      signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
+      signal: AbortSignal.timeout(SEGMENT_TIMEOUT_MS)
     });
   } catch (error) {
     if (isTimeoutError(error)) {
       throw new Error(
-        `Chunk ${chunkNumber} of ${totalChunks} failed: request timed out after ${formatSeconds(CHUNK_TIMEOUT_MS)} seconds.`
+        `Segment ${segmentNumber} of ${totalSegments} failed: request timed out after ${formatSeconds(SEGMENT_TIMEOUT_MS)} seconds.`
       );
     }
 
     throw new Error(
-      `Chunk ${chunkNumber} of ${totalChunks} failed before Mistral returned audio: ${describeUnknownError(error)}`
+      `Segment ${segmentNumber} of ${totalSegments} failed before Mistral returned audio: ${describeUnknownError(error)}`
     );
   }
 
@@ -475,7 +672,7 @@ async function generateChunkSpeech({
     const errorBody = await response.text();
     const suffix = errorBody ? ` ${truncate(errorBody, 300)}` : "";
     throw new Error(
-      `Chunk ${chunkNumber} of ${totalChunks} failed: Mistral API returned ${response.status} ${response.statusText}.${suffix}`
+      `Segment ${segmentNumber} of ${totalSegments} failed: Mistral API returned ${response.status} ${response.statusText}.${suffix}`
     );
   }
 
@@ -485,12 +682,14 @@ async function generateChunkSpeech({
     audioBuffer = await parseAudioResponse(response);
   } catch (error) {
     throw new Error(
-      `Chunk ${chunkNumber} of ${totalChunks} failed: ${describeUnknownError(error)}`
+      `Segment ${segmentNumber} of ${totalSegments} failed: ${describeUnknownError(error)}`
     );
   }
 
   if (audioBuffer.length === 0) {
-    throw new Error(`Chunk ${chunkNumber} of ${totalChunks} failed: Mistral returned empty audio.`);
+    throw new Error(
+      `Segment ${segmentNumber} of ${totalSegments} failed: Mistral returned empty audio.`
+    );
   }
 
   return audioBuffer;
@@ -514,71 +713,6 @@ async function parseAudioResponse(response: Response): Promise<Buffer> {
   }
 
   return Buffer.from(data.audio_data, "base64");
-}
-
-async function mergeChunkFiles(chunkPaths: string[], outputPath: string): Promise<void> {
-  const listFilePath = path.join(path.dirname(outputPath), `concat-${randomUUID()}.txt`);
-  const concatList = chunkPaths
-    .map((chunkPath) => `file '${escapeForFfmpegConcat(chunkPath)}'`)
-    .join("\n");
-
-  await writeFile(listFilePath, concatList);
-
-  try {
-    await runFfmpeg([
-      "-y",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      listFilePath,
-      "-vn",
-      "-acodec",
-      "libmp3lame",
-      "-b:a",
-      "192k",
-      outputPath
-    ]);
-
-    const outputStats = await stat(outputPath);
-    if (outputStats.size === 0) {
-      throw new Error("ffmpeg created an empty output file.");
-    }
-  } finally {
-    await rm(listFilePath, { force: true });
-  }
-}
-
-async function runFfmpeg(argumentsList: string[]): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const ffmpegProcess = spawn("ffmpeg", argumentsList, {
-      stdio: ["ignore", "ignore", "pipe"]
-    });
-
-    let stderr = "";
-
-    ffmpegProcess.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    ffmpegProcess.once("error", () => {
-      reject(
-        new Error(
-          "ffmpeg is not installed or not available on PATH. On macOS: brew install ffmpeg"
-        )
-      );
-    });
-
-    ffmpegProcess.once("exit", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-
-      reject(new Error(`ffmpeg failed while merging MP3 chunks. ${truncate(stderr, 400)}`));
-    });
-  });
 }
 
 function toGenerationFailure(error: unknown): GenerationFailure {
@@ -626,10 +760,6 @@ function describeUnknownError(error: unknown): string {
 
 function formatSeconds(milliseconds: number): number {
   return Math.round(milliseconds / 1000);
-}
-
-function escapeForFfmpegConcat(filePath: string): string {
-  return filePath.replace(/'/g, "'\\''");
 }
 
 function truncate(text: string, maxLength: number): string {

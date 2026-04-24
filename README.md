@@ -1,6 +1,13 @@
 # Voiceover
 
-Private tool for converting pasted long-form text into a single MP3 using Mistral's Voxtral TTS. Paste markdown or plain text, generate audio with a saved voice clone, download the file. Single-pass mode by default with automatic fallback chunking for large documents.
+Private tool for converting pasted long-form text into one narration file using Mistral's Voxtral TTS. Paste markdown or plain text, generate audio with a saved voice clone, and download the result as MP3 or WAV.
+
+## Current behavior
+
+- Narration Mode is the default path for long-form essays.
+- Long inputs are cleaned, segmented automatically, generated section by section, normalized with `ffmpeg`, merged, then normalized again before delivery.
+- Short inputs can still run in a single pass.
+- The legacy full-document request path remains available as `Single-pass experimental`.
 
 ## Running locally
 
@@ -9,7 +16,13 @@ npm install
 npm run dev
 ```
 
-Requires Node.js 18+ and ffmpeg installed locally (used for multi-chunk merges).
+Requires Node.js 18+. The server uses `ffmpeg` for narration normalization and multi-segment merges; it will use the bundled binary when available and fall back to a system `ffmpeg` on PATH.
+
+## Tests
+
+```
+npm test
+```
 
 ## Environment variables
 

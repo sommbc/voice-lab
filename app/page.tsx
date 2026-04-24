@@ -3,27 +3,44 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 
 const VOICES = [
-  { name: "Brandon",             id: "29511880-fc64-4d77-af2f-59ea3eb3efb1" },
-  { name: "Paul — Neutral",      id: "c69964a6-ab8b-4f8a-9465-ec0925096ec8" },
-  { name: "Paul — Confident",    id: "98559b22-62b5-4a64-a7cd-fc78ca41faa8" },
-  { name: "Paul — Cheerful",     id: "01d985cd-5e0c-4457-bfd8-80ba31a5bc03" },
-  { name: "Oliver — Neutral",    id: "e3596645-b1af-469e-b857-f18ddedc7652" },
-  { name: "Oliver — Confident",  id: "8169ab87-bc99-4669-a5ec-6855860ace24" },
-  { name: "Oliver — Curious",    id: "390c8a2b-60a6-4882-8437-c49a8bd33b63" },
-  { name: "Jane — Neutral",      id: "82c99ee6-f932-423f-a4a3-d403c8914b8d" },
-  { name: "Jane — Confident",    id: "cbe96cf0-85ec-4a10-accb-0b35c93b6dfd" },
-  { name: "Jane — Curious",      id: "5de47977-6e47-4266-a938-3bc1d76b4676" },
+  { name: "Brandon", id: "29511880-fc64-4d77-af2f-59ea3eb3efb1" },
+  { name: "Paul — Neutral", id: "c69964a6-ab8b-4f8a-9465-ec0925096ec8" },
+  { name: "Paul — Confident", id: "98559b22-62b5-4a64-a7cd-fc78ca41faa8" },
+  { name: "Paul — Cheerful", id: "01d985cd-5e0c-4457-bfd8-80ba31a5bc03" },
+  { name: "Oliver — Neutral", id: "e3596645-b1af-469e-b857-f18ddedc7652" },
+  { name: "Oliver — Confident", id: "8169ab87-bc99-4669-a5ec-6855860ace24" },
+  { name: "Oliver — Curious", id: "390c8a2b-60a6-4882-8437-c49a8bd33b63" },
+  { name: "Jane — Neutral", id: "82c99ee6-f932-423f-a4a3-d403c8914b8d" },
+  { name: "Jane — Confident", id: "cbe96cf0-85ec-4a10-accb-0b35c93b6dfd" },
+  { name: "Jane — Curious", id: "5de47977-6e47-4266-a938-3bc1d76b4676" }
 ];
 
 const DEFAULT_VOICE_ID = "29511880-fc64-4d77-af2f-59ea3eb3efb1";
 const VOICE_STORAGE_KEY = "voiceover-selected-voice-id";
 
+type OutputFormat = "mp3" | "wav";
+type ProgressStage =
+  | "cleaning"
+  | "segmenting"
+  | "single-pass"
+  | "generating"
+  | "normalizing"
+  | "merging"
+  | "final-normalization"
+  | "done";
+type GenerationStrategy =
+  | "narration-segmented"
+  | "fallback-chunking"
+  | "single-pass-experimental"
+  | "single-pass-short"
+  | "legacy-single-pass";
+
 type ProgressEvent = {
   type: "progress";
-  stage: "cleaning" | "single-pass" | "chunking" | "generating" | "merging" | "done";
+  stage: ProgressStage;
   message: string;
-  currentChunk?: number;
-  totalChunks?: number;
+  currentSegment?: number;
+  totalSegments?: number;
 };
 
 type ErrorEvent = {
@@ -35,9 +52,11 @@ type CompleteEvent = {
   type: "complete";
   filename: string;
   audioBase64: string;
-  totalChunks: number;
-  mode: "single-pass" | "chunked";
-  usedFallbackChunking: boolean;
+  mimeType: string;
+  outputFormat: OutputFormat;
+  normalizationApplied: boolean;
+  strategy: GenerationStrategy;
+  totalSegments: number;
 };
 
 type StreamEvent = ProgressEvent | ErrorEvent | CompleteEvent;
@@ -46,8 +65,10 @@ export default function HomePage() {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
   const [voiceId, setVoiceId] = useState(DEFAULT_VOICE_ID);
-  const [singlePassMode, setSinglePassMode] = useState(true);
-  const [fallbackChunkingOnFailure, setFallbackChunkingOnFailure] = useState(true);
+  const [narrationMode, setNarrationMode] = useState(true);
+  const [singlePassExperimental, setSinglePassExperimental] = useState(false);
+  const [normalizationEnabled, setNormalizationEnabled] = useState(true);
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp3");
   const [statusMessage, setStatusMessage] = useState("");
   const [statusDetail, setStatusDetail] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
@@ -58,7 +79,7 @@ export default function HomePage() {
 
   useEffect(() => {
     const stored = localStorage.getItem(VOICE_STORAGE_KEY);
-    if (stored && VOICES.some((v) => v.id === stored)) {
+    if (stored && VOICES.some((voice) => voice.id === stored)) {
       setVoiceId(stored);
     }
   }, []);
@@ -81,10 +102,13 @@ export default function HomePage() {
       URL.revokeObjectURL(downloadUrlRef.current);
       downloadUrlRef.current = "";
     }
+
     setTitle("");
     setText("");
-    setSinglePassMode(true);
-    setFallbackChunkingOnFailure(true);
+    setNarrationMode(true);
+    setSinglePassExperimental(false);
+    setNormalizationEnabled(true);
+    setOutputFormat("mp3");
     setDownloadUrl("");
     setDownloadFilename("");
     setErrorMessage("");
@@ -116,15 +140,17 @@ export default function HomePage() {
       const response = await fetch("/api/generate", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           title,
           text,
           voiceId,
-          singlePassMode,
-          fallbackChunkingOnFailure,
-        }),
+          narrationMode,
+          singlePassExperimental,
+          normalizationEnabled,
+          outputFormat
+        })
       });
 
       if (!response.ok) {
@@ -181,8 +207,12 @@ export default function HomePage() {
     if (event.type === "progress") {
       setStatusMessage(event.message);
 
-      if (event.stage === "generating" && event.currentChunk && event.totalChunks) {
-        setStatusDetail(`chunk ${event.currentChunk} of ${event.totalChunks}`);
+      if (
+        (event.stage === "generating" || event.stage === "normalizing") &&
+        event.currentSegment &&
+        event.totalSegments
+      ) {
+        setStatusDetail(`segment ${event.currentSegment} of ${event.totalSegments}`);
       } else {
         setStatusDetail("");
       }
@@ -193,7 +223,7 @@ export default function HomePage() {
     const audioBytes = decodeBase64(event.audioBase64);
     const audioBuffer = new ArrayBuffer(audioBytes.byteLength);
     new Uint8Array(audioBuffer).set(audioBytes);
-    const blob = new Blob([audioBuffer], { type: "audio/mpeg" });
+    const blob = new Blob([audioBuffer], { type: event.mimeType });
     const objectUrl = URL.createObjectURL(blob);
 
     downloadUrlRef.current = objectUrl;
@@ -216,7 +246,7 @@ export default function HomePage() {
         <header className="header">
           <p className="sec-label">Private Tool</p>
           <h1>Voiceover</h1>
-          <p className="subtitle">Paste text. Get an MP3.</p>
+          <p className="subtitle">Paste text. Get one narration file.</p>
         </header>
 
         <form className="stack" onSubmit={handleSubmit}>
@@ -239,11 +269,27 @@ export default function HomePage() {
                   <select
                     className="select"
                     value={voiceId}
-                    onChange={(e) => handleVoiceChange(e.target.value)}
+                    onChange={(event) => handleVoiceChange(event.target.value)}
                   >
-                    {VOICES.map((v) => (
-                      <option key={v.id} value={v.id}>{v.name}</option>
+                    {VOICES.map((voice) => (
+                      <option key={voice.id} value={voice.id}>
+                        {voice.name}
+                      </option>
                     ))}
+                  </select>
+                </div>
+              </label>
+
+              <label className="field-label">
+                <span className="field-name">Output format</span>
+                <div className="select-wrap">
+                  <select
+                    className="select"
+                    value={outputFormat}
+                    onChange={(event) => setOutputFormat(event.target.value as OutputFormat)}
+                  >
+                    <option value="mp3">MP3</option>
+                    <option value="wav">WAV</option>
                   </select>
                 </div>
               </label>
@@ -251,27 +297,46 @@ export default function HomePage() {
               <div className="toggle-list">
                 <label className="toggle">
                   <input
-                    checked={singlePassMode}
-                    onChange={(event) => setSinglePassMode(event.target.checked)}
+                    checked={narrationMode}
+                    onChange={(event) => setNarrationMode(event.target.checked)}
                     type="checkbox"
                   />
                   <span>
-                    <span className="toggle-text">Single pass</span>
-                    <span className="toggle-note">Full document in one request.</span>
+                    <span className="toggle-text">Narration Mode</span>
+                    <span className="toggle-note">
+                      Default on. Automatically segments long-form essays into narration-safe
+                      sections and still returns one file.
+                    </span>
                   </span>
                 </label>
 
                 <label className="toggle">
                   <input
-                    checked={fallbackChunkingOnFailure}
-                    disabled={!singlePassMode}
-                    onChange={(event) => setFallbackChunkingOnFailure(event.target.checked)}
+                    checked={singlePassExperimental}
+                    disabled={!narrationMode}
+                    onChange={(event) => setSinglePassExperimental(event.target.checked)}
                     type="checkbox"
                   />
                   <span>
-                    <span className="toggle-text">Chunk on failure</span>
+                    <span className="toggle-text">Single-pass experimental</span>
                     <span className="toggle-note">
-                      Split and merge if single-pass hits limits.
+                      {narrationMode
+                        ? "Try one full-document request first, then fall back to narration segments if it fails."
+                        : "Narration Mode off already uses the legacy full-document path first."}
+                    </span>
+                  </span>
+                </label>
+
+                <label className="toggle">
+                  <input
+                    checked={normalizationEnabled}
+                    onChange={(event) => setNormalizationEnabled(event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span>
+                    <span className="toggle-text">Audio normalization</span>
+                    <span className="toggle-note">
+                      Normalize narration loudness automatically before delivery.
                     </span>
                   </span>
                 </label>
@@ -304,7 +369,7 @@ export default function HomePage() {
                 <div className="status-label">Status</div>
                 <div className="status-message">
                   {statusMessage}
-                  {statusDetail ? ` — ${statusDetail}` : ""}
+                  {statusDetail ? ` | ${statusDetail}` : ""}
                 </div>
               </div>
             )}
@@ -322,14 +387,9 @@ export default function HomePage() {
                   <a className="btn-primary" href={downloadUrl} download={downloadFilename}>
                     Download
                   </a>
-                  <audio
-                    className="audio-player"
-                    controls
-                    preload="metadata"
-                    src={downloadUrl}
-                  />
+                  <audio className="audio-player" controls preload="metadata" src={downloadUrl} />
                   <button className="btn-secondary" type="button" onClick={handleReset}>
-                    New Transcription
+                    New Narration
                   </button>
                 </div>
               </div>
@@ -342,15 +402,25 @@ export default function HomePage() {
 }
 
 function buildCompletionDetail(event: CompleteEvent): string {
-  if (event.mode === "single-pass") {
-    return "single-pass";
-  }
+  const strategyLabel = (() => {
+    switch (event.strategy) {
+      case "narration-segmented":
+        return `Narration Mode segmented generation, ${event.totalSegments} segments`;
+      case "fallback-chunking":
+        return `Fallback chunking after single-pass failure, ${event.totalSegments} segments`;
+      case "single-pass-experimental":
+        return "Single-pass experimental";
+      case "legacy-single-pass":
+        return "Narration Mode off, legacy single-pass";
+      case "single-pass-short":
+      default:
+        return "Short-form single-pass";
+    }
+  })();
 
-  if (event.totalChunks === 1) {
-    return `${event.usedFallbackChunking ? "fallback, " : ""}1 chunk`;
-  }
-
-  return `${event.usedFallbackChunking ? "fallback, " : ""}${event.totalChunks} chunks merged`;
+  return `${strategyLabel}, ${event.outputFormat.toUpperCase()}, ${
+    event.normalizationApplied ? "normalized" : "normalization off"
+  }`;
 }
 
 async function readErrorResponse(response: Response): Promise<string> {
@@ -366,8 +436,8 @@ function decodeBase64(base64: string): Uint8Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
 
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
   }
 
   return bytes;
