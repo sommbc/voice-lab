@@ -4,12 +4,19 @@ import path from "node:path";
 import {
   AudioProcessingError,
   assertFfmpegAvailable,
+  DEFAULT_JOIN_PAUSE_MS,
   DEFAULT_OUTPUT_FORMAT,
+  DEFAULT_SMOOTH_JOINS,
+  DEFAULT_VOLUME_BOOST,
   getFileExtension,
   getMimeType,
+  generateSilenceAudioFile,
   mergeAudioFiles,
+  STANDARD_INTERMEDIATE_CHANNELS,
+  STANDARD_INTERMEDIATE_SAMPLE_RATE,
   transcodeAudioFile,
-  type OutputFormat
+  type OutputFormat,
+  type VolumeBoost
 } from "@/lib/audio";
 import { chunkText, prepareTextForSpeech, slugifyFilename } from "@/lib/text";
 
@@ -30,6 +37,7 @@ type ProgressStage =
   | "single-pass"
   | "generating"
   | "normalizing"
+  | "smoothing"
   | "merging"
   | "final-normalization"
   | "done";
@@ -86,6 +94,8 @@ export async function POST(request: Request): Promise<Response> {
     singlePassExperimental?: unknown;
     singlePassMode?: unknown;
     normalizationEnabled?: unknown;
+    volumeBoost?: unknown;
+    smoothJoins?: unknown;
     outputFormat?: unknown;
     debugForceSinglePassFailure?: unknown;
   };
@@ -107,6 +117,13 @@ export async function POST(request: Request): Promise<Response> {
     payload.singlePassExperimental === true ||
     (payload.singlePassMode === true && payload.singlePassExperimental !== false);
   const normalizationEnabled = payload.normalizationEnabled !== false;
+  const volumeBoost =
+    payload.volumeBoost === "normal" ||
+    payload.volumeBoost === "louder" ||
+    payload.volumeBoost === "very-loud"
+      ? payload.volumeBoost
+      : DEFAULT_VOLUME_BOOST;
+  const smoothJoins = payload.smoothJoins === false ? false : DEFAULT_SMOOTH_JOINS;
   const outputFormat = payload.outputFormat === "wav" ? "wav" : DEFAULT_OUTPUT_FORMAT;
   const debugForceSinglePassFailure = payload.debugForceSinglePassFailure === true;
 
@@ -120,6 +137,8 @@ export async function POST(request: Request): Promise<Response> {
         narrationMode,
         singlePassExperimental,
         normalizationEnabled,
+        volumeBoost,
+        smoothJoins,
         outputFormat,
         debugForceSinglePassFailure
       });
@@ -143,6 +162,8 @@ async function runGeneration({
   narrationMode,
   singlePassExperimental,
   normalizationEnabled,
+  volumeBoost,
+  smoothJoins,
   outputFormat,
   debugForceSinglePassFailure
 }: {
@@ -153,6 +174,8 @@ async function runGeneration({
   narrationMode: boolean;
   singlePassExperimental: boolean;
   normalizationEnabled: boolean;
+  volumeBoost: VolumeBoost;
+  smoothJoins: boolean;
   outputFormat: OutputFormat;
   debugForceSinglePassFailure: boolean;
 }): Promise<void> {
@@ -173,7 +196,7 @@ async function runGeneration({
     sendEvent({
       type: "progress",
       stage: "cleaning",
-      message: "Cleaning text"
+      message: "Preparing narration"
     });
 
     const preparedText = prepareTextForSpeech(text);
@@ -192,6 +215,7 @@ async function runGeneration({
         voiceId,
         outputFormat,
         normalizationEnabled,
+        volumeBoost,
         sendEvent,
         debugForceSinglePassFailure,
         strategyLabel: "Narration Mode short-form single pass"
@@ -225,6 +249,8 @@ async function runGeneration({
         voiceId,
         outputFormat,
         normalizationEnabled,
+        volumeBoost,
+        smoothJoins,
         sendEvent
       });
 
@@ -256,6 +282,7 @@ async function runGeneration({
         voiceId,
         outputFormat,
         normalizationEnabled,
+        volumeBoost,
         sendEvent,
         debugForceSinglePassFailure,
         strategyLabel: narrationMode
@@ -302,6 +329,8 @@ async function runGeneration({
       voiceId,
       outputFormat,
       normalizationEnabled,
+      volumeBoost,
+      smoothJoins,
       sendEvent
     });
 
@@ -348,6 +377,69 @@ function validateEnvironment(voiceId: string): void {
   }
 }
 
+async function prepareSegmentsForJoinSmoothing({
+  segmentPaths,
+  tempDirectoryPath,
+  smoothJoins,
+  sendEvent
+}: {
+  segmentPaths: string[];
+  tempDirectoryPath: string;
+  smoothJoins: boolean;
+  sendEvent: (event: StreamEvent) => void;
+}): Promise<string[]> {
+  if (!smoothJoins || segmentPaths.length < 2) {
+    return segmentPaths;
+  }
+
+  sendEvent({
+    type: "progress",
+    stage: "smoothing",
+    message: "Smoothing joins"
+  });
+
+  const joinGapPath = path.join(tempDirectoryPath, "join-gap.wav");
+
+  await generateSilenceAudioFile({
+    outputPath: joinGapPath,
+    durationMs: DEFAULT_JOIN_PAUSE_MS,
+    sampleRate: STANDARD_INTERMEDIATE_SAMPLE_RATE,
+    channels: STANDARD_INTERMEDIATE_CHANNELS
+  });
+
+  const smoothedPaths: string[] = [];
+
+  for (let index = 0; index < segmentPaths.length; index += 1) {
+    const smoothedSegmentPath = path.join(
+      tempDirectoryPath,
+      `segment-${String(index + 1).padStart(3, "0")}-smoothed.wav`
+    );
+
+    try {
+      await transcodeAudioFile({
+        inputPath: segmentPaths[index],
+        outputPath: smoothedSegmentPath,
+        outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
+        applyLoudnorm: false,
+        trimSilence: true,
+        sampleRate: STANDARD_INTERMEDIATE_SAMPLE_RATE,
+        channels: STANDARD_INTERMEDIATE_CHANNELS,
+        stage: "join-smoothing"
+      });
+    } catch (error) {
+      throw new Error(`Join smoothing failed on section ${index + 1}: ${extractErrorReason(error)}`);
+    }
+
+    smoothedPaths.push(smoothedSegmentPath);
+
+    if (index < segmentPaths.length - 1) {
+      smoothedPaths.push(joinGapPath);
+    }
+  }
+
+  return smoothedPaths;
+}
+
 async function mergeSegmentsWithFallback({
   segmentPaths,
   tempDirectoryPath,
@@ -366,7 +458,7 @@ async function mergeSegmentsWithFallback({
   sendEvent({
     type: "progress",
     stage: "merging",
-    message: "Merging audio"
+    message: "Joining sections"
   });
 
   const copyMergedPath = path.join(tempDirectoryPath, "merged.wav");
@@ -418,12 +510,14 @@ async function finalizeOutput({
   tempDirectoryPath,
   outputFormat,
   normalizationEnabled,
+  volumeBoost,
   sendEvent
 }: {
   assembledPath: string;
   tempDirectoryPath: string;
   outputFormat: OutputFormat;
   normalizationEnabled: boolean;
+  volumeBoost: VolumeBoost;
   sendEvent: (event: StreamEvent) => void;
 }): Promise<{
   deliverPath: string;
@@ -467,7 +561,7 @@ async function finalizeOutput({
   sendEvent({
     type: "progress",
     stage: "final-normalization",
-    message: "Final normalization"
+    message: "Final mastering"
   });
 
   try {
@@ -476,6 +570,7 @@ async function finalizeOutput({
       outputPath: normalizedOutputPath,
       outputFormat,
       applyLoudnorm: true,
+      volumeBoost,
       stage: "final-normalization"
     });
 
@@ -491,10 +586,10 @@ async function finalizeOutput({
       sendEvent({
         type: "progress",
         stage: "final-normalization",
-        message: `Final normalization failed (${truncate(
+        message: `Final mastering failed (${truncate(
           normalizationFailureReason,
           140
-        )}). Using merged audio without normalization`
+        )}). Using merged audio without mastering`
       });
 
       return {
@@ -512,10 +607,10 @@ async function finalizeOutput({
     sendEvent({
       type: "progress",
       stage: "final-normalization",
-      message: `Final normalization failed (${truncate(
+      message: `Final mastering failed (${truncate(
         normalizationFailureReason,
         140
-      )}). Retrying without normalization`
+      )}). Retrying without mastering`
     });
 
     try {
@@ -547,6 +642,7 @@ async function generateSinglePassResult({
   voiceId,
   outputFormat,
   normalizationEnabled,
+  volumeBoost,
   sendEvent,
   debugForceSinglePassFailure,
   strategyLabel
@@ -555,6 +651,7 @@ async function generateSinglePassResult({
   voiceId: string;
   outputFormat: OutputFormat;
   normalizationEnabled: boolean;
+  volumeBoost: VolumeBoost;
   sendEvent: (event: StreamEvent) => void;
   debugForceSinglePassFailure: boolean;
   strategyLabel: string;
@@ -599,6 +696,7 @@ async function generateSinglePassResult({
     tempDirectoryPath,
     outputFormat,
     normalizationEnabled,
+    volumeBoost,
     sendEvent
   });
 
@@ -683,12 +781,16 @@ async function generateSegmentedSpeech({
   voiceId,
   outputFormat,
   normalizationEnabled,
+  volumeBoost,
+  smoothJoins,
   sendEvent
 }: {
   paragraphs: Parameters<typeof chunkText>[0];
   voiceId: string;
   outputFormat: OutputFormat;
   normalizationEnabled: boolean;
+  volumeBoost: VolumeBoost;
+  smoothJoins: boolean;
   sendEvent: (event: StreamEvent) => void;
 }): Promise<{
   audioBuffer: Buffer;
@@ -706,7 +808,7 @@ async function generateSegmentedSpeech({
   sendEvent({
     type: "progress",
     stage: "segmenting",
-    message: `Preparing narration segments (${segments.length} total)`
+    message: "Preparing narration"
   });
 
   const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
@@ -721,7 +823,7 @@ async function generateSegmentedSpeech({
       sendEvent({
         type: "progress",
         stage: "generating",
-        message: `Generating segment ${segmentNumber} of ${segments.length}`,
+        message: `Generating section ${segmentNumber} of ${segments.length}`,
         currentSegment: segmentNumber,
         totalSegments: segments.length
       });
@@ -753,7 +855,7 @@ async function generateSegmentedSpeech({
       sendEvent({
         type: "progress",
         stage: "normalizing",
-        message: `Normalizing segment ${segmentNumber} of ${segments.length}`,
+        message: `Normalizing section ${segmentNumber} of ${segments.length}`,
         currentSegment: segmentNumber,
         totalSegments: segments.length
       });
@@ -764,6 +866,9 @@ async function generateSegmentedSpeech({
           outputPath: normalizedSegmentPath,
           outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
           applyLoudnorm: true,
+          volumeBoost: "normal",
+          sampleRate: STANDARD_INTERMEDIATE_SAMPLE_RATE,
+          channels: STANDARD_INTERMEDIATE_CHANNELS,
           stage: "segment-normalization"
         });
       } catch (error) {
@@ -775,8 +880,15 @@ async function generateSegmentedSpeech({
       segmentPaths.push(normalizedSegmentPath);
     }
 
-    const assembledPath = await mergeSegmentsWithFallback({
+    const joinReadyPaths = await prepareSegmentsForJoinSmoothing({
       segmentPaths,
+      tempDirectoryPath,
+      smoothJoins,
+      sendEvent
+    });
+
+    const assembledPath = await mergeSegmentsWithFallback({
+      segmentPaths: joinReadyPaths,
       tempDirectoryPath,
       outputFormat,
       sendEvent
@@ -787,6 +899,7 @@ async function generateSegmentedSpeech({
       tempDirectoryPath,
       outputFormat,
       normalizationEnabled,
+      volumeBoost,
       sendEvent
     });
 
@@ -962,7 +1075,9 @@ function formatAudioStageLabel(stage: AudioProcessingError["stage"]): string {
     case "segment-normalization":
       return "Segment normalization";
     case "final-normalization":
-      return "Final normalization";
+      return "Final mastering";
+    case "join-smoothing":
+      return "Join smoothing";
     case "merge":
       return "Audio merge";
     case "encoding":
@@ -975,7 +1090,10 @@ function formatAudioStageLabel(stage: AudioProcessingError["stage"]): string {
 
 function stripAudioFailurePrefix(message: string): string {
   return message
-    .replace(/^(audio merge|final normalization|segment normalization|audio encoding|ffmpeg) failed:\s*/i, "")
+    .replace(
+      /^(audio merge|final mastering|final normalization|join smoothing|segment normalization|audio encoding|ffmpeg) failed:\s*/i,
+      ""
+    )
     .trim();
 }
 

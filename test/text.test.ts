@@ -5,8 +5,10 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   buildMergeArgs,
+  buildMasteringFilter,
   buildTranscodeArgs,
   LOUDNORM_FILTER,
+  TRIM_SILENCE_FILTER,
   summarizeFfmpegStderr
 } from "../lib/audio";
 import { chunkText, prepareTextForSpeech } from "../lib/text";
@@ -14,17 +16,26 @@ import { chunkText, prepareTextForSpeech } from "../lib/text";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const fixturePath = path.join(__dirname, "fixtures", "long-form-essay.md");
 
-test("segmentation keeps narration segments populated and under 300 words", async () => {
+test("segmentation keeps narration sections populated and materially larger than before", async () => {
   const source = await readFile(fixturePath, "utf8");
   const prepared = prepareTextForSpeech(source);
   const segments = chunkText(prepared.paragraphs);
 
-  assert.ok(segments.length > 1, "expected more than one narration segment");
+  assert.ok(segments.length > 1, "expected more than one narration section");
+  assert.ok(segments.length <= 5, `expected fewer joins, got ${segments.length} sections`);
 
-  for (const segment of segments) {
+  for (const [index, segment] of segments.entries()) {
     assert.ok(segment.text.trim().length > 0, "segment should not be empty");
     assert.ok(segment.wordCount > 0, "segment should contain words");
-    assert.ok(segment.wordCount <= 300, `segment exceeded cap with ${segment.wordCount} words`);
+
+    if (index < segments.length - 1) {
+      assert.ok(
+        segment.wordCount >= 350,
+        `non-final section should stay large enough, got ${segment.wordCount} words`
+      );
+    }
+
+    assert.ok(segment.wordCount <= 650, `segment exceeded cap with ${segment.wordCount} words`);
   }
 });
 
@@ -62,13 +73,18 @@ test("audio command helpers expose the loudnorm normalization path", () => {
     inputPath: "/tmp/in.wav",
     outputPath: "/tmp/out.mp3",
     outputFormat: "mp3",
-    applyLoudnorm: true
+    applyLoudnorm: true,
+    volumeBoost: "louder"
   });
   const wavArgs = buildTranscodeArgs({
     inputPath: "/tmp/in.wav",
     outputPath: "/tmp/out.wav",
     outputFormat: "wav",
-    applyLoudnorm: true
+    applyLoudnorm: true,
+    trimSilence: true,
+    sampleRate: 24000,
+    channels: 1,
+    volumeBoost: "normal"
   });
   const mergeArgs = buildMergeArgs({
     listFilePath: "/tmp/concat.txt",
@@ -84,8 +100,11 @@ test("audio command helpers expose the loudnorm normalization path", () => {
   });
 
   assert.deepEqual(mp3Args.slice(0, 5), ["-y", "-i", "/tmp/in.wav", "-vn", "-af"]);
-  assert.equal(mp3Args[5], LOUDNORM_FILTER);
+  assert.equal(LOUDNORM_FILTER, buildMasteringFilter("normal"));
+  assert.equal(mp3Args[5], buildMasteringFilter("louder"));
   assert.ok(mp3Args.includes("libmp3lame"));
+  assert.ok(wavArgs[5].includes(TRIM_SILENCE_FILTER));
+  assert.ok(wavArgs[5].includes(buildMasteringFilter("normal")));
   assert.ok(wavArgs.includes("pcm_s16le"));
   assert.ok(mergeArgs.includes("-c"));
   assert.ok(mergeArgs.includes("copy"));

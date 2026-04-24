@@ -1,6 +1,6 @@
-const DEFAULT_TARGET_MIN_WORDS = 180;
-const DEFAULT_TARGET_MAX_WORDS = 260;
-const DEFAULT_HARD_MAX_WORDS = 300;
+const DEFAULT_TARGET_MIN_WORDS = 350;
+const DEFAULT_TARGET_MAX_WORDS = 600;
+const DEFAULT_HARD_MAX_WORDS = 650;
 
 const sentenceSegmenter =
   typeof Intl !== "undefined" && "Segmenter" in Intl
@@ -128,11 +128,13 @@ export function chunkText(
   };
 
   for (const part of chunkUnits) {
+    const previousPart = currentParts[currentParts.length - 1];
     const wouldExceedHardMax =
       currentWordCount > 0 && currentWordCount + part.wordCount > hardMaxWords;
     const shouldFlushForTarget =
       currentWordCount >= targetMinWords &&
-      currentWordCount + part.wordCount > targetMaxWords;
+      currentWordCount + part.wordCount > targetMaxWords &&
+      !shouldKeepBoundaryOpen(previousPart, part);
 
     if (wouldExceedHardMax || shouldFlushForTarget) {
       flushChunk();
@@ -280,6 +282,58 @@ function rebalanceTrailingChunk(
     previousChunk.wordCount += lastChunk.wordCount;
     chunks.pop();
   }
+}
+
+function shouldKeepBoundaryOpen(previousPart: TextChunk | undefined, nextPart: TextChunk): boolean {
+  if (!previousPart) {
+    return false;
+  }
+
+  return (
+    isBoundarySensitivePart(previousPart) ||
+    isBoundarySensitivePart(nextPart) ||
+    isShortFollowUpParagraph(nextPart)
+  );
+}
+
+function isBoundarySensitivePart(part: TextChunk): boolean {
+  const trimmed = part.text.trim();
+
+  if (!trimmed) {
+    return false;
+  }
+
+  if (trimmed.endsWith(":") || isQuoteLikeParagraph(trimmed)) {
+    return true;
+  }
+
+  const sentenceCount = splitIntoSentences(trimmed).length;
+
+  if (part.wordCount <= 18 && sentenceCount <= 1) {
+    return true;
+  }
+
+  return part.wordCount <= 48 && sentenceCount <= 2 && isHeadingLikeParagraph(trimmed);
+}
+
+function isShortFollowUpParagraph(part: TextChunk): boolean {
+  const trimmed = part.text.trim();
+
+  if (!trimmed) {
+    return false;
+  }
+
+  return (
+    part.wordCount <= 40 ||
+    /^[\"'([{]/.test(trimmed) ||
+    /^(and|but|or|so|because|then|still|instead|meanwhile|for example|for instance)\b/i.test(
+      trimmed
+    )
+  );
+}
+
+function isQuoteLikeParagraph(text: string): boolean {
+  return /^[\"']/.test(text) || /[\"']$/.test(text);
 }
 
 function cleanLine(rawLine: string): PreparedParagraph | null {

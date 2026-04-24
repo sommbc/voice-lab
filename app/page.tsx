@@ -17,14 +17,17 @@ const VOICES = [
 
 const DEFAULT_VOICE_ID = "29511880-fc64-4d77-af2f-59ea3eb3efb1";
 const VOICE_STORAGE_KEY = "voiceover-selected-voice-id";
+const DEFAULT_VOLUME_BOOST = "louder";
 
 type OutputFormat = "mp3" | "wav";
+type VolumeBoost = "normal" | "louder" | "very-loud";
 type ProgressStage =
   | "cleaning"
   | "segmenting"
   | "single-pass"
   | "generating"
   | "normalizing"
+  | "smoothing"
   | "merging"
   | "final-normalization"
   | "done";
@@ -69,6 +72,8 @@ export default function HomePage() {
   const [narrationMode, setNarrationMode] = useState(true);
   const [singlePassExperimental, setSinglePassExperimental] = useState(false);
   const [normalizationEnabled, setNormalizationEnabled] = useState(true);
+  const [volumeBoost, setVolumeBoost] = useState<VolumeBoost>(DEFAULT_VOLUME_BOOST);
+  const [smoothJoins, setSmoothJoins] = useState(true);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp3");
   const [statusMessage, setStatusMessage] = useState("");
   const [statusDetail, setStatusDetail] = useState("");
@@ -109,6 +114,8 @@ export default function HomePage() {
     setNarrationMode(true);
     setSinglePassExperimental(false);
     setNormalizationEnabled(true);
+    setVolumeBoost(DEFAULT_VOLUME_BOOST);
+    setSmoothJoins(true);
     setOutputFormat("mp3");
     setDownloadUrl("");
     setDownloadFilename("");
@@ -150,6 +157,8 @@ export default function HomePage() {
           narrationMode,
           singlePassExperimental,
           normalizationEnabled,
+          volumeBoost,
+          smoothJoins,
           outputFormat
         })
       });
@@ -215,7 +224,7 @@ export default function HomePage() {
         event.currentSegment &&
         event.totalSegments
       ) {
-        setStatusDetail(`segment ${event.currentSegment} of ${event.totalSegments}`);
+        setStatusDetail(`section ${event.currentSegment} of ${event.totalSegments}`);
       } else {
         setStatusDetail("");
       }
@@ -297,6 +306,22 @@ export default function HomePage() {
                 </div>
               </label>
 
+              <label className="field-label">
+                <span className="field-name">Volume Boost</span>
+                <div className="select-wrap">
+                  <select
+                    className="select"
+                    disabled={!normalizationEnabled}
+                    value={volumeBoost}
+                    onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
+                  >
+                    <option value="normal">Normal</option>
+                    <option value="louder">Louder</option>
+                    <option value="very-loud">Very Loud</option>
+                  </select>
+                </div>
+              </label>
+
               <div className="toggle-list">
                 <label className="toggle">
                   <input
@@ -340,6 +365,21 @@ export default function HomePage() {
                     <span className="toggle-text">Audio normalization</span>
                     <span className="toggle-note">
                       Normalize narration loudness automatically before delivery.
+                    </span>
+                  </span>
+                </label>
+
+                <label className="toggle">
+                  <input
+                    checked={smoothJoins}
+                    disabled={!narrationMode}
+                    onChange={(event) => setSmoothJoins(event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span>
+                    <span className="toggle-text">Smooth joins</span>
+                    <span className="toggle-note">
+                      Trim awkward silence and add a natural pause between narration sections.
                     </span>
                   </span>
                 </label>
@@ -408,9 +448,9 @@ function buildCompletionDetail(event: CompleteEvent): string {
   const strategyLabel = (() => {
     switch (event.strategy) {
       case "narration-segmented":
-        return `Narration Mode segmented generation, ${event.totalSegments} segments`;
+        return `Narration Mode segmented generation, ${event.totalSegments} sections`;
       case "fallback-chunking":
-        return `Fallback chunking after single-pass failure, ${event.totalSegments} segments`;
+        return `Fallback chunking after single-pass failure, ${event.totalSegments} sections`;
       case "single-pass-experimental":
         return "Single-pass experimental";
       case "legacy-single-pass":

@@ -4,17 +4,32 @@ import { open, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export type OutputFormat = "mp3" | "wav";
+export type VolumeBoost = "normal" | "louder" | "very-loud";
 export type AudioProcessingStage =
   | "availability-check"
   | "segment-normalization"
   | "merge"
+  | "join-smoothing"
   | "final-normalization"
   | "encoding";
 
 type MergeStrategy = "copy" | "reencode";
+type LoudnessSettings = {
+  integratedLoudness: number;
+  truePeak: number;
+  limiter: number;
+};
 
 export const DEFAULT_OUTPUT_FORMAT: OutputFormat = "mp3";
-export const LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11";
+export const DEFAULT_VOLUME_BOOST: VolumeBoost = "louder";
+export const DEFAULT_SMOOTH_JOINS = true;
+export const DEFAULT_JOIN_PAUSE_MS = 300;
+export const STANDARD_INTERMEDIATE_SAMPLE_RATE = 24_000;
+export const STANDARD_INTERMEDIATE_CHANNELS = 1;
+export const TRIM_SILENCE_FILTER =
+  "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB:start_silence=0.04:detection=rms,areverse,silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB:start_silence=0.08:detection=rms,areverse";
+export const LOUDNORM_FILTER =
+  "loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.841:level=disabled";
 export const FFMPEG_MISSING_MESSAGE =
   "ffmpeg executable not found. Checked FFMPEG_PATH, bundled ffmpeg-static, and system ffmpeg on PATH.";
 
@@ -35,6 +50,7 @@ const AUDIO_STAGE_LABELS: Record<AudioProcessingStage, string> = {
   "availability-check": "ffmpeg availability check",
   "segment-normalization": "segment normalization",
   merge: "audio merge",
+  "join-smoothing": "join smoothing",
   "final-normalization": "final normalization",
   encoding: "audio encoding"
 };
@@ -48,6 +64,23 @@ const FFMPEG_BANNER_LINE_PATTERNS = [
 const FFMPEG_PROGRESS_LINE_PATTERNS = [/^(size|frame|time|bitrate|speed)=/i, /^video:/i];
 const FFMPEG_INTERESTING_LINE_PATTERN =
   /(error|invalid|failed|no such|not found|permission denied|unsafe|unable|could not|impossible|conversion failed|does not contain|unsupported|cannot|not yet|mismatch|corrupt|malformed)/i;
+const VOLUME_BOOST_SETTINGS: Record<VolumeBoost, LoudnessSettings> = {
+  normal: {
+    integratedLoudness: -16,
+    truePeak: -1.5,
+    limiter: getLimiterLimit(-1.5)
+  },
+  louder: {
+    integratedLoudness: -14,
+    truePeak: -1,
+    limiter: getLimiterLimit(-1)
+  },
+  "very-loud": {
+    integratedLoudness: -12.5,
+    truePeak: -0.8,
+    limiter: getLimiterLimit(-0.8)
+  }
+};
 
 let ffmpegExecutablePromise: Promise<string> | null = null;
 
@@ -119,13 +152,21 @@ export async function transcodeAudioFile({
   outputPath,
   outputFormat,
   applyLoudnorm,
-  stage
+  stage,
+  volumeBoost = DEFAULT_VOLUME_BOOST,
+  trimSilence = false,
+  sampleRate,
+  channels
 }: {
   inputPath: string;
   outputPath: string;
   outputFormat: OutputFormat;
   applyLoudnorm: boolean;
   stage?: AudioProcessingStage;
+  volumeBoost?: VolumeBoost;
+  trimSilence?: boolean;
+  sampleRate?: number;
+  channels?: number;
 }): Promise<void> {
   await assertAudioFileReady(inputPath);
 
@@ -134,7 +175,11 @@ export async function transcodeAudioFile({
       inputPath,
       outputPath,
       outputFormat,
-      applyLoudnorm
+      applyLoudnorm,
+      volumeBoost,
+      trimSilence,
+      sampleRate,
+      channels
     }),
     {
       stage: stage ?? (applyLoudnorm ? "final-normalization" : "encoding")
@@ -190,21 +235,68 @@ export async function mergeAudioFiles({
   }
 }
 
+export async function generateSilenceAudioFile({
+  outputPath,
+  durationMs,
+  sampleRate = STANDARD_INTERMEDIATE_SAMPLE_RATE,
+  channels = STANDARD_INTERMEDIATE_CHANNELS
+}: {
+  outputPath: string;
+  durationMs: number;
+  sampleRate?: number;
+  channels?: number;
+}): Promise<void> {
+  await runFfmpeg(
+    buildSilenceArgs({
+      outputPath,
+      durationMs,
+      sampleRate,
+      channels
+    }),
+    {
+      stage: "join-smoothing"
+    }
+  );
+
+  await assertAudioFileReady(outputPath);
+}
+
 export function buildTranscodeArgs({
   inputPath,
   outputPath,
   outputFormat,
-  applyLoudnorm
+  applyLoudnorm,
+  volumeBoost = DEFAULT_VOLUME_BOOST,
+  trimSilence = false,
+  sampleRate,
+  channels
 }: {
   inputPath: string;
   outputPath: string;
   outputFormat: OutputFormat;
   applyLoudnorm: boolean;
+  volumeBoost?: VolumeBoost;
+  trimSilence?: boolean;
+  sampleRate?: number;
+  channels?: number;
 }): string[] {
   const args = ["-y", "-i", inputPath, "-vn"];
+  const audioFilterChain = buildAudioFilterChain({
+    applyLoudnorm,
+    volumeBoost,
+    trimSilence
+  });
 
-  if (applyLoudnorm) {
-    args.push("-af", LOUDNORM_FILTER);
+  if (audioFilterChain) {
+    args.push("-af", audioFilterChain);
+  }
+
+  if (channels) {
+    args.push("-ac", String(channels));
+  }
+
+  if (sampleRate) {
+    args.push("-ar", String(sampleRate));
   }
 
   return [...args, ...getCodecArgs(outputFormat), outputPath];
@@ -233,6 +325,11 @@ export function buildMergeArgs({
     ...(strategy === "copy" ? ["-c", "copy"] : getCodecArgs(outputFormat)),
     outputPath
   ];
+}
+
+export function buildMasteringFilter(volumeBoost: VolumeBoost): string {
+  const settings = VOLUME_BOOST_SETTINGS[volumeBoost];
+  return `loudnorm=I=${settings.integratedLoudness}:TP=${settings.truePeak}:LRA=11,alimiter=limit=${settings.limiter}:level=disabled`;
 }
 
 export function summarizeFfmpegStderr(stderr: string): string {
@@ -422,6 +519,59 @@ async function assertAudioFileReady(filePath: string): Promise<void> {
   }
 }
 
+function buildAudioFilterChain({
+  applyLoudnorm,
+  volumeBoost,
+  trimSilence
+}: {
+  applyLoudnorm: boolean;
+  volumeBoost: VolumeBoost;
+  trimSilence: boolean;
+}): string | null {
+  const filters: string[] = [];
+
+  if (trimSilence) {
+    filters.push(TRIM_SILENCE_FILTER);
+  }
+
+  if (applyLoudnorm) {
+    filters.push(buildMasteringFilter(volumeBoost));
+  }
+
+  if (filters.length === 0) {
+    return null;
+  }
+
+  return filters.join(",");
+}
+
+function buildSilenceArgs({
+  outputPath,
+  durationMs,
+  sampleRate,
+  channels
+}: {
+  outputPath: string;
+  durationMs: number;
+  sampleRate: number;
+  channels: number;
+}): string[] {
+  const channelLayout = channels === 1 ? "mono" : channels === 2 ? "stereo" : `${channels}c`;
+
+  return [
+    "-y",
+    "-f",
+    "lavfi",
+    "-i",
+    `anullsrc=r=${sampleRate}:cl=${channelLayout}`,
+    "-t",
+    (durationMs / 1000).toFixed(3),
+    "-c:a",
+    "pcm_s16le",
+    outputPath
+  ];
+}
+
 function getCodecArgs(outputFormat: OutputFormat): string[] {
   if (outputFormat === "wav") {
     return ["-c:a", "pcm_s16le"];
@@ -432,6 +582,10 @@ function getCodecArgs(outputFormat: OutputFormat): string[] {
 
 function escapeForFfmpegConcat(filePath: string): string {
   return filePath.replace(/'/g, "'\\''");
+}
+
+function getLimiterLimit(truePeak: number): number {
+  return Number((10 ** (truePeak / 20)).toFixed(3));
 }
 
 function capitalize(text: string): string {
