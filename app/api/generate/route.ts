@@ -13,20 +13,22 @@ import {
   generateSilenceAudioFile,
   masterAudioFile,
   mergeAudioFiles,
+  persistAudioDebugArtifact,
+  resolveMasteringStrategy,
   STANDARD_INTERMEDIATE_CHANNELS,
   STANDARD_INTERMEDIATE_SAMPLE_RATE,
   transcodeAudioFile,
+  type MasteringStrategy,
   type OutputFormat,
   type VolumeBoost
 } from "@/lib/audio";
+import { parseMistralAudioResponse, postMistralSpeech } from "@/lib/mistral";
 import { chunkText, prepareTextForSpeech, slugifyFilename } from "@/lib/text";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-const MISTRAL_SPEECH_ENDPOINT = "https://api.mistral.ai/v1/audio/speech";
-const MISTRAL_MODEL = "voxtral-mini-tts-2603";
 const SINGLE_PASS_TIMEOUT_MS = 180_000;
 const SEGMENT_TIMEOUT_MS = 120_000;
 const INTERMEDIATE_SEGMENT_FORMAT: OutputFormat = "wav";
@@ -181,12 +183,25 @@ async function runGeneration({
 }): Promise<void> {
   const encoder = new TextEncoder();
   let tempDirectoryPath = "";
+  const debugAudioEnabled = readBooleanEnv(process.env.VOICEOVER_DEBUG_AUDIO);
+  const masteringStrategy = resolveMasteringStrategy(process.env.VOICEOVER_MASTERING_STRATEGY);
+  const debugArtifactDirectoryPath = debugAudioEnabled
+    ? await mkdtemp(path.join(tmpdir(), "voiceover-debug-"))
+    : "";
 
   const sendEvent = (event: StreamEvent) => {
     controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
   };
 
   try {
+    console.info(
+      "[generation] config",
+      JSON.stringify({
+        debugAudioEnabled,
+        masteringStrategy
+      })
+    );
+
     if (!text.trim()) {
       throw new Error("Paste some text before generating audio.");
     }
@@ -216,7 +231,9 @@ async function runGeneration({
         volumeBoost,
         smoothJoins,
         sendEvent,
-        preparationMessage: "Preparing segmented generation"
+        preparationMessage: "Preparing segmented generation",
+        masteringStrategy,
+        debugArtifactDirectoryPath: debugArtifactDirectoryPath || undefined
       });
 
       tempDirectoryPath = segmentedResult.tempDirectoryPath;
@@ -250,7 +267,9 @@ async function runGeneration({
         volumeBoost,
         sendEvent,
         debugForceSinglePassFailure,
-        progressMessage: "Generating continuous read"
+        progressMessage: "Generating continuous read",
+        masteringStrategy,
+        debugArtifactDirectoryPath: debugArtifactDirectoryPath || undefined
       });
 
       tempDirectoryPath = singlePassResult.tempDirectoryPath;
@@ -295,7 +314,9 @@ async function runGeneration({
       volumeBoost,
       smoothJoins,
       sendEvent,
-      preparationMessage: "Preparing segmented fallback"
+      preparationMessage: "Preparing segmented fallback",
+      masteringStrategy,
+      debugArtifactDirectoryPath: debugArtifactDirectoryPath || undefined
     });
 
     tempDirectoryPath = fallbackResult.tempDirectoryPath;
@@ -327,6 +348,15 @@ async function runGeneration({
 
     if (tempDirectoryPath) {
       await rm(tempDirectoryPath, { force: true, recursive: true });
+    }
+
+    if (debugArtifactDirectoryPath) {
+      console.info(
+        "[audio-debug] session",
+        JSON.stringify({
+          path: debugArtifactDirectoryPath
+        })
+      );
     }
   }
 }
@@ -461,13 +491,57 @@ async function mergeSegmentsWithFallback({
   }
 }
 
+async function persistSegmentedRawDebugArtifact({
+  segmentPaths,
+  tempDirectoryPath,
+  debugArtifactDirectoryPath
+}: {
+  segmentPaths: string[];
+  tempDirectoryPath: string;
+  debugArtifactDirectoryPath: string;
+}): Promise<void> {
+  if (segmentPaths.length === 0) {
+    return;
+  }
+
+  const debugRawPath = path.join(
+    tempDirectoryPath,
+    `debug-raw-mistral.${getFileExtension(INTERMEDIATE_SEGMENT_FORMAT)}`
+  );
+
+  try {
+    await mergeAudioFiles({
+      inputPaths: segmentPaths,
+      outputPath: debugRawPath,
+      outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
+      strategy: "copy"
+    });
+  } catch {
+    await mergeAudioFiles({
+      inputPaths: segmentPaths,
+      outputPath: debugRawPath,
+      outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
+      strategy: "reencode"
+    });
+  }
+
+  await persistAudioDebugArtifact({
+    sourcePath: debugRawPath,
+    directoryPath: debugArtifactDirectoryPath,
+    filename: `raw-mistral-output.${getFileExtension(INTERMEDIATE_SEGMENT_FORMAT)}`,
+    note: "Concatenated segmented Mistral output before join smoothing and mastering."
+  });
+}
+
 async function finalizeOutput({
   assembledPath,
   tempDirectoryPath,
   outputFormat,
   normalizationEnabled,
   volumeBoost,
-  sendEvent
+  sendEvent,
+  masteringStrategy,
+  debugArtifactDirectoryPath
 }: {
   assembledPath: string;
   tempDirectoryPath: string;
@@ -475,6 +549,8 @@ async function finalizeOutput({
   normalizationEnabled: boolean;
   volumeBoost: VolumeBoost;
   sendEvent: (event: StreamEvent) => void;
+  masteringStrategy: MasteringStrategy;
+  debugArtifactDirectoryPath?: string;
 }): Promise<{
   deliverPath: string;
   normalizationApplied: boolean;
@@ -485,6 +561,23 @@ async function finalizeOutput({
 
   if (!normalizationEnabled) {
     if (assembledMatchesOutput) {
+      console.info(
+        "[mastering] final",
+        JSON.stringify({
+          volumeBoost,
+          strategy: "raw-debug-only"
+        })
+      );
+
+      if (debugArtifactDirectoryPath) {
+        await persistAudioDebugArtifact({
+          sourcePath: assembledPath,
+          directoryPath: debugArtifactDirectoryPath,
+          filename: `final-master-output.${getFileExtension(outputFormat)}`,
+          note: "Delivered without mastering because normalization was disabled."
+        });
+      }
+
       return {
         deliverPath: assembledPath,
         normalizationApplied: false,
@@ -501,6 +594,23 @@ async function finalizeOutput({
       applyLoudnorm: false,
       stage: "encoding"
     });
+
+    console.info(
+      "[mastering] final",
+      JSON.stringify({
+        volumeBoost,
+        strategy: "raw-debug-only"
+      })
+    );
+
+    if (debugArtifactDirectoryPath) {
+      await persistAudioDebugArtifact({
+        sourcePath: deliverPath,
+        directoryPath: debugArtifactDirectoryPath,
+        filename: `final-master-output.${getFileExtension(outputFormat)}`,
+        note: "Delivered without mastering because normalization was disabled."
+      });
+    }
 
     return {
       deliverPath,
@@ -525,7 +635,9 @@ async function finalizeOutput({
       inputPath: assembledPath,
       outputPath: normalizedOutputPath,
       outputFormat,
-      volumeBoost
+      volumeBoost,
+      strategy: masteringStrategy,
+      debugArtifactDirectoryPath
     });
 
     return {
@@ -545,6 +657,15 @@ async function finalizeOutput({
           140
         )}). Using the unmastered audio instead`
       });
+
+      if (debugArtifactDirectoryPath) {
+        await persistAudioDebugArtifact({
+          sourcePath: assembledPath,
+          directoryPath: debugArtifactDirectoryPath,
+          filename: `final-master-output.${getFileExtension(outputFormat)}`,
+          note: "Delivered unmastered after mastering failed."
+        });
+      }
 
       return {
         deliverPath: assembledPath,
@@ -575,6 +696,15 @@ async function finalizeOutput({
         applyLoudnorm: false,
         stage: "encoding"
       });
+
+      if (debugArtifactDirectoryPath) {
+        await persistAudioDebugArtifact({
+          sourcePath: fallbackOutputPath,
+          directoryPath: debugArtifactDirectoryPath,
+          filename: `final-master-output.${getFileExtension(outputFormat)}`,
+          note: "Delivered after mastering failed and the route retried without mastering."
+        });
+      }
     } catch (fallbackError) {
       throw new Error(
         `Mastering final audio failed: ${normalizationFailureReason}. Fallback export failed: ${extractErrorReason(
@@ -599,7 +729,9 @@ async function generateSinglePassResult({
   volumeBoost,
   sendEvent,
   debugForceSinglePassFailure,
-  progressMessage
+  progressMessage,
+  masteringStrategy,
+  debugArtifactDirectoryPath
 }: {
   input: string;
   voiceId: string;
@@ -609,6 +741,8 @@ async function generateSinglePassResult({
   sendEvent: (event: StreamEvent) => void;
   debugForceSinglePassFailure: boolean;
   progressMessage: string;
+  masteringStrategy: MasteringStrategy;
+  debugArtifactDirectoryPath?: string;
 }): Promise<{
   audioBuffer: Buffer;
   tempDirectoryPath: string;
@@ -629,7 +763,15 @@ async function generateSinglePassResult({
     debugForceSinglePassFailure
   });
 
-  if (!normalizationEnabled) {
+  if (!normalizationEnabled && !debugArtifactDirectoryPath) {
+    console.info(
+      "[mastering] final",
+      JSON.stringify({
+        volumeBoost,
+        strategy: "raw-debug-only"
+      })
+    );
+
     return {
       audioBuffer,
       tempDirectoryPath: "",
@@ -638,12 +780,47 @@ async function generateSinglePassResult({
     };
   }
 
-  await assertFfmpegAvailable();
-
   const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
   const sourcePath = path.join(tempDirectoryPath, `single-pass-source.${getFileExtension(sourceFormat)}`);
 
   await writeFile(sourcePath, audioBuffer);
+
+  if (debugArtifactDirectoryPath) {
+    await persistAudioDebugArtifact({
+      sourcePath,
+      directoryPath: debugArtifactDirectoryPath,
+      filename: `raw-mistral-output.${getFileExtension(sourceFormat)}`,
+      note: "Exact single-pass Mistral output before mastering."
+    });
+  }
+
+  if (!normalizationEnabled) {
+    console.info(
+      "[mastering] final",
+      JSON.stringify({
+        volumeBoost,
+        strategy: "raw-debug-only"
+      })
+    );
+
+    if (debugArtifactDirectoryPath) {
+      await persistAudioDebugArtifact({
+        sourcePath,
+        directoryPath: debugArtifactDirectoryPath,
+        filename: `final-master-output.${getFileExtension(sourceFormat)}`,
+        note: "Delivered without mastering because normalization was disabled."
+      });
+    }
+
+    return {
+      audioBuffer,
+      tempDirectoryPath,
+      normalizationApplied: false,
+      normalizationFallbackUsed: false
+    };
+  }
+
+  await assertFfmpegAvailable();
 
   const finalizedOutput = await finalizeOutput({
     assembledPath: sourcePath,
@@ -651,7 +828,9 @@ async function generateSinglePassResult({
     outputFormat,
     normalizationEnabled,
     volumeBoost,
-    sendEvent
+    sendEvent,
+    masteringStrategy,
+    debugArtifactDirectoryPath
   });
 
   return {
@@ -682,20 +861,11 @@ async function generateSinglePassSpeech({
   let response: Response;
 
   try {
-    response = await fetch(MISTRAL_SPEECH_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.MISTRAL_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: MISTRAL_MODEL,
-        input,
-        voice_id: voiceId,
-        response_format: responseFormat,
-        stream: false
-      }),
-      signal: AbortSignal.timeout(SINGLE_PASS_TIMEOUT_MS)
+    response = await postMistralSpeech({
+      input,
+      voiceId,
+      responseFormat,
+      timeoutMs: SINGLE_PASS_TIMEOUT_MS
     });
   } catch (error) {
     if (isTimeoutError(error)) {
@@ -719,7 +889,7 @@ async function generateSinglePassSpeech({
     );
   }
 
-  const audioBuffer = await parseAudioResponse(response);
+  const audioBuffer = await parseRouteAudioResponse(response);
 
   if (audioBuffer.length === 0) {
     throw new GenerationFailure("Single-pass request returned empty audio.", {
@@ -738,7 +908,9 @@ async function generateSegmentedSpeech({
   volumeBoost,
   smoothJoins,
   sendEvent,
-  preparationMessage
+  preparationMessage,
+  masteringStrategy,
+  debugArtifactDirectoryPath
 }: {
   paragraphs: Parameters<typeof chunkText>[0];
   voiceId: string;
@@ -748,6 +920,8 @@ async function generateSegmentedSpeech({
   smoothJoins: boolean;
   sendEvent: (event: StreamEvent) => void;
   preparationMessage: string;
+  masteringStrategy: MasteringStrategy;
+  debugArtifactDirectoryPath?: string;
 }): Promise<{
   audioBuffer: Buffer;
   totalSegments: number;
@@ -800,6 +974,14 @@ async function generateSegmentedSpeech({
       segmentPaths.push(rawSegmentPath);
     }
 
+    if (debugArtifactDirectoryPath) {
+      await persistSegmentedRawDebugArtifact({
+        segmentPaths,
+        tempDirectoryPath,
+        debugArtifactDirectoryPath
+      });
+    }
+
     const joinReadyPaths = await prepareSegmentsForJoinSmoothing({
       segmentPaths,
       tempDirectoryPath,
@@ -819,7 +1001,9 @@ async function generateSegmentedSpeech({
       outputFormat,
       normalizationEnabled,
       volumeBoost,
-      sendEvent
+      sendEvent,
+      masteringStrategy,
+      debugArtifactDirectoryPath
     });
 
     return {
@@ -849,20 +1033,11 @@ async function generateSegmentSpeech({
   let response: Response;
 
   try {
-    response = await fetch(MISTRAL_SPEECH_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.MISTRAL_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: MISTRAL_MODEL,
-        input,
-        voice_id: voiceId,
-        response_format: INTERMEDIATE_SEGMENT_FORMAT,
-        stream: false
-      }),
-      signal: AbortSignal.timeout(SEGMENT_TIMEOUT_MS)
+    response = await postMistralSpeech({
+      input,
+      voiceId,
+      responseFormat: INTERMEDIATE_SEGMENT_FORMAT,
+      timeoutMs: SEGMENT_TIMEOUT_MS
     });
   } catch (error) {
     if (isTimeoutError(error)) {
@@ -887,7 +1062,7 @@ async function generateSegmentSpeech({
   let audioBuffer: Buffer;
 
   try {
-    audioBuffer = await parseAudioResponse(response);
+    audioBuffer = await parseRouteAudioResponse(response);
   } catch (error) {
     throw new Error(
       `Segment ${segmentNumber} of ${totalSegments} failed: ${describeUnknownError(error)}`
@@ -903,24 +1078,14 @@ async function generateSegmentSpeech({
   return audioBuffer;
 }
 
-async function parseAudioResponse(response: Response): Promise<Buffer> {
-  let data: { audio_data?: string };
-
+async function parseRouteAudioResponse(response: Response): Promise<Buffer> {
   try {
-    data = (await response.json()) as { audio_data?: string };
-  } catch {
-    throw new GenerationFailure("Mistral API response was not valid JSON.", {
+    return await parseMistralAudioResponse(response);
+  } catch (error) {
+    throw new GenerationFailure(describeUnknownError(error), {
       chunkingWorth: true
     });
   }
-
-  if (!data.audio_data) {
-    throw new GenerationFailure("Mistral API response did not include audio_data.", {
-      chunkingWorth: true
-    });
-  }
-
-  return Buffer.from(data.audio_data, "base64");
 }
 
 function describeSafeError(error: unknown): string {
@@ -1052,4 +1217,8 @@ function truncate(text: string, maxLength: number): string {
   }
 
   return `${compact.slice(0, maxLength)}...`;
+}
+
+function readBooleanEnv(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(value ?? "");
 }

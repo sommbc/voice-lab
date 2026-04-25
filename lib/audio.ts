@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { open, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, open, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export type OutputFormat = "mp3" | "wav";
@@ -16,9 +16,15 @@ export type AudioProcessingStage =
   | "encoding";
 
 export type MasteringStrategy =
+  | "current-static-master"
+  | "speech-leveler"
+  | "raw-debug-only";
+
+type MasteringExecutionMode =
   | "linear-loudnorm"
   | "static-gain-limited"
-  | "dynamic-loudnorm";
+  | "speech-leveler"
+  | "raw-debug-only";
 
 type MergeStrategy = "copy" | "reencode";
 type LoudnessSettings = {
@@ -57,13 +63,36 @@ export type AudioMasteringResult = {
   metrics: AudioLoudnessMetrics | null;
   preMasterMetrics: AudioLoudnessMetrics | null;
   strategy: MasteringStrategy;
+  executionMode: MasteringExecutionMode;
   appliedGainDb: number | null;
+};
+
+export type AudioLoudnessTimelinePoint = {
+  seconds: number;
+  shortTermLufs: number;
+};
+
+export type AudioLoudnessJump = {
+  fromSeconds: number;
+  toSeconds: number;
+  fromShortTermLufs: number;
+  toShortTermLufs: number;
+  deltaLufs: number;
+};
+
+export type AudioLoudnessTimeline = {
+  integratedLoudness: number | null;
+  truePeak: number | null;
+  loudnessRange: number | null;
+  shortTermByTimestamp: AudioLoudnessTimelinePoint[];
+  largestJumps: AudioLoudnessJump[];
 };
 
 export const DEFAULT_OUTPUT_FORMAT: OutputFormat = "mp3";
 export const DEFAULT_VOLUME_BOOST: VolumeBoost = "louder";
 export const DEFAULT_SMOOTH_JOINS = true;
 export const DEFAULT_JOIN_PAUSE_MS = 300;
+export const DEFAULT_MASTERING_STRATEGY: MasteringStrategy = "current-static-master";
 export const STANDARD_INTERMEDIATE_SAMPLE_RATE = 24_000;
 export const STANDARD_INTERMEDIATE_CHANNELS = 1;
 export const TRIM_SILENCE_FILTER =
@@ -72,6 +101,9 @@ export const LOUDNORM_FILTER =
   "loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.841:level=disabled";
 export const SPEECH_PREMASTER_FILTER =
   "highpass=f=70,acompressor=threshold=0.063:ratio=4:attack=2:release=120:makeup=2.51,alimiter=limit=0.708:level=disabled";
+export const SPEECH_LEVELER_PREMASTER_FILTER = "highpass=f=70";
+export const SPEECH_LEVELER_FILTER =
+  "speechnorm=peak=0.9:expansion=1.4:compression=2:raise=0.0005:fall=0.00015:link=1,acompressor=threshold=0.125:ratio=1.35:attack=8:release=140:makeup=1.25";
 const PREMASTER_INTERMEDIATE_SAMPLE_RATE = 24_000;
 const PREMASTER_INTERMEDIATE_CHANNELS = 1;
 const LINEAR_LOUDNORM_HEADROOM_DB = 0.2;
@@ -81,6 +113,8 @@ export const FFMPEG_MISSING_MESSAGE =
 const MP3_BITRATE = "192k";
 const FFMPEG_TIMEOUT_MS = 180_000;
 const LOUDNESS_MEASUREMENT_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json";
+const EBUR128_ANALYSIS_FILTER = "ebur128=peak=true:framelog=verbose";
+const MIN_VALID_SHORT_TERM_LUFS = -70;
 const PACKAGED_FFMPEG_EXECUTABLE = path.join(
   process.cwd(),
   "node_modules",
@@ -193,6 +227,56 @@ export function getMimeType(format: OutputFormat): string {
 
 export async function assertFfmpegAvailable(): Promise<void> {
   await getFfmpegExecutable();
+}
+
+export function resolveMasteringStrategy(value: string | undefined | null): MasteringStrategy {
+  const normalized = value?.trim().toLowerCase();
+
+  switch (normalized) {
+    case "speech-leveler":
+      return "speech-leveler";
+    case "raw":
+    case "raw-debug-only":
+      return "raw-debug-only";
+    case "static":
+    case "current-static-master":
+    case "linear-loudnorm":
+    case "static-gain-limited":
+    case "":
+    case undefined:
+    case null:
+      return DEFAULT_MASTERING_STRATEGY;
+    default:
+      return DEFAULT_MASTERING_STRATEGY;
+  }
+}
+
+export async function persistAudioDebugArtifact({
+  sourcePath,
+  directoryPath,
+  filename,
+  note
+}: {
+  sourcePath: string;
+  directoryPath: string;
+  filename: string;
+  note?: string;
+}): Promise<string> {
+  await mkdir(directoryPath, { recursive: true });
+
+  const targetPath = path.join(directoryPath, filename);
+  await copyFile(sourcePath, targetPath);
+
+  console.info(
+    "[audio-debug] artifact",
+    JSON.stringify({
+      filename,
+      path: targetPath,
+      note: note ?? null
+    })
+  );
+
+  return targetPath;
 }
 
 export async function transcodeAudioFile({
@@ -316,21 +400,127 @@ export async function masterAudioFile({
   inputPath,
   outputPath,
   outputFormat,
-  volumeBoost
+  volumeBoost,
+  strategy = DEFAULT_MASTERING_STRATEGY,
+  debugArtifactDirectoryPath
 }: {
   inputPath: string;
   outputPath: string;
   outputFormat: OutputFormat;
   volumeBoost: VolumeBoost;
+  strategy?: MasteringStrategy;
+  debugArtifactDirectoryPath?: string;
 }): Promise<AudioMasteringResult> {
   await assertAudioFileReady(inputPath);
 
   const settings = VOLUME_BOOST_SETTINGS[volumeBoost];
 
-  const preMasterPath = path.join(
-    path.dirname(outputPath),
-    `premaster-${randomUUID()}.wav`
-  );
+  if (strategy === "raw-debug-only") {
+    return await runRawDebugOnlyMastering({
+      inputPath,
+      outputPath,
+      outputFormat,
+      volumeBoost,
+      debugArtifactDirectoryPath
+    });
+  }
+
+  if (strategy === "speech-leveler") {
+    try {
+      return await runSpeechLevelerMastering({
+        inputPath,
+        outputPath,
+        outputFormat,
+        volumeBoost,
+        settings,
+        debugArtifactDirectoryPath
+      });
+    } catch (error) {
+      console.warn(
+        "[mastering] speech-leveler failed; falling back to current static master",
+        JSON.stringify({
+          volumeBoost,
+          reason: error instanceof Error ? error.message : "Unknown speech-leveler failure."
+        })
+      );
+    }
+  }
+
+  return await runCurrentStaticMastering({
+    inputPath,
+    outputPath,
+    outputFormat,
+    volumeBoost,
+    settings,
+    debugArtifactDirectoryPath
+  });
+}
+
+async function runRawDebugOnlyMastering({
+  inputPath,
+  outputPath,
+  outputFormat,
+  volumeBoost,
+  debugArtifactDirectoryPath
+}: {
+  inputPath: string;
+  outputPath: string;
+  outputFormat: OutputFormat;
+  volumeBoost: VolumeBoost;
+  debugArtifactDirectoryPath?: string;
+}): Promise<AudioMasteringResult> {
+  await copyOrEncodeAudioWithoutMastering({
+    inputPath,
+    outputPath,
+    outputFormat
+  });
+
+  const metrics = await measureAudioFileWithWarning(outputPath, "post-master verification");
+
+  if (debugArtifactDirectoryPath) {
+    await persistAudioDebugArtifact({
+      sourcePath: outputPath,
+      directoryPath: debugArtifactDirectoryPath,
+      filename: `final-master-output.${getFileExtension(outputFormat)}`,
+      note: "Delivered without mastering because raw-debug-only was selected."
+    });
+  }
+
+  logMasteringSummary({
+    volumeBoost,
+    strategy: "raw-debug-only",
+    executionMode: "raw-debug-only",
+    appliedGainDb: null,
+    settings: VOLUME_BOOST_SETTINGS[volumeBoost],
+    preMasterMetrics: null,
+    metrics
+  });
+
+  return {
+    metrics,
+    preMasterMetrics: null,
+    strategy: "raw-debug-only",
+    executionMode: "raw-debug-only",
+    appliedGainDb: null
+  };
+}
+
+async function runCurrentStaticMastering({
+  inputPath,
+  outputPath,
+  outputFormat,
+  volumeBoost,
+  settings,
+  debugArtifactDirectoryPath
+}: {
+  inputPath: string;
+  outputPath: string;
+  outputFormat: OutputFormat;
+  volumeBoost: VolumeBoost;
+  settings: LoudnessSettings;
+  debugArtifactDirectoryPath?: string;
+}): Promise<AudioMasteringResult> {
+  const preMasterPath = path.join(path.dirname(outputPath), `premaster-${randomUUID()}.wav`);
 
   try {
     await applySpeechPreMaster({
@@ -338,21 +528,23 @@ export async function masterAudioFile({
       outputPath: preMasterPath
     });
 
-    const preMasterMetrics = await measureAudioFile(preMasterPath).catch((error) => {
-      console.warn(
-        "[mastering] pre-master verification unavailable",
-        JSON.stringify({
-          preMasterPath,
-          reason: error instanceof Error ? error.message : "Unknown measurement failure."
-        })
-      );
-      return null;
-    });
+    if (debugArtifactDirectoryPath) {
+      await persistAudioDebugArtifact({
+        sourcePath: preMasterPath,
+        directoryPath: debugArtifactDirectoryPath,
+        filename: "premaster-output.wav",
+        note: "Current static mastering pre-master output."
+      });
+    }
 
+    const preMasterMetrics = await measureAudioFileWithWarning(
+      preMasterPath,
+      "pre-master verification"
+    );
     const measurement = await measureForLinearMastering(preMasterPath, settings);
     const linearFeasible = canLinearLoudnormEngage(measurement, settings);
 
-    let strategy: MasteringStrategy;
+    let executionMode: MasteringExecutionMode;
     let appliedGainDb: number | null = null;
 
     if (linearFeasible) {
@@ -378,7 +570,7 @@ export async function masterAudioFile({
       const reportedType = passTwoStats?.normalization_type ?? null;
 
       if (reportedType === "linear") {
-        strategy = "linear-loudnorm";
+        executionMode = "linear-loudnorm";
         appliedGainDb = parseFiniteNumber(measurement.target_offset);
       } else {
         console.warn(
@@ -398,7 +590,7 @@ export async function masterAudioFile({
           measurement
         });
 
-        strategy = "static-gain-limited";
+        executionMode = "static-gain-limited";
         appliedGainDb = fallbackResult.appliedGainDb;
       }
     } else {
@@ -410,44 +602,154 @@ export async function masterAudioFile({
         measurement
       });
 
-      strategy = "static-gain-limited";
+      executionMode = "static-gain-limited";
       appliedGainDb = fallbackResult.appliedGainDb;
     }
 
-    const metrics = await measureAudioFile(outputPath).catch((error) => {
-      console.warn(
-        "[mastering] post-master verification unavailable",
-        JSON.stringify({
-          outputPath,
-          reason: error instanceof Error ? error.message : "Unknown measurement failure."
-        })
-      );
-      return null;
-    });
+    const metrics = await measureAudioFileWithWarning(outputPath, "post-master verification");
 
-    console.info(
-      "[mastering] final",
-      JSON.stringify({
-        volumeBoost,
-        strategy,
-        appliedGainDb,
-        targetIntegratedLoudness: settings.integratedLoudness,
-        targetTruePeak: settings.truePeak,
-        preMasterIntegratedLoudness: preMasterMetrics?.integratedLoudness ?? null,
-        preMasterTruePeak: preMasterMetrics?.truePeak ?? null,
-        measuredIntegratedLoudness: metrics?.integratedLoudness ?? null,
-        measuredTruePeak: metrics?.truePeak ?? null
-      })
-    );
+    if (debugArtifactDirectoryPath) {
+      await persistAudioDebugArtifact({
+        sourcePath: outputPath,
+        directoryPath: debugArtifactDirectoryPath,
+        filename: `final-master-output.${getFileExtension(outputFormat)}`,
+        note: "Current static mastering final delivery."
+      });
+    }
+
+    logMasteringSummary({
+      volumeBoost,
+      strategy: "current-static-master",
+      executionMode,
+      appliedGainDb,
+      settings,
+      preMasterMetrics,
+      metrics
+    });
 
     return {
       metrics,
       preMasterMetrics,
-      strategy,
+      strategy: "current-static-master",
+      executionMode,
       appliedGainDb
     };
   } finally {
     await rm(preMasterPath, { force: true });
+  }
+}
+
+async function runSpeechLevelerMastering({
+  inputPath,
+  outputPath,
+  outputFormat,
+  volumeBoost,
+  settings,
+  debugArtifactDirectoryPath
+}: {
+  inputPath: string;
+  outputPath: string;
+  outputFormat: OutputFormat;
+  volumeBoost: VolumeBoost;
+  settings: LoudnessSettings;
+  debugArtifactDirectoryPath?: string;
+}): Promise<AudioMasteringResult> {
+  const preMasterPath = path.join(path.dirname(outputPath), `speech-leveler-premaster-${randomUUID()}.wav`);
+  const speechLeveledPath = path.join(
+    path.dirname(outputPath),
+    `speech-leveler-${randomUUID()}.wav`
+  );
+
+  try {
+    await applySpeechLevelerPreMaster({
+      inputPath,
+      outputPath: preMasterPath
+    });
+
+    if (debugArtifactDirectoryPath) {
+      await persistAudioDebugArtifact({
+        sourcePath: preMasterPath,
+        directoryPath: debugArtifactDirectoryPath,
+        filename: "premaster-output.wav",
+        note: "Speech-leveler pre-master output."
+      });
+    }
+
+    const preMasterMetrics = await measureAudioFileWithWarning(
+      preMasterPath,
+      "pre-master verification"
+    );
+
+    await applySpeechLevelerPass({
+      inputPath: preMasterPath,
+      outputPath: speechLeveledPath
+    });
+
+    if (debugArtifactDirectoryPath) {
+      const speechLevelerDebugPath = path.join(
+        path.dirname(outputPath),
+        `speech-leveler-debug-${randomUUID()}.mp3`
+      );
+
+      try {
+        await transcodeAudioFile({
+          inputPath: speechLeveledPath,
+          outputPath: speechLevelerDebugPath,
+          outputFormat: "mp3",
+          applyLoudnorm: false,
+          stage: "encoding"
+        });
+
+        await persistAudioDebugArtifact({
+          sourcePath: speechLevelerDebugPath,
+          directoryPath: debugArtifactDirectoryPath,
+          filename: "speechnorm-test-output.mp3",
+          note: "Speech-leveler intermediate before final static gain targeting."
+        });
+      } finally {
+        await rm(speechLevelerDebugPath, { force: true });
+      }
+    }
+
+    const measurement = await measureForLinearMastering(speechLeveledPath, settings);
+    const speechLevelerResult = await applyStaticGainMaster({
+      inputPath: speechLeveledPath,
+      outputPath,
+      outputFormat,
+      settings,
+      measurement
+    });
+    const metrics = await measureAudioFileWithWarning(outputPath, "post-master verification");
+
+    if (debugArtifactDirectoryPath) {
+      await persistAudioDebugArtifact({
+        sourcePath: outputPath,
+        directoryPath: debugArtifactDirectoryPath,
+        filename: `final-master-output.${getFileExtension(outputFormat)}`,
+        note: "Speech-leveler final delivery."
+      });
+    }
+
+    logMasteringSummary({
+      volumeBoost,
+      strategy: "speech-leveler",
+      executionMode: "speech-leveler",
+      appliedGainDb: speechLevelerResult.appliedGainDb,
+      settings,
+      preMasterMetrics,
+      metrics
+    });
+
+    return {
+      metrics,
+      preMasterMetrics,
+      strategy: "speech-leveler",
+      executionMode: "speech-leveler",
+      appliedGainDb: speechLevelerResult.appliedGainDb
+    };
+  } finally {
+    await rm(preMasterPath, { force: true });
+    await rm(speechLeveledPath, { force: true });
   }
 }
 
@@ -458,6 +760,50 @@ async function applySpeechPreMaster({
   inputPath: string;
   outputPath: string;
 }): Promise<void> {
+  await applyWavFilterPass({
+    inputPath,
+    outputPath,
+    filter: SPEECH_PREMASTER_FILTER
+  });
+}
+
+async function applySpeechLevelerPreMaster({
+  inputPath,
+  outputPath
+}: {
+  inputPath: string;
+  outputPath: string;
+}): Promise<void> {
+  await applyWavFilterPass({
+    inputPath,
+    outputPath,
+    filter: SPEECH_LEVELER_PREMASTER_FILTER
+  });
+}
+
+async function applySpeechLevelerPass({
+  inputPath,
+  outputPath
+}: {
+  inputPath: string;
+  outputPath: string;
+}): Promise<void> {
+  await applyWavFilterPass({
+    inputPath,
+    outputPath,
+    filter: SPEECH_LEVELER_FILTER
+  });
+}
+
+async function applyWavFilterPass({
+  inputPath,
+  outputPath,
+  filter
+}: {
+  inputPath: string;
+  outputPath: string;
+  filter: string;
+}): Promise<void> {
   await runFfmpeg(
     [
       "-y",
@@ -465,7 +811,7 @@ async function applySpeechPreMaster({
       inputPath,
       "-vn",
       "-af",
-      SPEECH_PREMASTER_FILTER,
+      filter,
       "-ar",
       String(PREMASTER_INTERMEDIATE_SAMPLE_RATE),
       "-ac",
@@ -513,6 +859,82 @@ async function applyStaticGainMaster({
   await assertAudioFileReady(outputPath);
 
   return { appliedGainDb };
+}
+
+async function copyOrEncodeAudioWithoutMastering({
+  inputPath,
+  outputPath,
+  outputFormat
+}: {
+  inputPath: string;
+  outputPath: string;
+  outputFormat: OutputFormat;
+}): Promise<void> {
+  const inputExtension = path.extname(inputPath).replace(/^\./, "").toLowerCase();
+
+  if (inputExtension === outputFormat) {
+    await copyFile(inputPath, outputPath);
+    await assertAudioFileReady(outputPath);
+    return;
+  }
+
+  await transcodeAudioFile({
+    inputPath,
+    outputPath,
+    outputFormat,
+    applyLoudnorm: false,
+    stage: "encoding"
+  });
+}
+
+async function measureAudioFileWithWarning(
+  filePath: string,
+  warningLabel: string
+): Promise<AudioLoudnessMetrics | null> {
+  return await measureAudioFile(filePath).catch((error) => {
+    console.warn(
+      `[mastering] ${warningLabel} unavailable`,
+      JSON.stringify({
+        filePath,
+        reason: error instanceof Error ? error.message : "Unknown measurement failure."
+      })
+    );
+    return null;
+  });
+}
+
+function logMasteringSummary({
+  volumeBoost,
+  strategy,
+  executionMode,
+  appliedGainDb,
+  settings,
+  preMasterMetrics,
+  metrics
+}: {
+  volumeBoost: VolumeBoost;
+  strategy: MasteringStrategy;
+  executionMode: MasteringExecutionMode;
+  appliedGainDb: number | null;
+  settings: LoudnessSettings;
+  preMasterMetrics: AudioLoudnessMetrics | null;
+  metrics: AudioLoudnessMetrics | null;
+}): void {
+  console.info(
+    "[mastering] final",
+    JSON.stringify({
+      volumeBoost,
+      strategy,
+      executionMode,
+      appliedGainDb,
+      targetIntegratedLoudness: settings.integratedLoudness,
+      targetTruePeak: settings.truePeak,
+      preMasterIntegratedLoudness: preMasterMetrics?.integratedLoudness ?? null,
+      preMasterTruePeak: preMasterMetrics?.truePeak ?? null,
+      measuredIntegratedLoudness: metrics?.integratedLoudness ?? null,
+      measuredTruePeak: metrics?.truePeak ?? null
+    })
+  );
 }
 
 export function buildStaticGainMasteringFilter(
@@ -642,6 +1064,162 @@ export async function measureAudioFile(inputPath: string): Promise<AudioLoudness
   }
 
   throw new Error(`Unable to measure loudness for ${path.basename(inputPath)}.`);
+}
+
+export async function analyzeAudioFileOverTime(
+  inputPath: string,
+  {
+    bucketSeconds = 1,
+    topJumpCount = 8
+  }: {
+    bucketSeconds?: number;
+    topJumpCount?: number;
+  } = {}
+): Promise<AudioLoudnessTimeline> {
+  await assertAudioFileReady(inputPath);
+
+  const ffmpegExecutable = await getFfmpegExecutable();
+  const argumentsList = [
+    "-hide_banner",
+    "-loglevel",
+    "verbose",
+    "-nostats",
+    "-i",
+    inputPath,
+    "-vn",
+    "-filter_complex",
+    EBUR128_ANALYSIS_FILTER,
+    "-f",
+    "null",
+    "-"
+  ];
+  const startTime = Date.now();
+
+  console.info(
+    "[ffmpeg] starting",
+    JSON.stringify({
+      stage: "measurement",
+      executable: ffmpegExecutable,
+      args: argumentsList
+    })
+  );
+
+  const result = spawnSync(ffmpegExecutable, argumentsList, {
+    encoding: "utf8",
+    maxBuffer: 50 * 1024 * 1024
+  });
+  const combinedOutput = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+
+  if (result.error) {
+    const spawnError = result.error as NodeJS.ErrnoException;
+    throw spawnError.code === "ENOENT"
+      ? new Error(FFMPEG_MISSING_MESSAGE)
+      : new Error(`ffmpeg could not start during audio measurement: ${spawnError.message}`);
+  }
+
+  if (result.status !== 0 || result.signal) {
+    const failure = new AudioProcessingError({
+      stage: "measurement",
+      executable: ffmpegExecutable,
+      args: argumentsList,
+      stderr: combinedOutput,
+      exitCode: result.status,
+      signal: result.signal as NodeJS.Signals | null,
+      timedOut: result.signal === "SIGKILL"
+    });
+
+    console.error(
+      "[ffmpeg] failed",
+      JSON.stringify({
+        stage: "measurement",
+        durationMs: Date.now() - startTime,
+        executable: ffmpegExecutable,
+        args: argumentsList,
+        exitCode: result.status,
+        signal: result.signal,
+        timedOut: result.signal === "SIGKILL",
+        stderrSummary: failure.stderrSummary
+      })
+    );
+
+    throw failure;
+  }
+
+  console.info(
+    "[ffmpeg] completed",
+    JSON.stringify({
+      stage: "measurement",
+      durationMs: Date.now() - startTime
+    })
+  );
+
+  return parseEbur128Analysis(combinedOutput, {
+    bucketSeconds,
+    topJumpCount
+  });
+}
+
+export function parseEbur128Analysis(
+  output: string,
+  {
+    bucketSeconds = 1,
+    topJumpCount = 8
+  }: {
+    bucketSeconds?: number;
+    topJumpCount?: number;
+  } = {}
+): AudioLoudnessTimeline {
+  const framePattern =
+    /t:\s*(?<seconds>-?(?:\d+(?:\.\d+)?|\.\d+))\s+TARGET:[^\n]*?\bM:\s*(?<momentary>-?(?:\d+(?:\.\d+)?|inf)|nan)\s+S:\s*(?<shortTerm>-?(?:\d+(?:\.\d+)?|inf)|nan)\s+I:\s*(?<integrated>-?(?:\d+(?:\.\d+)?|inf)|nan)\s+LUFS\s+LRA:\s*(?<range>-?(?:\d+(?:\.\d+)?|inf)|nan)\s+LU/gi;
+  const samples: AudioLoudnessTimelinePoint[] = [];
+
+  for (const match of output.matchAll(framePattern)) {
+    const seconds = parseNullableFiniteNumber(match.groups?.seconds);
+    const shortTermLufs = parseNullableFiniteNumber(match.groups?.shortTerm);
+
+    if (seconds === null || shortTermLufs === null || shortTermLufs <= MIN_VALID_SHORT_TERM_LUFS) {
+      continue;
+    }
+
+    samples.push({
+      seconds,
+      shortTermLufs
+    });
+  }
+
+  const shortTermByTimestamp = bucketShortTermSamples(samples, bucketSeconds);
+
+  return {
+    integratedLoudness: parseSummaryMetric(
+      output,
+      /Summary:[\s\S]*?Integrated loudness:\s+I:\s*(-?(?:\d+(?:\.\d+)?|inf))\s+LUFS/i
+    ),
+    truePeak: parseSummaryMetric(
+      output,
+      /Summary:[\s\S]*?True peak:\s+Peak:\s*(-?(?:\d+(?:\.\d+)?|inf))\s+dBFS/i
+    ),
+    loudnessRange: parseSummaryMetric(
+      output,
+      /Summary:[\s\S]*?Loudness range:\s+LRA:\s*(-?(?:\d+(?:\.\d+)?|inf))\s+LU/i
+    ),
+    shortTermByTimestamp,
+    largestJumps: findLargestShortTermJumps(shortTermByTimestamp, topJumpCount)
+  };
+}
+
+export function formatAudioTimestamp(seconds: number): string {
+  const roundedSeconds = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(roundedSeconds / 3600);
+  const minutes = Math.floor((roundedSeconds % 3600) / 60);
+  const remainingSeconds = roundedSeconds % 60;
+
+  if (hours > 0) {
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(
+      remainingSeconds
+    ).padStart(2, "0")}`;
+  }
+
+  return `${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
 }
 
 export function buildTranscodeArgs({
@@ -1064,6 +1642,13 @@ function parseMaxVolume(output: string): number | null {
   return parseFiniteNumber(match?.[1]);
 }
 
+function parseSummaryMetric(output: string, pattern: RegExp): number | null {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  const matches = [...output.matchAll(new RegExp(pattern.source, flags))];
+  const lastMatch = matches.at(-1);
+  return parseNullableFiniteNumber(lastMatch?.[1]);
+}
+
 function parseFiniteNumber(value: string | undefined): number | null {
   if (!value) {
     return null;
@@ -1071,6 +1656,69 @@ function parseFiniteNumber(value: string | undefined): number | null {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseNullableFiniteNumber(value: string | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  if (normalized === "nan" || normalized === "inf" || normalized === "-inf") {
+    return null;
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function bucketShortTermSamples(
+  samples: AudioLoudnessTimelinePoint[],
+  bucketSeconds: number
+): AudioLoudnessTimelinePoint[] {
+  const safeBucketSeconds = Number.isFinite(bucketSeconds) && bucketSeconds > 0 ? bucketSeconds : 1;
+  const buckets = new Map<number, AudioLoudnessTimelinePoint>();
+
+  for (const sample of samples) {
+    const bucketIndex = Math.floor(sample.seconds / safeBucketSeconds);
+    buckets.set(bucketIndex, {
+      seconds: Number((bucketIndex * safeBucketSeconds).toFixed(2)),
+      shortTermLufs: Number(sample.shortTermLufs.toFixed(2))
+    });
+  }
+
+  return [...buckets.entries()]
+    .sort(([leftBucket], [rightBucket]) => leftBucket - rightBucket)
+    .map(([, sample]) => sample);
+}
+
+function findLargestShortTermJumps(
+  samples: AudioLoudnessTimelinePoint[],
+  topJumpCount: number
+): AudioLoudnessJump[] {
+  const jumps: AudioLoudnessJump[] = [];
+
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1];
+    const current = samples[index];
+    const deltaLufs = Math.abs(current.shortTermLufs - previous.shortTermLufs);
+
+    jumps.push({
+      fromSeconds: previous.seconds,
+      toSeconds: current.seconds,
+      fromShortTermLufs: previous.shortTermLufs,
+      toShortTermLufs: current.shortTermLufs,
+      deltaLufs: Number(deltaLufs.toFixed(2))
+    });
+  }
+
+  return jumps
+    .sort(
+      (left, right) =>
+        right.deltaLufs - left.deltaLufs || left.fromSeconds - right.fromSeconds
+    )
+    .slice(0, Math.max(1, Math.floor(topJumpCount)));
 }
 
 function capitalize(text: string): string {

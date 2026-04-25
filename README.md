@@ -22,6 +22,9 @@ Requires Node.js 18+. The server uses `ffmpeg` for narration normalization and m
 
 ```
 npm test
+npx tsc --noEmit
+npm run build
+npm run analyze-audio -- ./path/to/file.mp3
 ```
 
 ## Environment variables
@@ -29,6 +32,14 @@ npm test
 ```
 MISTRAL_API_KEY
 MISTRAL_VOICE_ID
+VOICEOVER_DEBUG_AUDIO
+VOICEOVER_MASTERING_STRATEGY
 ```
 
-Both are required. The app will return an error on generation if either is missing.
+`MISTRAL_API_KEY` and `MISTRAL_VOICE_ID` are required.
+
+Optional server-only audio diagnostics:
+
+- `VOICEOVER_DEBUG_AUDIO=true` keeps raw, pre-master, final, and speech-leveler debug artifacts under `/tmp` and logs file references server-side only.
+- `VOICEOVER_MASTERING_STRATEGY=static` keeps the current static chain as the default.
+- `VOICEOVER_MASTERING_STRATEGY=speech-leveler` enables the speech-leveler mastering experiment.

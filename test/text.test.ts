@@ -4,6 +4,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
+  DEFAULT_MASTERING_STRATEGY,
   buildLinearMasteringFilter,
   buildMergeArgs,
   buildMasteringFilter,
@@ -11,8 +12,13 @@ import {
   buildTranscodeArgs,
   canLinearLoudnormEngage,
   computeStaticMasteringGainDb,
+  formatAudioTimestamp,
   LOUDNORM_FILTER,
+  parseEbur128Analysis,
+  resolveMasteringStrategy,
   SPEECH_PREMASTER_FILTER,
+  SPEECH_LEVELER_FILTER,
+  SPEECH_LEVELER_PREMASTER_FILTER,
   TRIM_SILENCE_FILTER,
   VOLUME_BOOST_SETTINGS,
   summarizeFfmpegStderr
@@ -149,6 +155,16 @@ test("speech pre-master filter chains highpass, compressor, and limiter for cres
   );
 });
 
+test("speech-leveler filters stay conservative and strategy parsing defaults safely", () => {
+  assert.equal(SPEECH_LEVELER_PREMASTER_FILTER, "highpass=f=70");
+  assert.match(SPEECH_LEVELER_FILTER, /^speechnorm=/);
+  assert.match(SPEECH_LEVELER_FILTER, /acompressor=/);
+  assert.equal(resolveMasteringStrategy("speech-leveler"), "speech-leveler");
+  assert.equal(resolveMasteringStrategy("raw-debug-only"), "raw-debug-only");
+  assert.equal(resolveMasteringStrategy("static"), DEFAULT_MASTERING_STRATEGY);
+  assert.equal(resolveMasteringStrategy("unknown-value"), DEFAULT_MASTERING_STRATEGY);
+});
+
 test("linear loudnorm feasibility predicate matches loud-quiet input crest constraints", () => {
   const easy = canLinearLoudnormEngage(
     {
@@ -225,4 +241,37 @@ Conversion failed!
   assert.doesNotMatch(summary, /ffmpeg version/i);
   assert.match(summary, /Impossible to open/);
   assert.match(summary, /Invalid data found/);
+});
+
+test("ebur128 parser exposes summary metrics, a timestamped short-term view, and largest jumps", () => {
+  const analysis = parseEbur128Analysis(`
+[Parsed_ebur128_0 @ 0x1] t: 269.999 TARGET:-23 LUFS    M: -18.2 S: -17.9     I: -17.6 LUFS       LRA:   4.1 LU  FTPK:  -1.2 dBFS  TPK:  -1.2 dBFS
+[Parsed_ebur128_0 @ 0x1] t: 270.999 TARGET:-23 LUFS    M: -15.0 S: -14.1     I: -17.5 LUFS       LRA:   4.4 LU  FTPK:  -1.0 dBFS  TPK:  -1.0 dBFS
+[Parsed_ebur128_0 @ 0x1] t: 271.999 TARGET:-23 LUFS    M: -15.4 S: -14.6     I: -17.4 LUFS       LRA:   4.6 LU  FTPK:  -1.0 dBFS  TPK:  -1.0 dBFS
+[Parsed_ebur128_0 @ 0x1] Summary:
+
+  Integrated loudness:
+    I:         -17.4 LUFS
+    Threshold: -27.4 LUFS
+
+  Loudness range:
+    LRA:         4.6 LU
+    Threshold: -37.4 LUFS
+    LRA low:    -19.2 LUFS
+    LRA high:   -14.6 LUFS
+
+  True peak:
+    Peak:       -1.0 dBFS
+  `);
+
+  assert.equal(analysis.integratedLoudness, -17.4);
+  assert.equal(analysis.truePeak, -1.0);
+  assert.equal(analysis.loudnessRange, 4.6);
+  assert.deepEqual(analysis.shortTermByTimestamp, [
+    { seconds: 269, shortTermLufs: -17.9 },
+    { seconds: 270, shortTermLufs: -14.1 },
+    { seconds: 271, shortTermLufs: -14.6 }
+  ]);
+  assert.equal(analysis.largestJumps[0]?.deltaLufs, 3.8);
+  assert.equal(formatAudioTimestamp(270), "04:30");
 });
