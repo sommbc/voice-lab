@@ -6,16 +6,25 @@ import {
   DEFAULT_JOIN_PAUSE_MS,
   DEFAULT_VOLUME_BOOST,
   VOLUME_BOOST_SETTINGS,
+  applySegmentSeamAdjustmentAudioFile,
   analyzeAudioFileOverTime,
   buildSegmentBoundaryDiagnostics,
+  buildSegmentJoinPlan,
+  buildSegmentSeamAdjustmentFilter,
   collectSegmentDiagnosticsWarnings,
+  computeSegmentSeamAdjustments,
+  extractAudioClip,
   formatAudioTimestamp,
   generateSilenceAudioFile,
   levelSegmentAudioFile,
   masterAudioFile,
   measureSegmentAudioFile,
   mergeAudioFiles,
+  selectSeamRegenerationTargets,
   standardizeSegmentAudioFile,
+  SEGMENT_LEVELING_SETTINGS,
+  type SegmentBoundaryDiagnostic,
+  type SegmentDiagnosticsManifest,
   type SegmentDiagnosticsManifestSegment
 } from "../lib/audio";
 import { parseMistralAudioResponse, postMistralSpeech } from "../lib/mistral";
@@ -108,6 +117,7 @@ async function main(): Promise<void> {
       manifestSegments.push({
         segmentIndex: segmentNumber,
         wordCount: segments[index].wordCount,
+        generationAttempt: 1,
         rawMetrics,
         standardizedMetrics,
         leveledMetrics,
@@ -128,9 +138,25 @@ async function main(): Promise<void> {
       );
     }
 
+    const joinPlan = buildSegmentJoinPlan(
+      segments.map((segment) => segment.text),
+      true
+    );
+    let boundaries = buildSegmentBoundaryDiagnostics(
+      manifestSegments.map((segment) => segment.leveledMetrics),
+      joinPlan.map((join) => join.pauseMs / 1000)
+    );
+    boundaries = await applyScriptSeamAdjustments({
+      workspacePath,
+      leveledPaths,
+      manifestSegments,
+      boundaries,
+      joinPlan
+    });
     const joinReadyPaths = await insertJoinGaps({
       workspacePath,
-      segmentPaths: leveledPaths
+      segmentPaths: leveledPaths,
+      joinPlan
     });
     const mergedPath = path.join(workspacePath, "segmented-merged-premaster.wav");
 
@@ -139,10 +165,11 @@ async function main(): Promise<void> {
       outputPath: mergedPath
     });
 
-    const boundaries = buildSegmentBoundaryDiagnostics(
-      manifestSegments.map((segment) => segment.leveledMetrics),
-      DEFAULT_JOIN_PAUSE_MS / 1000
-    );
+    await exportSeamClips({
+      workspacePath,
+      mergedPath,
+      boundaries
+    });
     const mp3Path = path.join(workspacePath, "segmented-final.mp3");
     const wavPath = path.join(workspacePath, "segmented-final.wav");
 
@@ -179,6 +206,15 @@ async function main(): Promise<void> {
 
     console.log("");
     printBoundaries(boundaries);
+    const regenerationTargets = selectSeamRegenerationTargets(
+      boundaries,
+      manifestSegments.map((segment) => segment.leveledMetrics)
+    );
+    console.log(
+      `Regeneration targets if enabled: ${
+        regenerationTargets.length ? regenerationTargets.join(", ") : "none"
+      }`
+    );
     console.log("");
     printFinalAnalysis("Segmented final MP3", mp3Path, mp3Analysis);
     printFinalAnalysis("Segmented final WAV", wavPath, wavAnalysis);
@@ -186,6 +222,29 @@ async function main(): Promise<void> {
     for (const warning of warnings) {
       console.log(`  ${warning.code}: ${warning.message}`);
     }
+
+    const manifest: SegmentDiagnosticsManifest = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      totalSegments: segments.length,
+      smoothJoins: true,
+      joinPauseMs: DEFAULT_JOIN_PAUSE_MS,
+      joinPlan,
+      segmentLeveling: SEGMENT_LEVELING_SETTINGS,
+      segments: manifestSegments,
+      boundaries,
+      warnings,
+      finalMetrics: {
+        integratedLoudness: mp3Analysis.integratedLoudness,
+        truePeak: mp3Analysis.truePeak,
+        maxVolume: null,
+        measurementMode: "loudnorm"
+      }
+    };
+
+    const manifestPath = path.join(workspacePath, "segmented-audio-manifest.json");
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    console.log(`Manifest: ${manifestPath}`);
   } finally {
     const keepWorkspace = /^(1|true|yes|on)$/i.test(process.env.VOICEOVER_KEEP_AB_TMP ?? "");
 
@@ -199,24 +258,107 @@ async function main(): Promise<void> {
 
 async function insertJoinGaps({
   workspacePath,
-  segmentPaths
+  segmentPaths,
+  joinPlan
 }: {
   workspacePath: string;
   segmentPaths: string[];
+  joinPlan: Array<{ pauseMs: number }>;
 }): Promise<string[]> {
   if (segmentPaths.length < 2) {
     return segmentPaths;
   }
 
-  const gapPath = path.join(workspacePath, "join-gap.wav");
+  const paths: string[] = [];
 
-  await generateSilenceAudioFile({
-    outputPath: gapPath,
-    durationMs: DEFAULT_JOIN_PAUSE_MS
-  });
+  for (const [index, segmentPath] of segmentPaths.entries()) {
+    paths.push(segmentPath);
 
-  return segmentPaths.flatMap((segmentPath, index) =>
-    index < segmentPaths.length - 1 ? [segmentPath, gapPath] : [segmentPath]
+    if (index >= segmentPaths.length - 1) {
+      continue;
+    }
+
+    const pauseMs = joinPlan[index]?.pauseMs ?? DEFAULT_JOIN_PAUSE_MS;
+    const gapPath = path.join(
+      workspacePath,
+      `join-gap-${String(index + 1).padStart(3, "0")}-${pauseMs}ms.wav`
+    );
+
+    await generateSilenceAudioFile({
+      outputPath: gapPath,
+      durationMs: pauseMs
+    });
+
+    paths.push(gapPath);
+  }
+
+  return paths;
+}
+
+async function applyScriptSeamAdjustments({
+  workspacePath,
+  leveledPaths,
+  manifestSegments,
+  boundaries,
+  joinPlan
+}: {
+  workspacePath: string;
+  leveledPaths: string[];
+  manifestSegments: SegmentDiagnosticsManifestSegment[];
+  boundaries: SegmentBoundaryDiagnostic[];
+  joinPlan: Array<{ pauseMs: number }>;
+}): Promise<SegmentBoundaryDiagnostic[]> {
+  const adjustments = computeSegmentSeamAdjustments(boundaries, leveledPaths.length);
+  const actionableAdjustments = adjustments.filter(
+    (adjustment) => adjustment.startCutDb >= 0.05 || adjustment.endCutDb >= 0.05
+  );
+
+  if (actionableAdjustments.length === 0) {
+    return boundaries;
+  }
+
+  console.log("Applying boundary-aware edge adjustments:");
+
+  for (const adjustment of actionableAdjustments) {
+    const segmentArrayIndex = adjustment.segmentIndex - 1;
+    const sourcePath = leveledPaths[segmentArrayIndex];
+    const segment = manifestSegments[segmentArrayIndex];
+    const segmentId = String(adjustment.segmentIndex).padStart(3, "0");
+    const outputPath = path.join(workspacePath, `segment-${segmentId}-seam-adjusted.wav`);
+    const durationSeconds = segment.leveledMetrics.durationSeconds;
+    const filter = buildSegmentSeamAdjustmentFilter(adjustment, durationSeconds);
+
+    if (!filter) {
+      continue;
+    }
+
+    await applySegmentSeamAdjustmentAudioFile({
+      inputPath: sourcePath,
+      outputPath,
+      adjustment: {
+        ...adjustment,
+        filter
+      },
+      durationSeconds
+    });
+
+    const adjustedMetrics = await measureSegmentAudioFile(outputPath);
+    leveledPaths[segmentArrayIndex] = outputPath;
+    segment.leveledMetrics = adjustedMetrics;
+    segment.seamStartCutDb = adjustment.startCutDb;
+    segment.seamEndCutDb = adjustment.endCutDb;
+    segment.seamAdjustmentFilter = filter;
+
+    console.log(
+      `  segment ${adjustment.segmentIndex}: start -${adjustment.startCutDb.toFixed(
+        2
+      )} dB, end -${adjustment.endCutDb.toFixed(2)} dB`
+    );
+  }
+
+  return buildSegmentBoundaryDiagnostics(
+    manifestSegments.map((segment) => segment.leveledMetrics),
+    joinPlan.map((join) => join.pauseMs / 1000)
   );
 }
 
@@ -244,6 +386,36 @@ async function mergeWithWavFallback({
   }
 }
 
+async function exportSeamClips({
+  workspacePath,
+  mergedPath,
+  boundaries
+}: {
+  workspacePath: string;
+  mergedPath: string;
+  boundaries: SegmentBoundaryDiagnostic[];
+}): Promise<void> {
+  for (const boundary of boundaries) {
+    if (boundary.boundaryTimestampSeconds === null) {
+      continue;
+    }
+
+    const outputPath = path.join(
+      workspacePath,
+      `seam-${String(boundary.boundaryIndex).padStart(3, "0")}.wav`
+    );
+
+    await extractAudioClip({
+      inputPath: mergedPath,
+      outputPath,
+      startSeconds: boundary.boundaryTimestampSeconds - 3,
+      durationSeconds: 6 + boundary.gapDurationMs / 1000
+    });
+
+    boundary.seamClipPath = outputPath;
+  }
+}
+
 function printBoundaries(boundaries: ReturnType<typeof buildSegmentBoundaryDiagnostics>): void {
   console.log("Boundary diagnostics:");
 
@@ -258,10 +430,17 @@ function printBoundaries(boundaries: ReturnType<typeof buildSegmentBoundaryDiagn
         boundary.boundaryTimestampSeconds === null
           ? "unknown"
           : formatAudioTimestamp(boundary.boundaryTimestampSeconds)
-      }  delta ${formatMetric(boundary.deltaLufs, "LU")}  before ${formatMetric(
+      }  gap ${boundary.gapDurationMs} ms  score ${boundary.seamQualityScore.toFixed(
+        2
+      )}  delta ${formatMetric(boundary.deltaLufs, "LU")}  rms ${formatMetric(
+        boundary.rmsDeltaDb,
+        "dB"
+      )}  before ${formatMetric(
         boundary.beforeLoudness,
         "LUFS"
-      )} after ${formatMetric(boundary.afterLoudness, "LUFS")}`
+      )} after ${formatMetric(boundary.afterLoudness, "LUFS")}  clip ${
+        boundary.seamClipPath ?? "none"
+      }`
     );
   }
 }

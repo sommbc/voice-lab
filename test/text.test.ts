@@ -11,8 +11,10 @@ import {
   buildMergeArgs,
   buildMasteringFilter,
   buildSegmentBoundaryDiagnostics,
+  buildSegmentJoinPlan,
   buildSegmentLevelingArgs,
   buildSegmentLevelingFilter,
+  buildSegmentSeamAdjustmentFilter,
   buildSegmentStandardizationArgs,
   buildStaticGainMasteringFilter,
   buildTranscodeArgs,
@@ -20,8 +22,11 @@ import {
   collectSegmentDiagnosticsWarnings,
   computeSegmentDriftCorrectionDb,
   computeSegmentLevelingGainDb,
+  computeSegmentSeamAdjustments,
+  computeSeamQualityScore,
   computeStaticMasteringGainDb,
   formatAudioTimestamp,
+  getAdaptiveJoinPauseMs,
   LOUDNORM_FILTER,
   parseEbur128Analysis,
   resolveMasteringStrategy,
@@ -32,6 +37,7 @@ import {
   SPEECH_LEVELER_PREMASTER_FILTER,
   TRIM_SILENCE_FILTER,
   VOLUME_BOOST_SETTINGS,
+  selectSeamRegenerationTargets,
   summarizeFfmpegStderr,
   type SegmentAudioMetrics,
   type SegmentDiagnosticsManifest
@@ -398,6 +404,110 @@ test("boundary diagnostics detect loudness jumps between leveled segments", () =
   assert.equal(boundaries[0].deltaLufs, 3.6);
   assert.equal(boundaries[0].exceedsThreshold, true);
   assert.equal(boundaries[0].nearBoundaryJumpExceedsThreshold, true);
+  assert.equal(boundaries[0].gapDurationMs, 300);
+  assert.equal(boundaries[0].rmsDeltaDb, 3.6);
+  assert.equal(boundaries[0].seamPassed, false);
+});
+
+test("adaptive join planning shortens ordinary stitch gaps and preserves section pauses", () => {
+  const sentencePause = getAdaptiveJoinPauseMs({
+    previousText: "The standard rises.",
+    nextText: "The future belongs to people who can think clearly."
+  });
+  const softPause = getAdaptiveJoinPauseMs({
+    previousText: "The machine reaches into those rooms with me,",
+    nextText: "and the specialist now has a new kind of leverage."
+  });
+  const sectionPause = getAdaptiveJoinPauseMs({
+    previousText: "The old monopoly is over.",
+    nextText: "New Tools\nThis is where the fake version explodes."
+  });
+  const disabledPause = getAdaptiveJoinPauseMs({
+    previousText: "One.",
+    nextText: "Two.",
+    smoothJoins: false
+  });
+  const plan = buildSegmentJoinPlan(["First section.", "Second section:", "and then"], true);
+
+  assert.equal(sentencePause, 220);
+  assert.equal(softPause, 120);
+  assert.equal(sectionPause, 320);
+  assert.equal(disabledPause, 0);
+  assert.equal(plan.length, 2);
+  assert.equal(plan[0].pauseMs, 220);
+  assert.equal(plan[1].pauseMs, 120);
+});
+
+test("seam quality scoring and regeneration target selection catch bad patch points", () => {
+  const score = computeSeamQualityScore({
+    loudnessDeltaLufs: 4.2,
+    rmsDeltaDb: 5.3,
+    gapDurationMs: 360,
+    spectralDifferenceScore: 19,
+    speechCutoffRiskBefore: false,
+    speechCutoffRiskAfter: false,
+    highTruePeakNearBoundary: false
+  });
+
+  assert.ok(score >= 35, `expected bad seam score, got ${score}`);
+
+  const boundaries = buildSegmentBoundaryDiagnostics(
+    [
+      makeSegmentMetrics({
+        durationSeconds: 10,
+        firstWindowLoudness: -18,
+        lastWindowLoudness: -22,
+        lastTwoSecondZeroCrossingRate: 0.31
+      }),
+      makeSegmentMetrics({
+        durationSeconds: 10,
+        firstWindowLoudness: -16.8,
+        lastWindowLoudness: -17,
+        firstTwoSecondZeroCrossingRate: 0.07
+      })
+    ],
+    [0.36]
+  );
+  const targets = selectSeamRegenerationTargets(
+    boundaries,
+    boundaries.length
+      ? [
+          makeSegmentMetrics({ durationSeconds: 10, firstWindowLoudness: -18, lastWindowLoudness: -22 }),
+          makeSegmentMetrics({ durationSeconds: 10, firstWindowLoudness: -16.8, lastWindowLoudness: -17 })
+        ]
+      : []
+  );
+
+  assert.equal(boundaries[0].suddenToneMismatch, true);
+  assert.equal(boundaries[0].seamPassed, false);
+  assert.deepEqual(targets, [2]);
+});
+
+test("boundary-aware edge adjustments attenuate the louder side of a seam", () => {
+  const boundaries = buildSegmentBoundaryDiagnostics(
+    [
+      makeSegmentMetrics({
+        durationSeconds: 20,
+        firstWindowLoudness: -18,
+        lastWindowLoudness: -18
+      }),
+      makeSegmentMetrics({
+        durationSeconds: 20,
+        firstWindowLoudness: -23,
+        lastWindowLoudness: -22
+      })
+    ],
+    [0.22]
+  );
+  const adjustments = computeSegmentSeamAdjustments(boundaries, 2);
+
+  assert.equal(adjustments[0].startCutDb, 0);
+  assert.equal(adjustments[0].endCutDb, 3);
+  assert.equal(adjustments[1].startCutDb, 0);
+
+  const filter = buildSegmentSeamAdjustmentFilter(adjustments[0], 20);
+  assert.match(filter ?? "", /volume='if\(lt\(t\\,17\.00\)\\,1\\,exp/);
+  assert.match(filter ?? "", /alimiter=limit=/);
 });
 
 test("diagnostic warnings expose boundary, drift, and final-peak failures", () => {
@@ -420,6 +530,7 @@ test("diagnostic warnings expose boundary, drift, and final-peak failures", () =
 
   assert.ok(warnings.some((warning) => warning.code === "boundary-delta"));
   assert.ok(warnings.some((warning) => warning.code === "near-boundary-jump"));
+  assert.ok(warnings.some((warning) => warning.code === "seam-quality"));
   assert.ok(warnings.some((warning) => warning.code === "segment-internal-drift"));
   assert.ok(warnings.some((warning) => warning.code === "final-true-peak"));
 });
@@ -435,12 +546,14 @@ test("segmented diagnostics manifest keeps metrics and gain shape serializable",
     createdAt: "2026-05-07T00:00:00.000Z",
     totalSegments: 1,
     smoothJoins: true,
-    joinPauseMs: 300,
+    joinPauseMs: 180,
+    joinPlan: [],
     segmentLeveling: SEGMENT_LEVELING_SETTINGS,
     segments: [
       {
         segmentIndex: 1,
         wordCount: 240,
+        generationAttempt: 1,
         rawMetrics: metrics,
         standardizedMetrics: metrics,
         leveledMetrics: metrics,
@@ -462,9 +575,11 @@ test("segmented diagnostics manifest keeps metrics and gain shape serializable",
 
   assert.equal(serialized.version, 1);
   assert.equal(serialized.segments[0].wordCount, 240);
+  assert.equal(serialized.segments[0].generationAttempt, 1);
   assert.equal(serialized.segments[0].appliedGainDb, 1.25);
   assert.equal(serialized.segments[0].driftCorrectionDb, 3.5);
   assert.equal(serialized.segments[0].leveledMetrics.firstWindowLoudness, -18.2);
+  assert.deepEqual(serialized.joinPlan, []);
   assert.equal(serialized.finalMetrics?.truePeak, -1);
 });
 
@@ -530,11 +645,15 @@ Duration: 00:04:32.25, start: 0.000000, bitrate: 384 kb/s
 function makeSegmentMetrics({
   durationSeconds,
   firstWindowLoudness,
-  lastWindowLoudness
+  lastWindowLoudness,
+  firstTwoSecondZeroCrossingRate = 0.12,
+  lastTwoSecondZeroCrossingRate = 0.12
 }: {
   durationSeconds: number;
   firstWindowLoudness: number;
   lastWindowLoudness: number;
+  firstTwoSecondZeroCrossingRate?: number;
+  lastTwoSecondZeroCrossingRate?: number;
 }): SegmentAudioMetrics {
   const internalDriftLufs = Number(
     Math.abs(lastWindowLoudness - firstWindowLoudness).toFixed(2)
@@ -552,6 +671,18 @@ function makeSegmentMetrics({
     ],
     firstWindowLoudness,
     lastWindowLoudness,
+    firstFiveSecondLoudness: firstWindowLoudness,
+    lastFiveSecondLoudness: lastWindowLoudness,
+    firstTwoSecondRmsDb: firstWindowLoudness,
+    lastTwoSecondRmsDb: lastWindowLoudness,
+    firstTwoSecondPeakDb: -3,
+    lastTwoSecondPeakDb: -3,
+    firstTwoSecondZeroCrossingRate,
+    lastTwoSecondZeroCrossingRate,
+    leadingEdgeRmsDb: -45,
+    trailingEdgeRmsDb: -45,
+    leadingSpeechCutoffRisk: false,
+    trailingSpeechCutoffRisk: false,
     largestInternalJump: {
       fromSeconds: 0,
       toSeconds: Math.max(0, durationSeconds - 1),

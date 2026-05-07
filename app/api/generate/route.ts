@@ -9,8 +9,11 @@ import {
   DEFAULT_SMOOTH_JOINS,
   DEFAULT_VOLUME_BOOST,
   VOLUME_BOOST_SETTINGS,
+  buildSegmentJoinPlan,
   buildSegmentBoundaryDiagnostics,
+  buildSegmentSeamAdjustmentFilter,
   collectSegmentDiagnosticsWarnings,
+  computeSegmentSeamAdjustments,
   extractAudioClip,
   getFileExtension,
   getMimeType,
@@ -21,10 +24,12 @@ import {
   mergeAudioFiles,
   persistAudioDebugArtifact,
   resolveMasteringStrategy,
+  selectSeamRegenerationTargets,
   SEGMENT_LEVELING_SETTINGS,
   STANDARD_INTERMEDIATE_CHANNELS,
   STANDARD_INTERMEDIATE_SAMPLE_RATE,
   standardizeSegmentAudioFile,
+  applySegmentSeamAdjustmentAudioFile,
   transcodeAudioFile,
   type AudioMasteringResult,
   type MasteringStrategy,
@@ -33,10 +38,11 @@ import {
   type SegmentDiagnosticsManifest,
   type SegmentDiagnosticsManifestSegment,
   type SegmentDiagnosticsWarning,
+  type SegmentJoinPlan,
   type VolumeBoost
 } from "@/lib/audio";
 import { parseMistralAudioResponse, postMistralSpeech } from "@/lib/mistral";
-import { chunkText, prepareTextForSpeech, slugifyFilename } from "@/lib/text";
+import { chunkText, prepareTextForSpeech, slugifyFilename, type TextChunk } from "@/lib/text";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -45,6 +51,7 @@ export const maxDuration = 300;
 const SINGLE_PASS_TIMEOUT_MS = 180_000;
 const SEGMENT_TIMEOUT_MS = 120_000;
 const INTERMEDIATE_SEGMENT_FORMAT: OutputFormat = "wav";
+const MAX_SEAM_REGENERATION_SEGMENTS = 2;
 
 type ProgressStage =
   | "cleaning"
@@ -97,6 +104,13 @@ class GenerationFailure extends Error {
     this.chunkingWorth = options.chunkingWorth ?? false;
   }
 }
+
+type ProcessedSegment = {
+  rawSegmentPath: string;
+  standardizedSegmentPath: string;
+  leveledSegmentPath: string;
+  manifestSegment: SegmentDiagnosticsManifestSegment;
+};
 
 export async function POST(request: Request): Promise<Response> {
   let payload: {
@@ -387,24 +401,17 @@ function validateEnvironment(voiceId: string): void {
 async function prepareSegmentsForJoinSmoothing({
   segmentPaths,
   tempDirectoryPath,
-  smoothJoins
+  smoothJoins,
+  joinPlan
 }: {
   segmentPaths: string[];
   tempDirectoryPath: string;
   smoothJoins: boolean;
+  joinPlan: SegmentJoinPlan[];
 }): Promise<string[]> {
   if (!smoothJoins || segmentPaths.length < 2) {
     return segmentPaths;
   }
-
-  const joinGapPath = path.join(tempDirectoryPath, "join-gap.wav");
-
-  await generateSilenceAudioFile({
-    outputPath: joinGapPath,
-    durationMs: DEFAULT_JOIN_PAUSE_MS,
-    sampleRate: STANDARD_INTERMEDIATE_SAMPLE_RATE,
-    channels: STANDARD_INTERMEDIATE_CHANNELS
-  });
 
   const smoothedPaths: string[] = [];
 
@@ -412,6 +419,20 @@ async function prepareSegmentsForJoinSmoothing({
     smoothedPaths.push(segmentPaths[index]);
 
     if (index < segmentPaths.length - 1) {
+      const boundary = joinPlan[index];
+      const pauseMs = boundary?.pauseMs ?? DEFAULT_JOIN_PAUSE_MS;
+      const joinGapPath = path.join(
+        tempDirectoryPath,
+        `join-gap-${String(index + 1).padStart(3, "0")}-${pauseMs}ms.wav`
+      );
+
+      await generateSilenceAudioFile({
+        outputPath: joinGapPath,
+        durationMs: pauseMs,
+        sampleRate: STANDARD_INTERMEDIATE_SAMPLE_RATE,
+        channels: STANDARD_INTERMEDIATE_CHANNELS
+      });
+
       smoothedPaths.push(joinGapPath);
     }
   }
@@ -935,9 +956,13 @@ async function generateSegmentedSpeech({
   });
 
   const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
-  const rawSegmentPaths: string[] = [];
-  const leveledSegmentPaths: string[] = [];
-  const manifestSegments: SegmentDiagnosticsManifestSegment[] = [];
+  const processedSegments: ProcessedSegment[] = [];
+  const joinPlan = buildSegmentJoinPlan(
+    segments.map((segment) => segment.text),
+    smoothJoins
+  );
+  const seamRegenerationEnabled =
+    process.env.VOICEOVER_REGENERATE_BAD_SEAMS?.trim().toLowerCase() !== "false";
 
   try {
     await assertFfmpegAvailable();
@@ -951,104 +976,49 @@ async function generateSegmentedSpeech({
     );
 
     for (let index = 0; index < segments.length; index += 1) {
-      const segmentNumber = index + 1;
-      const segmentId = String(segmentNumber).padStart(3, "0");
+      processedSegments.push(
+        await generateAndProcessSegment({
+          segment: segments[index],
+          segmentIndex: index,
+          totalSegments: segments.length,
+          attempt: 1,
+          tempDirectoryPath,
+          voiceId,
+          sendEvent,
+          debugArtifactDirectoryPath
+        })
+      );
+    }
 
-      sendEvent({
-        type: "progress",
-        stage: "generating",
-        message: `Generating section ${segmentNumber} of ${segments.length}`,
-        currentSegment: segmentNumber,
-        totalSegments: segments.length
-      });
+    let boundaryDiagnostics = buildSegmentBoundaryDiagnostics(
+      processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
+      joinPlan.map((join) => join.pauseMs / 1000)
+    );
 
-      const audioBuffer = await generateSegmentSpeech({
-        input: segments[index].text,
+    if (seamRegenerationEnabled) {
+      boundaryDiagnostics = await regenerateFailedSeams({
+        segments,
+        processedSegments,
+        boundaryDiagnostics,
+        joinPlan,
+        tempDirectoryPath,
         voiceId,
-        segmentNumber,
-        totalSegments: segments.length
-      });
-
-      const rawSegmentPath = path.join(
-        tempDirectoryPath,
-        `segment-${segmentId}-raw.wav`
-      );
-
-      await writeFile(rawSegmentPath, audioBuffer);
-      rawSegmentPaths.push(rawSegmentPath);
-
-      const rawMetrics = await measureSegmentAudioFile(rawSegmentPath);
-
-      if (debugArtifactDirectoryPath) {
-        await persistSegmentDebugArtifact({
-          sourcePath: rawSegmentPath,
-          debugArtifactDirectoryPath,
-          segmentNumber,
-          kind: "raw"
-        });
-      }
-
-      sendEvent({
-        type: "progress",
-        stage: "normalizing",
-        message: `Leveling section ${segmentNumber} of ${segments.length}`,
-        currentSegment: segmentNumber,
-        totalSegments: segments.length
-      });
-
-      const standardizedSegmentPath = path.join(
-        tempDirectoryPath,
-        `segment-${segmentId}-standardized.wav`
-      );
-
-      await standardizeSegmentAudioFile({
-        inputPath: rawSegmentPath,
-        outputPath: standardizedSegmentPath
-      });
-
-      const standardizedMetrics = await measureSegmentAudioFile(standardizedSegmentPath);
-
-      if (debugArtifactDirectoryPath) {
-        await persistSegmentDebugArtifact({
-          sourcePath: standardizedSegmentPath,
-          debugArtifactDirectoryPath,
-          segmentNumber,
-          kind: "standardized"
-        });
-      }
-
-      const leveledSegmentPath = path.join(
-        tempDirectoryPath,
-        `segment-${segmentId}-leveled.wav`
-      );
-      const levelingResult = await levelSegmentAudioFile({
-        inputPath: standardizedSegmentPath,
-        outputPath: leveledSegmentPath,
-        metrics: standardizedMetrics
-      });
-      const leveledMetrics = await measureSegmentAudioFile(leveledSegmentPath);
-
-      if (debugArtifactDirectoryPath) {
-        await persistSegmentDebugArtifact({
-          sourcePath: leveledSegmentPath,
-          debugArtifactDirectoryPath,
-          segmentNumber,
-          kind: "leveled"
-        });
-      }
-
-      leveledSegmentPaths.push(leveledSegmentPath);
-      manifestSegments.push({
-        segmentIndex: segmentNumber,
-        wordCount: segments[index].wordCount,
-        rawMetrics,
-        standardizedMetrics,
-        leveledMetrics,
-        appliedGainDb: levelingResult.appliedGainDb,
-        driftCorrectionDb: levelingResult.driftCorrectionDb,
-        levelingFilter: levelingResult.filter
+        sendEvent,
+        debugArtifactDirectoryPath
       });
     }
+
+    boundaryDiagnostics = await applyBoundaryAwareSeamAdjustments({
+      processedSegments,
+      boundaryDiagnostics,
+      joinPlan,
+      tempDirectoryPath,
+      debugArtifactDirectoryPath
+    });
+
+    const rawSegmentPaths = processedSegments.map((segment) => segment.rawSegmentPath);
+    const leveledSegmentPaths = processedSegments.map((segment) => segment.leveledSegmentPath);
+    const manifestSegments = processedSegments.map((segment) => segment.manifestSegment);
 
     if (debugArtifactDirectoryPath) {
       await persistSegmentedRawDebugArtifact({
@@ -1069,7 +1039,8 @@ async function generateSegmentedSpeech({
     const joinReadyPaths = await prepareSegmentsForJoinSmoothing({
       segmentPaths: leveledSegmentPaths,
       tempDirectoryPath,
-      smoothJoins
+      smoothJoins,
+      joinPlan
     });
 
     const assembledPath = await mergeSegmentsWithFallback({
@@ -1077,10 +1048,6 @@ async function generateSegmentedSpeech({
       tempDirectoryPath,
       sendEvent
     });
-    const boundaryDiagnostics = buildSegmentBoundaryDiagnostics(
-      manifestSegments.map((segment) => segment.leveledMetrics),
-      smoothJoins ? DEFAULT_JOIN_PAUSE_MS / 1000 : 0
-    );
 
     logSegmentedBoundaryDiagnostics(boundaryDiagnostics);
 
@@ -1128,6 +1095,7 @@ async function generateSegmentedSpeech({
           totalSegments: segments.length,
           smoothJoins,
           joinPauseMs: smoothJoins && segments.length > 1 ? DEFAULT_JOIN_PAUSE_MS : 0,
+          joinPlan,
           segmentLeveling: SEGMENT_LEVELING_SETTINGS,
           segments: manifestSegments,
           boundaries: boundaryDiagnostics,
@@ -1150,21 +1118,345 @@ async function generateSegmentedSpeech({
   }
 }
 
+async function generateAndProcessSegment({
+  segment,
+  segmentIndex,
+  totalSegments,
+  attempt,
+  tempDirectoryPath,
+  voiceId,
+  sendEvent,
+  debugArtifactDirectoryPath
+}: {
+  segment: TextChunk;
+  segmentIndex: number;
+  totalSegments: number;
+  attempt: number;
+  tempDirectoryPath: string;
+  voiceId: string;
+  sendEvent: (event: StreamEvent) => void;
+  debugArtifactDirectoryPath?: string;
+}): Promise<ProcessedSegment> {
+  const segmentNumber = segmentIndex + 1;
+  const segmentId = String(segmentNumber).padStart(3, "0");
+  const attemptSuffix = attempt > 1 ? `-attempt-${attempt}` : "";
+
+  sendEvent({
+    type: "progress",
+    stage: "generating",
+    message:
+      attempt > 1
+        ? `Regenerating section ${segmentNumber} of ${totalSegments}`
+        : `Generating section ${segmentNumber} of ${totalSegments}`,
+    currentSegment: segmentNumber,
+    totalSegments
+  });
+
+  const audioBuffer = await generateSegmentSpeech({
+    input: segment.text,
+    voiceId,
+    segmentNumber,
+    totalSegments
+  });
+
+  const rawSegmentPath = path.join(
+    tempDirectoryPath,
+    `segment-${segmentId}${attemptSuffix}-raw.wav`
+  );
+
+  await writeFile(rawSegmentPath, audioBuffer);
+  const rawMetrics = await measureSegmentAudioFile(rawSegmentPath);
+
+  if (debugArtifactDirectoryPath) {
+    await persistSegmentDebugArtifact({
+      sourcePath: rawSegmentPath,
+      debugArtifactDirectoryPath,
+      segmentNumber,
+      attempt,
+      kind: "raw"
+    });
+  }
+
+  sendEvent({
+    type: "progress",
+    stage: "normalizing",
+    message: `Leveling section ${segmentNumber} of ${totalSegments}`,
+    currentSegment: segmentNumber,
+    totalSegments
+  });
+
+  const standardizedSegmentPath = path.join(
+    tempDirectoryPath,
+    `segment-${segmentId}${attemptSuffix}-standardized.wav`
+  );
+
+  await standardizeSegmentAudioFile({
+    inputPath: rawSegmentPath,
+    outputPath: standardizedSegmentPath
+  });
+
+  const standardizedMetrics = await measureSegmentAudioFile(standardizedSegmentPath);
+
+  if (debugArtifactDirectoryPath) {
+    await persistSegmentDebugArtifact({
+      sourcePath: standardizedSegmentPath,
+      debugArtifactDirectoryPath,
+      segmentNumber,
+      attempt,
+      kind: "standardized"
+    });
+  }
+
+  const leveledSegmentPath = path.join(
+    tempDirectoryPath,
+    `segment-${segmentId}${attemptSuffix}-leveled.wav`
+  );
+  const levelingResult = await levelSegmentAudioFile({
+    inputPath: standardizedSegmentPath,
+    outputPath: leveledSegmentPath,
+    metrics: standardizedMetrics
+  });
+  const leveledMetrics = await measureSegmentAudioFile(leveledSegmentPath);
+
+  if (debugArtifactDirectoryPath) {
+    await persistSegmentDebugArtifact({
+      sourcePath: leveledSegmentPath,
+      debugArtifactDirectoryPath,
+      segmentNumber,
+      attempt,
+      kind: "leveled"
+    });
+  }
+
+  return {
+    rawSegmentPath,
+    standardizedSegmentPath,
+    leveledSegmentPath,
+    manifestSegment: {
+      segmentIndex: segmentNumber,
+      wordCount: segment.wordCount,
+      generationAttempt: attempt,
+      rawMetrics,
+      standardizedMetrics,
+      leveledMetrics,
+      appliedGainDb: levelingResult.appliedGainDb,
+      driftCorrectionDb: levelingResult.driftCorrectionDb,
+      levelingFilter: levelingResult.filter
+    }
+  };
+}
+
+async function regenerateFailedSeams({
+  segments,
+  processedSegments,
+  boundaryDiagnostics,
+  joinPlan,
+  tempDirectoryPath,
+  voiceId,
+  sendEvent,
+  debugArtifactDirectoryPath
+}: {
+  segments: TextChunk[];
+  processedSegments: ProcessedSegment[];
+  boundaryDiagnostics: SegmentBoundaryDiagnostic[];
+  joinPlan: SegmentJoinPlan[];
+  tempDirectoryPath: string;
+  voiceId: string;
+  sendEvent: (event: StreamEvent) => void;
+  debugArtifactDirectoryPath?: string;
+}): Promise<SegmentBoundaryDiagnostic[]> {
+  let currentDiagnostics = boundaryDiagnostics;
+  const targets = selectSeamRegenerationTargets(
+    currentDiagnostics,
+    processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
+    MAX_SEAM_REGENERATION_SEGMENTS
+  );
+
+  if (targets.length === 0) {
+    return currentDiagnostics;
+  }
+
+  console.warn(
+    "[segmented] seam-regeneration",
+    JSON.stringify({
+      targets,
+      failedBoundaries: currentDiagnostics
+        .filter((boundary) => !boundary.seamPassed)
+        .map((boundary) => ({
+          boundaryIndex: boundary.boundaryIndex,
+          seamQualityScore: boundary.seamQualityScore,
+          deltaLufs: boundary.deltaLufs,
+          rmsDeltaDb: boundary.rmsDeltaDb,
+          gapDurationMs: boundary.gapDurationMs,
+          spectralDifferenceScore: boundary.spectralDifferenceScore
+        }))
+    })
+  );
+
+  for (const segmentNumber of targets) {
+    const segmentIndex = segmentNumber - 1;
+    const previousSegment = processedSegments[segmentIndex];
+    const previousScore = scoreSeamsTouchingSegment(currentDiagnostics, segmentNumber);
+    const candidate = await generateAndProcessSegment({
+      segment: segments[segmentIndex],
+      segmentIndex,
+      totalSegments: segments.length,
+      attempt: 2,
+      tempDirectoryPath,
+      voiceId,
+      sendEvent,
+      debugArtifactDirectoryPath
+    });
+
+    processedSegments[segmentIndex] = candidate;
+
+    const candidateDiagnostics = buildSegmentBoundaryDiagnostics(
+      processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
+      joinPlan.map((join) => join.pauseMs / 1000)
+    );
+    const candidateScore = scoreSeamsTouchingSegment(candidateDiagnostics, segmentNumber);
+
+    if (candidateScore <= previousScore) {
+      currentDiagnostics = candidateDiagnostics;
+      console.info(
+        "[segmented] seam-regeneration accepted",
+        JSON.stringify({
+          segmentIndex: segmentNumber,
+          previousScore,
+          candidateScore
+        })
+      );
+      continue;
+    }
+
+    processedSegments[segmentIndex] = previousSegment;
+    console.warn(
+      "[segmented] seam-regeneration rejected",
+      JSON.stringify({
+        segmentIndex: segmentNumber,
+        previousScore,
+        candidateScore
+      })
+    );
+  }
+
+  return buildSegmentBoundaryDiagnostics(
+    processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
+    joinPlan.map((join) => join.pauseMs / 1000)
+  );
+}
+
+function scoreSeamsTouchingSegment(
+  boundaries: SegmentBoundaryDiagnostic[],
+  segmentNumber: number
+): number {
+  return boundaries
+    .filter(
+      (boundary) =>
+        boundary.previousSegmentIndex === segmentNumber ||
+        boundary.nextSegmentIndex === segmentNumber
+    )
+    .reduce((total, boundary) => total + boundary.seamQualityScore, 0);
+}
+
+async function applyBoundaryAwareSeamAdjustments({
+  processedSegments,
+  boundaryDiagnostics,
+  joinPlan,
+  tempDirectoryPath,
+  debugArtifactDirectoryPath
+}: {
+  processedSegments: ProcessedSegment[];
+  boundaryDiagnostics: SegmentBoundaryDiagnostic[];
+  joinPlan: SegmentJoinPlan[];
+  tempDirectoryPath: string;
+  debugArtifactDirectoryPath?: string;
+}): Promise<SegmentBoundaryDiagnostic[]> {
+  const adjustments = computeSegmentSeamAdjustments(boundaryDiagnostics, processedSegments.length);
+  const actionableAdjustments = adjustments.filter(
+    (adjustment) => adjustment.startCutDb >= 0.05 || adjustment.endCutDb >= 0.05
+  );
+
+  if (actionableAdjustments.length === 0) {
+    return boundaryDiagnostics;
+  }
+
+  console.info(
+    "[segmented] seam-edge-adjustments",
+    JSON.stringify({
+      adjustments: actionableAdjustments.map((adjustment) => ({
+        segmentIndex: adjustment.segmentIndex,
+        startCutDb: adjustment.startCutDb,
+        endCutDb: adjustment.endCutDb
+      }))
+    })
+  );
+
+  for (const adjustment of actionableAdjustments) {
+    const segmentArrayIndex = adjustment.segmentIndex - 1;
+    const processedSegment = processedSegments[segmentArrayIndex];
+    const segmentId = String(adjustment.segmentIndex).padStart(3, "0");
+    const adjustedPath = path.join(tempDirectoryPath, `segment-${segmentId}-seam-adjusted.wav`);
+    const durationSeconds = processedSegment.manifestSegment.leveledMetrics.durationSeconds;
+    const filter = buildSegmentSeamAdjustmentFilter(adjustment, durationSeconds);
+
+    if (!filter) {
+      continue;
+    }
+
+    await applySegmentSeamAdjustmentAudioFile({
+      inputPath: processedSegment.leveledSegmentPath,
+      outputPath: adjustedPath,
+      adjustment: {
+        ...adjustment,
+        filter
+      },
+      durationSeconds
+    });
+
+    const adjustedMetrics = await measureSegmentAudioFile(adjustedPath);
+    processedSegment.leveledSegmentPath = adjustedPath;
+    processedSegment.manifestSegment.leveledMetrics = adjustedMetrics;
+    processedSegment.manifestSegment.seamStartCutDb = adjustment.startCutDb;
+    processedSegment.manifestSegment.seamEndCutDb = adjustment.endCutDb;
+    processedSegment.manifestSegment.seamAdjustmentFilter = filter;
+
+    if (debugArtifactDirectoryPath) {
+      await persistSegmentDebugArtifact({
+        sourcePath: adjustedPath,
+        debugArtifactDirectoryPath,
+        segmentNumber: adjustment.segmentIndex,
+        attempt: processedSegment.manifestSegment.generationAttempt,
+        kind: "seam-adjusted"
+      });
+    }
+  }
+
+  return buildSegmentBoundaryDiagnostics(
+    processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
+    joinPlan.map((join) => join.pauseMs / 1000)
+  );
+}
+
 async function persistSegmentDebugArtifact({
   sourcePath,
   debugArtifactDirectoryPath,
   segmentNumber,
+  attempt,
   kind
 }: {
   sourcePath: string;
   debugArtifactDirectoryPath: string;
   segmentNumber: number;
-  kind: "raw" | "standardized" | "leveled";
+  attempt: number;
+  kind: "raw" | "standardized" | "leveled" | "seam-adjusted";
 }): Promise<void> {
   await persistAudioDebugArtifact({
     sourcePath,
     directoryPath: debugArtifactDirectoryPath,
-    filename: `${kind}-segment-${String(segmentNumber).padStart(3, "0")}.wav`,
+    filename: `${kind}-segment-${String(segmentNumber).padStart(3, "0")}${
+      attempt > 1 ? `-attempt-${attempt}` : ""
+    }.wav`,
     note: `${kind} segmented Mistral WAV artifact.`
   });
 }
@@ -1192,8 +1484,10 @@ async function persistSeamDebugArtifacts({
       inputPath: assembledPath,
       outputPath,
       startSeconds: boundary.boundaryTimestampSeconds - 3,
-      durationSeconds: 6 + (smoothJoins ? DEFAULT_JOIN_PAUSE_MS / 1000 : 0)
+      durationSeconds: 6 + (smoothJoins ? boundary.gapDurationMs / 1000 : 0)
     });
+
+    boundary.seamClipPath = outputPath;
 
     console.info(
       "[audio-debug] artifact",
@@ -1252,9 +1546,18 @@ function logSegmentedBoundaryDiagnostics(boundaries: SegmentBoundaryDiagnostic[]
         boundaryIndex: boundary.boundaryIndex,
         boundaryTimestampSeconds: boundary.boundaryTimestampSeconds,
         nextSpeechTimestampSeconds: boundary.nextSpeechTimestampSeconds,
+        gapDurationMs: boundary.gapDurationMs,
         beforeLoudness: boundary.beforeLoudness,
         afterLoudness: boundary.afterLoudness,
         deltaLufs: boundary.deltaLufs,
+        previousLast2sRmsDb: boundary.previousLast2sRmsDb,
+        nextFirst2sRmsDb: boundary.nextFirst2sRmsDb,
+        rmsDeltaDb: boundary.rmsDeltaDb,
+        spectralDifferenceScore: boundary.spectralDifferenceScore,
+        speechCutoffRiskBefore: boundary.speechCutoffRiskBefore,
+        speechCutoffRiskAfter: boundary.speechCutoffRiskAfter,
+        seamQualityScore: boundary.seamQualityScore,
+        seamPassed: boundary.seamPassed,
         exceedsThreshold: boundary.exceedsThreshold,
         nearBoundaryJumpExceedsThreshold: boundary.nearBoundaryJumpExceedsThreshold
       }))
