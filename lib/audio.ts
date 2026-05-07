@@ -268,6 +268,116 @@ export type SegmentDiagnosticsManifest = {
   boundaries: SegmentBoundaryDiagnostic[];
   warnings: SegmentDiagnosticsWarning[];
   finalMetrics: AudioLoudnessMetrics | null;
+  multiTakeOptimization: MultiTakeOptimizationManifest;
+};
+
+export type MultiTakeCandidatePenalty = {
+  score: number;
+  reasons: string[];
+};
+
+export type MultiTakeCandidateInput = {
+  segmentIndex: number;
+  candidateIndex: number;
+  metrics: SegmentAudioMetrics;
+  generationAttempt?: number;
+  contextOverlapUsed?: boolean;
+  contextFallbackUsed?: boolean;
+  contextAudioTrimmed?: boolean;
+  contextAudioTrimSeconds?: number | null;
+};
+
+export type MultiTakeCandidateManifest = {
+  segmentIndex: number;
+  candidateIndex: number;
+  generationAttempt: number;
+  selected: boolean;
+  candidatePenaltyScore: number;
+  candidatePenaltyReasons: string[];
+  contextOverlapUsed: boolean;
+  contextFallbackUsed: boolean;
+  contextAudioTrimmed: boolean;
+  contextAudioTrimSeconds: number | null;
+  leveledMetrics: SegmentAudioMetrics;
+};
+
+export type MultiTakePairwiseSeamScore = {
+  boundaryIndex: number;
+  previousSegmentIndex: number;
+  nextSegmentIndex: number;
+  leftCandidateIndex: number;
+  rightCandidateIndex: number;
+  score: number;
+  seamQualityScore: number;
+  seamFailureKind: SegmentSeamFailureKind;
+  seamFailureReason: string;
+  deltaLufs: number | null;
+  rmsDeltaDb: number | null;
+  gapDurationMs: number;
+  spectralDifferenceScore: number | null;
+  toneMismatchScore: number;
+  speakingRateDeltaWps: number | null;
+  speechCutoffRiskBefore: boolean;
+  speechCutoffRiskAfter: boolean;
+  highTruePeakNearBoundary: boolean;
+  seamPassed: boolean;
+};
+
+export type MultiTakePairwiseSeamScoreBoundary = {
+  boundaryIndex: number;
+  previousSegmentIndex: number;
+  nextSegmentIndex: number;
+  scores: MultiTakePairwiseSeamScore[];
+};
+
+export type MultiTakeWorstSeam = {
+  boundaryIndex: number;
+  score: number;
+  seamFailureKind: SegmentSeamFailureKind;
+  seamFailureReason: string;
+  leftCandidateIndex: number;
+  rightCandidateIndex: number;
+};
+
+export type MultiTakePathSelection = {
+  baselinePath: number[];
+  chosenPath: number[];
+  baselineTotalScore: number;
+  chosenTotalScore: number;
+  improvementPercentage: number;
+  baselineWorstSeam: MultiTakeWorstSeam | null;
+  chosenWorstSeam: MultiTakeWorstSeam | null;
+  worstSeamImprovementPercentage: number;
+};
+
+export type PublishabilityVerdict = {
+  publishable: boolean;
+  reason: "passed" | "provider_take_reset";
+  killCriteriaFailures: string[];
+  thresholds: {
+    seamScoreWarning: number;
+    minimumAverageImprovementPercentage: number;
+    minimumWorstSeamImprovementPercentage: number;
+    tonalMixedSeamsPerTenMinutes: number;
+  };
+};
+
+export type MultiTakeOptimizationManifest = {
+  enabled: boolean;
+  takeCount: number;
+  candidateCounts: number[];
+  candidates: MultiTakeCandidateManifest[][];
+  pairwiseSeamScoreMatrix: MultiTakePairwiseSeamScoreBoundary[];
+  baselinePath: number[];
+  chosenPath: number[];
+  baselineTotalScore: number;
+  chosenTotalScore: number;
+  chosenTotalScoreAfterAdjustments: number;
+  improvementPercentage: number;
+  worstSeamBefore: MultiTakeWorstSeam | null;
+  worstSeamAfter: MultiTakeWorstSeam | null;
+  worstSeamImprovementPercentage: number;
+  finalPublishabilityVerdict: PublishabilityVerdict;
 };
 
 export const DEFAULT_OUTPUT_FORMAT: OutputFormat = "mp3";
@@ -313,6 +423,11 @@ export const SEGMENT_EDGE_CUTOFF_RMS_WARNING_DB = -20;
 export const SEGMENT_EDGE_MATCH_THRESHOLD_LU = 2;
 export const SEGMENT_EDGE_MATCH_MAX_CUT_DB = 3;
 export const SEGMENT_EDGE_MATCH_WINDOW_SECONDS = 3;
+export const DEFAULT_MULTI_TAKE_COUNT = 1;
+export const MAX_MULTI_TAKE_COUNT = 5;
+export const MULTI_TAKE_MINIMUM_AVERAGE_IMPROVEMENT_PERCENTAGE = 25;
+export const MULTI_TAKE_MINIMUM_WORST_SEAM_IMPROVEMENT_PERCENTAGE = 20;
+export const MULTI_TAKE_TONAL_MIXED_SEAMS_PER_TEN_MINUTES = 1;
 const PREMASTER_INTERMEDIATE_SAMPLE_RATE = 24_000;
 const PREMASTER_INTERMEDIATE_CHANNELS = 1;
 const LINEAR_LOUDNORM_HEADROOM_DB = 0.2;
@@ -2268,6 +2383,416 @@ export function buildSegmentBoundaryDiagnostics(
   return diagnostics;
 }
 
+export function resolveMultiTakeCount(
+  value: string | undefined,
+  {
+    defaultValue = DEFAULT_MULTI_TAKE_COUNT,
+    maxValue = MAX_MULTI_TAKE_COUNT
+  }: {
+    defaultValue?: number;
+    maxValue?: number;
+  } = {}
+): number {
+  const fallback = Math.max(1, Math.floor(defaultValue));
+
+  if (value === undefined || value.trim() === "") {
+    return fallback;
+  }
+
+  const trimmed = value.trim();
+
+  if (!/^\d+$/.test(trimmed)) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(trimmed, 10);
+
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return fallback;
+  }
+
+  return Math.min(Math.max(1, Math.floor(maxValue)), parsed);
+}
+
+export function computeMultiTakeCandidatePenalty(
+  candidate: Pick<
+    MultiTakeCandidateInput,
+    | "metrics"
+    | "generationAttempt"
+    | "contextFallbackUsed"
+    | "contextAudioTrimmed"
+    | "contextAudioTrimSeconds"
+  >
+): MultiTakeCandidatePenalty {
+  const reasons: string[] = [];
+  let score = 0;
+  const metrics = candidate.metrics;
+
+  if (metrics.integratedLoudness === null) {
+    score += 4;
+    reasons.push("missing-integrated-loudness");
+  }
+
+  if (metrics.truePeak === null) {
+    score += 4;
+    reasons.push("missing-true-peak");
+  } else if (metrics.truePeak > SEGMENT_LEVELING_SETTINGS.truePeak + 0.5) {
+    score += 8;
+    reasons.push("high-true-peak");
+  }
+
+  if (
+    metrics.internalDriftLufs !== null &&
+    metrics.internalDriftLufs > SEGMENT_INTERNAL_DRIFT_WARNING_LU
+  ) {
+    score += (metrics.internalDriftLufs - SEGMENT_INTERNAL_DRIFT_WARNING_LU) * 5;
+    reasons.push("internal-drift");
+  }
+
+  if (metrics.leadingSpeechCutoffRisk) {
+    score += 12;
+    reasons.push("leading-speech-cutoff-risk");
+  }
+
+  if (metrics.trailingSpeechCutoffRisk) {
+    score += 12;
+    reasons.push("trailing-speech-cutoff-risk");
+  }
+
+  if (candidate.contextFallbackUsed) {
+    score += 6;
+    reasons.push("context-fallback");
+  }
+
+  const contextAudioTrimSeconds = candidate.contextAudioTrimSeconds ?? null;
+
+  if (
+    candidate.contextAudioTrimmed &&
+    (contextAudioTrimSeconds === null ||
+      !Number.isFinite(contextAudioTrimSeconds) ||
+      contextAudioTrimSeconds < 0)
+  ) {
+    score += 6;
+    reasons.push("invalid-context-trim");
+  }
+
+  if ((candidate.generationAttempt ?? 1) > 1) {
+    score += 1;
+    reasons.push("regenerated-take");
+  }
+
+  return {
+    score: roundToTwoDecimals(score),
+    reasons
+  };
+}
+
+export function buildMultiTakePairwiseSeamScoreMatrix({
+  candidates,
+  joinPlan,
+  wordCounts,
+  toneSeamScoringEnabled = true
+}: {
+  candidates: MultiTakeCandidateInput[][];
+  joinPlan: Pick<SegmentJoinPlan, "pauseMs">[];
+  wordCounts: number[];
+  toneSeamScoringEnabled?: boolean;
+}): MultiTakePairwiseSeamScoreBoundary[] {
+  const matrix: MultiTakePairwiseSeamScoreBoundary[] = [];
+
+  for (
+    let boundaryArrayIndex = 0;
+    boundaryArrayIndex < candidates.length - 1;
+    boundaryArrayIndex += 1
+  ) {
+    const previousCandidates = candidates[boundaryArrayIndex] ?? [];
+    const nextCandidates = candidates[boundaryArrayIndex + 1] ?? [];
+    const boundaryIndex = boundaryArrayIndex + 1;
+    const scores: MultiTakePairwiseSeamScore[] = [];
+
+    for (const previousCandidate of previousCandidates) {
+      for (const nextCandidate of nextCandidates) {
+        const diagnostic = buildSegmentBoundaryDiagnostics(
+          [previousCandidate.metrics, nextCandidate.metrics],
+          [(joinPlan[boundaryArrayIndex]?.pauseMs ?? 0) / 1000],
+          undefined,
+          undefined,
+          {
+            wordCounts: [
+              wordCounts[boundaryArrayIndex] ?? 0,
+              wordCounts[boundaryArrayIndex + 1] ?? 0
+            ],
+            toneSeamScoringEnabled
+          }
+        )[0];
+
+        if (!diagnostic) {
+          continue;
+        }
+
+        scores.push({
+          boundaryIndex,
+          previousSegmentIndex: boundaryIndex,
+          nextSegmentIndex: boundaryIndex + 1,
+          leftCandidateIndex: previousCandidate.candidateIndex,
+          rightCandidateIndex: nextCandidate.candidateIndex,
+          score: diagnostic.seamQualityScore,
+          seamQualityScore: diagnostic.seamQualityScore,
+          seamFailureKind: diagnostic.seamFailureKind,
+          seamFailureReason: diagnostic.seamFailureReason,
+          deltaLufs: diagnostic.deltaLufs,
+          rmsDeltaDb: diagnostic.rmsDeltaDb,
+          gapDurationMs: diagnostic.gapDurationMs,
+          spectralDifferenceScore: diagnostic.spectralDifferenceScore,
+          toneMismatchScore: diagnostic.toneMismatchScore,
+          speakingRateDeltaWps: diagnostic.speakingRateDeltaWps,
+          speechCutoffRiskBefore: diagnostic.speechCutoffRiskBefore,
+          speechCutoffRiskAfter: diagnostic.speechCutoffRiskAfter,
+          highTruePeakNearBoundary: diagnostic.highTruePeakNearBoundary,
+          seamPassed: diagnostic.seamPassed
+        });
+      }
+    }
+
+    matrix.push({
+      boundaryIndex,
+      previousSegmentIndex: boundaryIndex,
+      nextSegmentIndex: boundaryIndex + 1,
+      scores
+    });
+  }
+
+  return matrix;
+}
+
+export function selectBestMultiTakePath({
+  candidatePenaltyScores,
+  pairwiseSeamScoreMatrix
+}: {
+  candidatePenaltyScores: number[][];
+  pairwiseSeamScoreMatrix: MultiTakePairwiseSeamScoreBoundary[];
+}): MultiTakePathSelection {
+  if (candidatePenaltyScores.length === 0) {
+    return {
+      baselinePath: [],
+      chosenPath: [],
+      baselineTotalScore: 0,
+      chosenTotalScore: 0,
+      improvementPercentage: 0,
+      baselineWorstSeam: null,
+      chosenWorstSeam: null,
+      worstSeamImprovementPercentage: 0
+    };
+  }
+
+  const baselinePath = candidatePenaltyScores.map(() => 0);
+  const dp: number[][] = [];
+  const backtrack: number[][] = [];
+
+  dp[0] = candidatePenaltyScores[0].map((penalty) => roundToTwoDecimals(penalty));
+  backtrack[0] = candidatePenaltyScores[0].map(() => -1);
+
+  for (let segmentIndex = 1; segmentIndex < candidatePenaltyScores.length; segmentIndex += 1) {
+    dp[segmentIndex] = [];
+    backtrack[segmentIndex] = [];
+
+    for (
+      let candidateIndex = 0;
+      candidateIndex < candidatePenaltyScores[segmentIndex].length;
+      candidateIndex += 1
+    ) {
+      let bestScore = Number.POSITIVE_INFINITY;
+      let bestPreviousCandidateIndex = 0;
+
+      for (
+        let previousCandidateIndex = 0;
+        previousCandidateIndex < candidatePenaltyScores[segmentIndex - 1].length;
+        previousCandidateIndex += 1
+      ) {
+        const seamScore =
+          findPairwiseScore(
+            pairwiseSeamScoreMatrix[segmentIndex - 1],
+            previousCandidateIndex,
+            candidateIndex
+          )?.score ?? Number.POSITIVE_INFINITY;
+        const candidateScore =
+          (dp[segmentIndex - 1]?.[previousCandidateIndex] ?? Number.POSITIVE_INFINITY) +
+          seamScore +
+          (candidatePenaltyScores[segmentIndex]?.[candidateIndex] ?? 0);
+
+        if (candidateScore < bestScore) {
+          bestScore = candidateScore;
+          bestPreviousCandidateIndex = previousCandidateIndex;
+        }
+      }
+
+      dp[segmentIndex][candidateIndex] = roundToTwoDecimals(bestScore);
+      backtrack[segmentIndex][candidateIndex] = bestPreviousCandidateIndex;
+    }
+  }
+
+  const finalScores = dp[dp.length - 1] ?? [];
+  let chosenFinalCandidateIndex = 0;
+  let chosenScore = finalScores[0] ?? 0;
+
+  for (const [candidateIndex, score] of finalScores.entries()) {
+    if (score < chosenScore) {
+      chosenScore = score;
+      chosenFinalCandidateIndex = candidateIndex;
+    }
+  }
+
+  const chosenPath = Array.from({ length: candidatePenaltyScores.length }, () => 0);
+  chosenPath[chosenPath.length - 1] = chosenFinalCandidateIndex;
+
+  for (let segmentIndex = candidatePenaltyScores.length - 1; segmentIndex > 0; segmentIndex -= 1) {
+    chosenPath[segmentIndex - 1] = backtrack[segmentIndex]?.[chosenPath[segmentIndex]] ?? 0;
+  }
+
+  const baselineTotalScore = scoreMultiTakePath({
+    path: baselinePath,
+    candidatePenaltyScores,
+    pairwiseSeamScoreMatrix
+  });
+  const chosenTotalScore = scoreMultiTakePath({
+    path: chosenPath,
+    candidatePenaltyScores,
+    pairwiseSeamScoreMatrix
+  });
+  const baselineWorstSeam = findWorstSeamForPath({
+    path: baselinePath,
+    pairwiseSeamScoreMatrix
+  });
+  const chosenWorstSeam = findWorstSeamForPath({
+    path: chosenPath,
+    pairwiseSeamScoreMatrix
+  });
+
+  return {
+    baselinePath,
+    chosenPath,
+    baselineTotalScore,
+    chosenTotalScore,
+    improvementPercentage: computeImprovementPercentage(
+      baselineTotalScore,
+      chosenTotalScore
+    ),
+    baselineWorstSeam,
+    chosenWorstSeam,
+    worstSeamImprovementPercentage: computeImprovementPercentage(
+      baselineWorstSeam?.score ?? 0,
+      chosenWorstSeam?.score ?? 0
+    )
+  };
+}
+
+export function scoreMultiTakePath({
+  path,
+  candidatePenaltyScores,
+  pairwiseSeamScoreMatrix
+}: {
+  path: number[];
+  candidatePenaltyScores: number[][];
+  pairwiseSeamScoreMatrix: MultiTakePairwiseSeamScoreBoundary[];
+}): number {
+  let score = 0;
+
+  for (const [segmentIndex, candidateIndex] of path.entries()) {
+    score += candidatePenaltyScores[segmentIndex]?.[candidateIndex] ?? 0;
+
+    if (segmentIndex === 0) {
+      continue;
+    }
+
+    score +=
+      findPairwiseScore(
+        pairwiseSeamScoreMatrix[segmentIndex - 1],
+        path[segmentIndex - 1] ?? 0,
+        candidateIndex
+      )?.score ?? 0;
+  }
+
+  return roundToTwoDecimals(score);
+}
+
+export function evaluateSegmentedPublishability({
+  boundaries,
+  multiTakeEnabled,
+  improvementPercentage,
+  worstSeamImprovementPercentage,
+  durationSeconds
+}: {
+  boundaries: SegmentBoundaryDiagnostic[];
+  multiTakeEnabled: boolean;
+  improvementPercentage: number;
+  worstSeamImprovementPercentage: number;
+  durationSeconds: number | null;
+}): PublishabilityVerdict {
+  const failures: string[] = [];
+  const worstSeamScore = boundaries.reduce(
+    (highest, boundary) => Math.max(highest, boundary.seamQualityScore),
+    0
+  );
+  const tonalMixedFailures = boundaries.filter(
+    (boundary) =>
+      !boundary.seamPassed &&
+      (boundary.seamFailureKind === "tonal" || boundary.seamFailureKind === "mixed")
+  );
+  const tonalOnlyFailures = boundaries.filter(
+    (boundary) => !boundary.seamPassed && boundary.seamFailureKind === "tonal"
+  );
+  const tenMinuteBlocks =
+    durationSeconds === null || durationSeconds <= 0
+      ? 1
+      : Math.max(1, Math.ceil(durationSeconds / 600));
+  const allowedTonalMixedFailures =
+    MULTI_TAKE_TONAL_MIXED_SEAMS_PER_TEN_MINUTES * tenMinuteBlocks;
+
+  if (worstSeamScore >= SEGMENT_SEAM_SCORE_WARNING) {
+    failures.push("worst_seam_score_threshold");
+  }
+
+  if (
+    multiTakeEnabled &&
+    improvementPercentage < MULTI_TAKE_MINIMUM_AVERAGE_IMPROVEMENT_PERCENTAGE
+  ) {
+    failures.push("average_improvement_below_threshold");
+  }
+
+  if (
+    multiTakeEnabled &&
+    worstSeamImprovementPercentage < MULTI_TAKE_MINIMUM_WORST_SEAM_IMPROVEMENT_PERCENTAGE
+  ) {
+    failures.push("worst_seam_improvement_below_threshold");
+  }
+
+  if (tonalMixedFailures.length > allowedTonalMixedFailures) {
+    failures.push("too_many_tonal_or_mixed_seams");
+  }
+
+  if (tonalOnlyFailures.length > 0) {
+    failures.push("mechanically_clean_tonal_mismatch");
+  }
+
+  if (multiTakeEnabled && improvementPercentage > 0 && tonalMixedFailures.length > 0) {
+    failures.push("metrics_improved_but_tonal_mismatch_remains");
+  }
+
+  return {
+    publishable: failures.length === 0,
+    reason: failures.length === 0 ? "passed" : "provider_take_reset",
+    killCriteriaFailures: failures,
+    thresholds: {
+      seamScoreWarning: SEGMENT_SEAM_SCORE_WARNING,
+      minimumAverageImprovementPercentage:
+        MULTI_TAKE_MINIMUM_AVERAGE_IMPROVEMENT_PERCENTAGE,
+      minimumWorstSeamImprovementPercentage:
+        MULTI_TAKE_MINIMUM_WORST_SEAM_IMPROVEMENT_PERCENTAGE,
+      tonalMixedSeamsPerTenMinutes: MULTI_TAKE_TONAL_MIXED_SEAMS_PER_TEN_MINUTES
+    }
+  };
+}
+
 export function collectSegmentDiagnosticsWarnings({
   boundaries,
   segmentMetrics,
@@ -2887,6 +3412,61 @@ function computeSpeakingRateWps(
   }
 
   return roundToTwoDecimals(wordCount / durationSeconds);
+}
+
+function findPairwiseScore(
+  boundary: MultiTakePairwiseSeamScoreBoundary | undefined,
+  leftCandidateIndex: number,
+  rightCandidateIndex: number
+): MultiTakePairwiseSeamScore | null {
+  return (
+    boundary?.scores.find(
+      (score) =>
+        score.leftCandidateIndex === leftCandidateIndex &&
+        score.rightCandidateIndex === rightCandidateIndex
+    ) ?? null
+  );
+}
+
+function findWorstSeamForPath({
+  path,
+  pairwiseSeamScoreMatrix
+}: {
+  path: number[];
+  pairwiseSeamScoreMatrix: MultiTakePairwiseSeamScoreBoundary[];
+}): MultiTakeWorstSeam | null {
+  let worst: MultiTakeWorstSeam | null = null;
+
+  for (let segmentIndex = 1; segmentIndex < path.length; segmentIndex += 1) {
+    const score = findPairwiseScore(
+      pairwiseSeamScoreMatrix[segmentIndex - 1],
+      path[segmentIndex - 1] ?? 0,
+      path[segmentIndex] ?? 0
+    );
+
+    if (!score || (worst !== null && score.score <= worst.score)) {
+      continue;
+    }
+
+    worst = {
+      boundaryIndex: score.boundaryIndex,
+      score: score.score,
+      seamFailureKind: score.seamFailureKind,
+      seamFailureReason: score.seamFailureReason,
+      leftCandidateIndex: score.leftCandidateIndex,
+      rightCandidateIndex: score.rightCandidateIndex
+    };
+  }
+
+  return worst;
+}
+
+function computeImprovementPercentage(before: number, after: number): number {
+  if (before <= 0) {
+    return after < before ? 100 : 0;
+  }
+
+  return roundToTwoDecimals(((before - after) / before) * 100);
 }
 
 function describeSeamFailure({

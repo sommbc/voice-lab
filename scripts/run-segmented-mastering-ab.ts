@@ -8,11 +8,14 @@ import {
   VOLUME_BOOST_SETTINGS,
   applySegmentSeamAdjustmentAudioFile,
   analyzeAudioFileOverTime,
+  buildMultiTakePairwiseSeamScoreMatrix,
   buildSegmentBoundaryDiagnostics,
   buildSegmentJoinPlan,
   buildSegmentSeamAdjustmentFilter,
   collectSegmentDiagnosticsWarnings,
+  computeMultiTakeCandidatePenalty,
   computeSegmentSeamAdjustments,
+  evaluateSegmentedPublishability,
   extractAudioClip,
   formatAudioTimestamp,
   generateSilenceAudioFile,
@@ -20,12 +23,19 @@ import {
   masterAudioFile,
   measureSegmentAudioFile,
   mergeAudioFiles,
+  resolveMultiTakeCount,
   selectSeamRegenerationTargets,
+  selectBestMultiTakePath,
   standardizeSegmentAudioFile,
   SEGMENT_LEVELING_SETTINGS,
+  type MultiTakeCandidateInput,
+  type MultiTakeCandidateManifest,
+  type MultiTakeOptimizationManifest,
+  type MultiTakePathSelection,
   type SegmentBoundaryDiagnostic,
   type SegmentDiagnosticsManifest,
-  type SegmentDiagnosticsManifestSegment
+  type SegmentDiagnosticsManifestSegment,
+  type SegmentJoinPlan
 } from "../lib/audio";
 import { parseMistralAudioResponse, postMistralSpeech } from "../lib/mistral";
 import {
@@ -49,6 +59,21 @@ const toneSeamScoringEnabled = readBooleanEnv(
   process.env.VOICEOVER_TONE_SEAM_SCORING,
   true
 );
+const takeCount = resolveMultiTakeCount(process.env.VOICEOVER_MULTI_TAKE_COUNT);
+
+type ScriptProcessedSegment = {
+  rawSegmentPath: string;
+  standardizedSegmentPath: string;
+  leveledSegmentPath: string;
+  manifestSegment: SegmentDiagnosticsManifestSegment;
+};
+
+type ScriptSegmentCandidate = {
+  candidateIndex: number;
+  processedSegment: ScriptProcessedSegment;
+  candidatePenaltyScore: number;
+  candidatePenaltyReasons: string[];
+};
 
 void main();
 
@@ -73,8 +98,9 @@ async function main(): Promise<void> {
   }
 
   const workspacePath = await mkdtemp(path.join(tmpdir(), "voiceover-segmented-ab-"));
-  const leveledPaths: string[] = [];
-  const manifestSegments: SegmentDiagnosticsManifestSegment[] = [];
+  let leveledPaths: string[] = [];
+  let manifestSegments: SegmentDiagnosticsManifestSegment[] = [];
+  let multiTakeOptimization: MultiTakeOptimizationManifest;
 
   try {
     console.log(`Essay: ${essayPath}`);
@@ -82,215 +108,44 @@ async function main(): Promise<void> {
     console.log(`Cleaned word count: ${prepared.wordCount}`);
     console.log(`Segments: ${segments.length}`);
     console.log(`Segment word counts: ${segments.map((segment) => segment.wordCount).join(", ")}`);
+    console.log(`Multi-take count: ${takeCount}`);
     console.log("");
 
+    const candidateGroups: ScriptSegmentCandidate[][] = [];
+
     for (let index = 0; index < segments.length; index += 1) {
-      const segmentNumber = index + 1;
-      const segmentId = String(segmentNumber).padStart(3, "0");
-      const rawPath = path.join(workspacePath, `segment-${segmentId}-raw.wav`);
-      const standardizedPath = path.join(workspacePath, `segment-${segmentId}-standardized.wav`);
-      const leveledPath = path.join(workspacePath, `segment-${segmentId}-leveled.wav`);
-      const prompt = buildSegmentContinuityPrompt({
-        previousText: segments[index - 1]?.text,
-        targetText: segments[index].text,
-        nextText: segments[index + 1]?.text,
-        enabled: false,
-        instructionStrength: "standard"
-      });
-      const continuityContextPrompt = buildSegmentContinuityPrompt({
-        previousText: segments[index - 1]?.text,
-        targetText: segments[index].text,
-        nextText: segments[index + 1]?.text,
-        enabled: contextOverlapEnabled,
-        instructionStrength: "standard"
-      });
-      const spokenOverlapInput =
-        contextOverlapEnabled && continuityContextPrompt.previousContext
-          ? buildSpokenContextOverlapInput({
-              previousContext: continuityContextPrompt.previousContext,
-              targetText: segments[index].text
-            })
-          : null;
+      candidateGroups[index] = [];
 
-      console.log(`Requesting segment ${segmentNumber} of ${segments.length}...`);
-      const response = await postMistralSpeech({
-        input: spokenOverlapInput?.input ?? prompt.input,
-        voiceId,
-        responseFormat: "wav",
-        timeoutMs: 120_000
-      });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        console.error(`Segment ${segmentNumber} failed: ${response.status} ${response.statusText}`);
-        if (errorBody) {
-          console.error(errorBody);
-        }
-        process.exit(1);
+      for (let candidateIndex = 0; candidateIndex < takeCount; candidateIndex += 1) {
+        candidateGroups[index].push(
+          await generateAndProcessScriptSegment({
+            workspacePath,
+            segments,
+            segmentIndex: index,
+            candidateIndex,
+            attempt: candidateIndex === 0 ? 1 : 200 + candidateIndex
+          })
+        );
       }
-
-      const rawBuffer = await parseMistralAudioResponse(response);
-      await writeFile(rawPath, rawBuffer);
-      let rawMetrics = await measureSegmentAudioFile(rawPath);
-      let finalRawPath = rawPath;
-      let finalPrompt: SegmentContinuityPrompt = spokenOverlapInput
-        ? {
-            ...continuityContextPrompt,
-            input: spokenOverlapInput.input,
-            nextContext: "",
-            contextOverlapUsed: true,
-            inputWordCount: spokenOverlapInput.inputWordCount
-          }
-        : prompt;
-      let contextLikelySpoken = false;
-      let contextFallbackUsed = false;
-      let contextAudioTrimmed = false;
-      let contextAudioTrimSeconds: number | null = null;
-
-      if (spokenOverlapInput && rawMetrics.durationSeconds !== null) {
-        const trimSeconds = estimateContextAudioTrimSeconds({
-          durationSeconds: rawMetrics.durationSeconds,
-          contextWordCount: spokenOverlapInput.contextWordCount,
-          targetWordCount: segments[index].wordCount
-        });
-        finalRawPath = path.join(workspacePath, `segment-${segmentId}-raw-context-trimmed.wav`);
-        await extractAudioClip({
-          inputPath: rawPath,
-          outputPath: finalRawPath,
-          startSeconds: trimSeconds,
-          durationSeconds: Math.max(0.5, rawMetrics.durationSeconds - trimSeconds)
-        });
-        rawMetrics = await measureSegmentAudioFile(finalRawPath);
-        contextAudioTrimmed = true;
-        contextAudioTrimSeconds = trimSeconds;
-        console.log(`  trimmed ${trimSeconds.toFixed(2)} s of spoken continuity context`);
-
-        if (isContextTrimLikelyBadTake(rawMetrics)) {
-          console.log("  context-trimmed take failed quality guard; regenerating target passage only");
-          finalPrompt = buildSegmentContinuityPrompt({
-            targetText: segments[index].text,
-            enabled: false
-          });
-          const fallbackResponse = await postMistralSpeech({
-            input: finalPrompt.input,
-            voiceId,
-            responseFormat: "wav",
-            timeoutMs: 120_000
-          });
-
-          if (!fallbackResponse.ok) {
-            const errorBody = await fallbackResponse.text();
-            console.error(
-              `Segment ${segmentNumber} target-only fallback failed: ${fallbackResponse.status} ${fallbackResponse.statusText}`
-            );
-            if (errorBody) {
-              console.error(errorBody);
-            }
-            process.exit(1);
-          }
-
-          finalRawPath = path.join(workspacePath, `segment-${segmentId}-raw-target-only.wav`);
-          const fallbackRawBuffer = await parseMistralAudioResponse(fallbackResponse);
-          await writeFile(finalRawPath, fallbackRawBuffer);
-          rawMetrics = await measureSegmentAudioFile(finalRawPath);
-          contextFallbackUsed = true;
-          contextAudioTrimmed = false;
-          contextAudioTrimSeconds = null;
-        }
-      } else if (contextLikelySpoken) {
-        console.log("  context likely spoken; regenerating target passage only");
-        finalPrompt = buildSegmentContinuityPrompt({
-          targetText: segments[index].text,
-          enabled: false
-        });
-        const fallbackResponse = await postMistralSpeech({
-          input: finalPrompt.input,
-          voiceId,
-          responseFormat: "wav",
-          timeoutMs: 120_000
-        });
-
-        if (!fallbackResponse.ok) {
-          const errorBody = await fallbackResponse.text();
-          console.error(
-            `Segment ${segmentNumber} target-only fallback failed: ${fallbackResponse.status} ${fallbackResponse.statusText}`
-          );
-          if (errorBody) {
-            console.error(errorBody);
-          }
-          process.exit(1);
-        }
-
-        finalRawPath = path.join(workspacePath, `segment-${segmentId}-raw-target-only.wav`);
-        const fallbackRawBuffer = await parseMistralAudioResponse(fallbackResponse);
-        await writeFile(finalRawPath, fallbackRawBuffer);
-        rawMetrics = await measureSegmentAudioFile(finalRawPath);
-        contextFallbackUsed = true;
-      }
-
-      await standardizeSegmentAudioFile({
-        inputPath: finalRawPath,
-        outputPath: standardizedPath
-      });
-      const standardizedMetrics = await measureSegmentAudioFile(standardizedPath);
-
-      const levelingResult = await levelSegmentAudioFile({
-        inputPath: standardizedPath,
-        outputPath: leveledPath,
-        metrics: standardizedMetrics
-      });
-      const leveledMetrics = await measureSegmentAudioFile(leveledPath);
-
-      leveledPaths.push(leveledPath);
-      manifestSegments.push({
-        segmentIndex: segmentNumber,
-        wordCount: segments[index].wordCount,
-        generationAttempt: 1,
-        generationInputWordCount: finalPrompt.inputWordCount,
-        targetWordCount: finalPrompt.targetWordCount,
-        contextOverlapUsed: finalPrompt.contextOverlapUsed,
-        contextInstructionStrength: finalPrompt.instructionStrength,
-        previousContext: finalPrompt.previousContext,
-        nextContext: finalPrompt.nextContext,
-        contextLikelySpoken,
-        contextFallbackUsed,
-        contextAudioTrimmed,
-        contextAudioTrimSeconds,
-        rawMetrics,
-        standardizedMetrics,
-        leveledMetrics,
-        appliedGainDb: levelingResult.appliedGainDb,
-        driftCorrectionDb: levelingResult.driftCorrectionDb,
-        levelingFilter: levelingResult.filter
-      });
-
-      console.log(
-        `  gain ${levelingResult.appliedGainDb.toFixed(
-          2
-        )} dB, drift ramp ${levelingResult.driftCorrectionDb.toFixed(
-          2
-        )} dB, leveled ${formatMetric(
-          leveledMetrics.integratedLoudness,
-          "LUFS"
-        )}, TP ${formatMetric(leveledMetrics.truePeak, "dBFS")}`
-      );
     }
 
     const joinPlan = buildSegmentJoinPlan(
       segments.map((segment) => segment.text),
       true
     );
-    let boundaries = buildSegmentBoundaryDiagnostics(
-      manifestSegments.map((segment) => segment.leveledMetrics),
-      joinPlan.map((join) => join.pauseMs / 1000),
-      undefined,
-      undefined,
-      {
-        wordCounts: segments.map((segment) => segment.wordCount),
-        toneSeamScoringEnabled
-      }
+    const optimizationResult = buildScriptMultiTakeOptimization({
+      candidateGroups,
+      joinPlan,
+      segments
+    });
+    leveledPaths = optimizationResult.selectedProcessedSegments.map(
+      (segment) => segment.leveledSegmentPath
     );
-    hydrateScriptBoundaryContext(boundaries, segments, manifestSegments);
+    manifestSegments = optimizationResult.selectedProcessedSegments.map(
+      (segment) => segment.manifestSegment
+    );
+    let boundaries = optimizationResult.boundaries;
+    multiTakeOptimization = optimizationResult.multiTakeOptimization;
     boundaries = await applyScriptSeamAdjustments({
       workspacePath,
       leveledPaths,
@@ -298,6 +153,12 @@ async function main(): Promise<void> {
       boundaries,
       joinPlan,
       segments
+    });
+    multiTakeOptimization = finalizeScriptMultiTakeOptimizationManifest({
+      multiTakeOptimization,
+      boundaries,
+      manifestSegments,
+      joinPlan
     });
     const joinReadyPaths = await insertJoinGaps({
       workspacePath,
@@ -368,6 +229,8 @@ async function main(): Promise<void> {
     for (const warning of warnings) {
       console.log(`  ${warning.code}: ${warning.message}`);
     }
+    console.log("");
+    printMultiTakeSummary(multiTakeOptimization);
 
     const manifest: SegmentDiagnosticsManifest = {
       version: 1,
@@ -385,7 +248,8 @@ async function main(): Promise<void> {
         truePeak: mp3Analysis.truePeak,
         maxVolume: null,
         measurementMode: "loudnorm"
-      }
+      },
+      multiTakeOptimization
     };
 
     const manifestPath = path.join(workspacePath, "segmented-audio-manifest.json");
@@ -400,6 +264,493 @@ async function main(): Promise<void> {
       await rm(workspacePath, { force: true, recursive: true });
     }
   }
+}
+
+async function generateAndProcessScriptSegment({
+  workspacePath,
+  segments,
+  segmentIndex,
+  candidateIndex,
+  attempt
+}: {
+  workspacePath: string;
+  segments: Array<{ text: string; wordCount: number }>;
+  segmentIndex: number;
+  candidateIndex: number;
+  attempt: number;
+}): Promise<ScriptSegmentCandidate> {
+  const segmentNumber = segmentIndex + 1;
+  const segmentId = String(segmentNumber).padStart(3, "0");
+  const attemptSuffix = attempt > 1 ? `-attempt-${attempt}` : "";
+  const rawPath = path.join(workspacePath, `segment-${segmentId}${attemptSuffix}-raw.wav`);
+  const standardizedPath = path.join(
+    workspacePath,
+    `segment-${segmentId}${attemptSuffix}-standardized.wav`
+  );
+  const leveledPath = path.join(
+    workspacePath,
+    `segment-${segmentId}${attemptSuffix}-leveled.wav`
+  );
+  const prompt = buildSegmentContinuityPrompt({
+    previousText: segments[segmentIndex - 1]?.text,
+    targetText: segments[segmentIndex].text,
+    nextText: segments[segmentIndex + 1]?.text,
+    enabled: false,
+    instructionStrength: attempt > 1 ? "strong" : "standard"
+  });
+  const continuityContextPrompt = buildSegmentContinuityPrompt({
+    previousText: segments[segmentIndex - 1]?.text,
+    targetText: segments[segmentIndex].text,
+    nextText: segments[segmentIndex + 1]?.text,
+    enabled: contextOverlapEnabled,
+    instructionStrength: attempt > 1 ? "strong" : "standard"
+  });
+  const spokenOverlapInput =
+    contextOverlapEnabled && continuityContextPrompt.previousContext
+      ? buildSpokenContextOverlapInput({
+          previousContext: continuityContextPrompt.previousContext,
+          targetText: segments[segmentIndex].text
+        })
+      : null;
+
+  console.log(
+    `Requesting segment ${segmentNumber} of ${segments.length}, take ${
+      candidateIndex + 1
+    } of ${takeCount}...`
+  );
+  const response = await postMistralSpeech({
+    input: spokenOverlapInput?.input ?? prompt.input,
+    voiceId,
+    responseFormat: "wav",
+    timeoutMs: 120_000
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`Segment ${segmentNumber} failed: ${response.status} ${response.statusText}`);
+    if (errorBody) {
+      console.error(errorBody);
+    }
+    process.exit(1);
+  }
+
+  const rawBuffer = await parseMistralAudioResponse(response);
+  await writeFile(rawPath, rawBuffer);
+  let rawMetrics = await measureSegmentAudioFile(rawPath);
+  let finalRawPath = rawPath;
+  let finalPrompt: SegmentContinuityPrompt = spokenOverlapInput
+    ? {
+        ...continuityContextPrompt,
+        input: spokenOverlapInput.input,
+        nextContext: "",
+        contextOverlapUsed: true,
+        inputWordCount: spokenOverlapInput.inputWordCount
+      }
+    : prompt;
+  const contextLikelySpoken = false;
+  let contextFallbackUsed = false;
+  let contextAudioTrimmed = false;
+  let contextAudioTrimSeconds: number | null = null;
+
+  if (spokenOverlapInput && rawMetrics.durationSeconds !== null) {
+    const trimSeconds = estimateContextAudioTrimSeconds({
+      durationSeconds: rawMetrics.durationSeconds,
+      contextWordCount: spokenOverlapInput.contextWordCount,
+      targetWordCount: segments[segmentIndex].wordCount
+    });
+    finalRawPath = path.join(
+      workspacePath,
+      `segment-${segmentId}${attemptSuffix}-raw-context-trimmed.wav`
+    );
+    await extractAudioClip({
+      inputPath: rawPath,
+      outputPath: finalRawPath,
+      startSeconds: trimSeconds,
+      durationSeconds: Math.max(0.5, rawMetrics.durationSeconds - trimSeconds)
+    });
+    rawMetrics = await measureSegmentAudioFile(finalRawPath);
+    contextAudioTrimmed = true;
+    contextAudioTrimSeconds = trimSeconds;
+    console.log(`  trimmed ${trimSeconds.toFixed(2)} s of spoken continuity context`);
+
+    if (isContextTrimLikelyBadTake(rawMetrics)) {
+      console.log("  context-trimmed take failed quality guard; regenerating target passage only");
+      finalPrompt = buildSegmentContinuityPrompt({
+        targetText: segments[segmentIndex].text,
+        enabled: false
+      });
+      const fallbackResponse = await postMistralSpeech({
+        input: finalPrompt.input,
+        voiceId,
+        responseFormat: "wav",
+        timeoutMs: 120_000
+      });
+
+      if (!fallbackResponse.ok) {
+        const errorBody = await fallbackResponse.text();
+        console.error(
+          `Segment ${segmentNumber} target-only fallback failed: ${fallbackResponse.status} ${fallbackResponse.statusText}`
+        );
+        if (errorBody) {
+          console.error(errorBody);
+        }
+        process.exit(1);
+      }
+
+      finalRawPath = path.join(
+        workspacePath,
+        `segment-${segmentId}${attemptSuffix}-raw-target-only.wav`
+      );
+      const fallbackRawBuffer = await parseMistralAudioResponse(fallbackResponse);
+      await writeFile(finalRawPath, fallbackRawBuffer);
+      rawMetrics = await measureSegmentAudioFile(finalRawPath);
+      contextFallbackUsed = true;
+      contextAudioTrimmed = false;
+      contextAudioTrimSeconds = null;
+    }
+  }
+
+  await standardizeSegmentAudioFile({
+    inputPath: finalRawPath,
+    outputPath: standardizedPath
+  });
+  const standardizedMetrics = await measureSegmentAudioFile(standardizedPath);
+
+  const levelingResult = await levelSegmentAudioFile({
+    inputPath: standardizedPath,
+    outputPath: leveledPath,
+    metrics: standardizedMetrics
+  });
+  const leveledMetrics = await measureSegmentAudioFile(leveledPath);
+
+  console.log(
+    `  gain ${levelingResult.appliedGainDb.toFixed(
+      2
+    )} dB, drift ramp ${levelingResult.driftCorrectionDb.toFixed(
+      2
+    )} dB, leveled ${formatMetric(
+      leveledMetrics.integratedLoudness,
+      "LUFS"
+    )}, TP ${formatMetric(leveledMetrics.truePeak, "dBFS")}`
+  );
+
+  const processedSegment: ScriptProcessedSegment = {
+    rawSegmentPath: finalRawPath,
+    standardizedSegmentPath: standardizedPath,
+    leveledSegmentPath: leveledPath,
+    manifestSegment: {
+      segmentIndex: segmentNumber,
+      wordCount: segments[segmentIndex].wordCount,
+      generationAttempt: attempt,
+      generationInputWordCount: finalPrompt.inputWordCount,
+      targetWordCount: finalPrompt.targetWordCount,
+      contextOverlapUsed: finalPrompt.contextOverlapUsed,
+      contextInstructionStrength: finalPrompt.instructionStrength,
+      previousContext: finalPrompt.previousContext,
+      nextContext: finalPrompt.nextContext,
+      contextLikelySpoken,
+      contextFallbackUsed,
+      contextAudioTrimmed,
+      contextAudioTrimSeconds,
+      regenerationReason:
+        candidateIndex === 0 ? undefined : `multi-take-candidate-${candidateIndex + 1}`,
+      rawMetrics,
+      standardizedMetrics,
+      leveledMetrics,
+      appliedGainDb: levelingResult.appliedGainDb,
+      driftCorrectionDb: levelingResult.driftCorrectionDb,
+      levelingFilter: levelingResult.filter
+    }
+  };
+
+  return toScriptSegmentCandidate(processedSegment, candidateIndex);
+}
+
+function buildScriptMultiTakeOptimization({
+  candidateGroups,
+  joinPlan,
+  segments
+}: {
+  candidateGroups: ScriptSegmentCandidate[][];
+  joinPlan: SegmentJoinPlan[];
+  segments: Array<{ text: string; wordCount: number }>;
+}): {
+  selectedProcessedSegments: ScriptProcessedSegment[];
+  boundaries: SegmentBoundaryDiagnostic[];
+  multiTakeOptimization: MultiTakeOptimizationManifest;
+} {
+  const candidateInputs = candidateGroups.map((group) =>
+    group.map(
+      (candidate): MultiTakeCandidateInput => ({
+        segmentIndex: candidate.processedSegment.manifestSegment.segmentIndex,
+        candidateIndex: candidate.candidateIndex,
+        metrics: candidate.processedSegment.manifestSegment.leveledMetrics,
+        generationAttempt: candidate.processedSegment.manifestSegment.generationAttempt,
+        contextOverlapUsed: candidate.processedSegment.manifestSegment.contextOverlapUsed,
+        contextFallbackUsed: candidate.processedSegment.manifestSegment.contextFallbackUsed,
+        contextAudioTrimmed: candidate.processedSegment.manifestSegment.contextAudioTrimmed,
+        contextAudioTrimSeconds:
+          candidate.processedSegment.manifestSegment.contextAudioTrimSeconds
+      })
+    )
+  );
+  const pairwiseSeamScoreMatrix = buildMultiTakePairwiseSeamScoreMatrix({
+    candidates: candidateInputs,
+    joinPlan,
+    wordCounts: segments.map((segment) => segment.wordCount),
+    toneSeamScoringEnabled
+  });
+  const selection = selectBestMultiTakePath({
+    candidatePenaltyScores: candidateGroups.map((group) =>
+      group.map((candidate) => candidate.candidatePenaltyScore)
+    ),
+    pairwiseSeamScoreMatrix
+  });
+  const selectedProcessedSegments = selection.chosenPath.map((candidateIndex, segmentIndex) => {
+    const candidate = candidateGroups[segmentIndex].find(
+      (entry) => entry.candidateIndex === candidateIndex
+    );
+
+    if (!candidate) {
+      throw new Error(
+        `Missing selected candidate ${candidateIndex} for segment ${segmentIndex + 1}.`
+      );
+    }
+
+    return candidate.processedSegment;
+  });
+  const boundaries = buildSegmentBoundaryDiagnostics(
+    selectedProcessedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
+    joinPlan.map((join) => join.pauseMs / 1000),
+    undefined,
+    undefined,
+    {
+      wordCounts: segments.map((segment) => segment.wordCount),
+      toneSeamScoringEnabled
+    }
+  );
+  hydrateScriptBoundaryContext(
+    boundaries,
+    segments,
+    selectedProcessedSegments.map((segment) => segment.manifestSegment)
+  );
+
+  return {
+    selectedProcessedSegments,
+    boundaries,
+    multiTakeOptimization: buildScriptMultiTakeOptimizationManifest({
+      candidateGroups,
+      pairwiseSeamScoreMatrix,
+      selection,
+      enabled: takeCount > 1,
+      takeCount
+    })
+  };
+}
+
+function buildScriptMultiTakeOptimizationManifest({
+  candidateGroups,
+  pairwiseSeamScoreMatrix,
+  selection,
+  enabled,
+  takeCount
+}: {
+  candidateGroups: ScriptSegmentCandidate[][];
+  pairwiseSeamScoreMatrix: MultiTakeOptimizationManifest["pairwiseSeamScoreMatrix"];
+  selection: MultiTakePathSelection;
+  enabled: boolean;
+  takeCount: number;
+}): MultiTakeOptimizationManifest {
+  const candidates: MultiTakeCandidateManifest[][] = candidateGroups.map(
+    (group, segmentIndex) =>
+      group.map((candidate) => {
+        const manifestSegment = candidate.processedSegment.manifestSegment;
+
+        return {
+          segmentIndex: manifestSegment.segmentIndex,
+          candidateIndex: candidate.candidateIndex,
+          generationAttempt: manifestSegment.generationAttempt,
+          selected: selection.chosenPath[segmentIndex] === candidate.candidateIndex,
+          candidatePenaltyScore: candidate.candidatePenaltyScore,
+          candidatePenaltyReasons: candidate.candidatePenaltyReasons,
+          contextOverlapUsed: manifestSegment.contextOverlapUsed,
+          contextFallbackUsed: manifestSegment.contextFallbackUsed,
+          contextAudioTrimmed: manifestSegment.contextAudioTrimmed,
+          contextAudioTrimSeconds: manifestSegment.contextAudioTrimSeconds,
+          leveledMetrics: manifestSegment.leveledMetrics
+        };
+      })
+  );
+
+  return {
+    enabled,
+    takeCount,
+    candidateCounts: candidates.map((group) => group.length),
+    candidates,
+    pairwiseSeamScoreMatrix,
+    baselinePath: selection.baselinePath,
+    chosenPath: selection.chosenPath,
+    baselineTotalScore: selection.baselineTotalScore,
+    chosenTotalScore: selection.chosenTotalScore,
+    chosenTotalScoreAfterAdjustments: selection.chosenTotalScore,
+    improvementPercentage: selection.improvementPercentage,
+    worstSeamBefore: selection.baselineWorstSeam,
+    worstSeamAfter: selection.chosenWorstSeam,
+    worstSeamImprovementPercentage: selection.worstSeamImprovementPercentage,
+    finalPublishabilityVerdict: evaluateSegmentedPublishability({
+      boundaries: [],
+      multiTakeEnabled: enabled,
+      improvementPercentage: selection.improvementPercentage,
+      worstSeamImprovementPercentage: selection.worstSeamImprovementPercentage,
+      durationSeconds: null
+    })
+  };
+}
+
+function finalizeScriptMultiTakeOptimizationManifest({
+  multiTakeOptimization,
+  boundaries,
+  manifestSegments,
+  joinPlan
+}: {
+  multiTakeOptimization: MultiTakeOptimizationManifest;
+  boundaries: SegmentBoundaryDiagnostic[];
+  manifestSegments: SegmentDiagnosticsManifestSegment[];
+  joinPlan: SegmentJoinPlan[];
+}): MultiTakeOptimizationManifest {
+  const chosenTotalScoreAfterAdjustments = roundToTwoDecimals(
+    multiTakeOptimization.chosenPath.reduce((total, candidateIndex, segmentIndex) => {
+      const candidate = multiTakeOptimization.candidates[segmentIndex]?.find(
+        (entry) => entry.candidateIndex === candidateIndex
+      );
+      return total + (candidate?.candidatePenaltyScore ?? 0);
+    }, 0) + boundaries.reduce((total, boundary) => total + boundary.seamQualityScore, 0)
+  );
+
+  return {
+    ...multiTakeOptimization,
+    chosenTotalScoreAfterAdjustments,
+    worstSeamAfter: findWorstFinalBoundaryForPath(
+      boundaries,
+      multiTakeOptimization.chosenPath
+    ),
+    finalPublishabilityVerdict: evaluateSegmentedPublishability({
+      boundaries,
+      multiTakeEnabled: multiTakeOptimization.enabled,
+      improvementPercentage: multiTakeOptimization.improvementPercentage,
+      worstSeamImprovementPercentage:
+        multiTakeOptimization.worstSeamImprovementPercentage,
+      durationSeconds: sumSegmentDurationSeconds(manifestSegments, joinPlan)
+    })
+  };
+}
+
+function findWorstFinalBoundaryForPath(
+  boundaries: SegmentBoundaryDiagnostic[],
+  chosenPath: number[]
+): MultiTakeOptimizationManifest["worstSeamAfter"] {
+  const worstBoundary = boundaries
+    .slice()
+    .sort((left, right) => right.seamQualityScore - left.seamQualityScore)[0];
+
+  if (!worstBoundary) {
+    return null;
+  }
+
+  return {
+    boundaryIndex: worstBoundary.boundaryIndex,
+    score: worstBoundary.seamQualityScore,
+    seamFailureKind: worstBoundary.seamFailureKind,
+    seamFailureReason: worstBoundary.seamFailureReason,
+    leftCandidateIndex: chosenPath[worstBoundary.previousSegmentIndex - 1] ?? 0,
+    rightCandidateIndex: chosenPath[worstBoundary.nextSegmentIndex - 1] ?? 0
+  };
+}
+
+function toScriptSegmentCandidate(
+  processedSegment: ScriptProcessedSegment,
+  candidateIndex: number
+): ScriptSegmentCandidate {
+  const penalty = computeMultiTakeCandidatePenalty({
+    metrics: processedSegment.manifestSegment.leveledMetrics,
+    generationAttempt: processedSegment.manifestSegment.generationAttempt,
+    contextFallbackUsed: processedSegment.manifestSegment.contextFallbackUsed,
+    contextAudioTrimmed: processedSegment.manifestSegment.contextAudioTrimmed,
+    contextAudioTrimSeconds: processedSegment.manifestSegment.contextAudioTrimSeconds
+  });
+
+  return {
+    candidateIndex,
+    processedSegment,
+    candidatePenaltyScore: penalty.score,
+    candidatePenaltyReasons: penalty.reasons
+  };
+}
+
+function sumSegmentDurationSeconds(
+  manifestSegments: SegmentDiagnosticsManifestSegment[],
+  joinPlan: SegmentJoinPlan[]
+): number | null {
+  let durationSeconds = 0;
+
+  for (const segment of manifestSegments) {
+    const segmentDuration = segment.leveledMetrics.durationSeconds;
+
+    if (segmentDuration === null) {
+      return null;
+    }
+
+    durationSeconds += segmentDuration;
+  }
+
+  for (const join of joinPlan) {
+    durationSeconds += join.pauseMs / 1000;
+  }
+
+  return roundToTwoDecimals(durationSeconds);
+}
+
+function printMultiTakeSummary(multiTakeOptimization: MultiTakeOptimizationManifest): void {
+  const verdict = multiTakeOptimization.finalPublishabilityVerdict;
+
+  console.log("Multi-take optimization:");
+  console.log(`  Enabled: ${multiTakeOptimization.enabled}`);
+  console.log(`  Take count: ${multiTakeOptimization.takeCount}`);
+  console.log(`  Baseline path: ${multiTakeOptimization.baselinePath.join(", ")}`);
+  console.log(`  Chosen path: ${multiTakeOptimization.chosenPath.join(", ")}`);
+  console.log(`  Baseline score: ${multiTakeOptimization.baselineTotalScore.toFixed(2)}`);
+  console.log(`  Chosen score: ${multiTakeOptimization.chosenTotalScore.toFixed(2)}`);
+  console.log(
+    `  Chosen score after edge adjustments: ${multiTakeOptimization.chosenTotalScoreAfterAdjustments.toFixed(
+      2
+    )}`
+  );
+  console.log(`  Improvement: ${multiTakeOptimization.improvementPercentage.toFixed(2)}%`);
+  console.log(
+    `  Worst seam before: ${
+      multiTakeOptimization.worstSeamBefore
+        ? `${multiTakeOptimization.worstSeamBefore.boundaryIndex} score ${multiTakeOptimization.worstSeamBefore.score.toFixed(
+            2
+          )}`
+        : "none"
+    }`
+  );
+  console.log(
+    `  Worst seam after: ${
+      multiTakeOptimization.worstSeamAfter
+        ? `${multiTakeOptimization.worstSeamAfter.boundaryIndex} score ${multiTakeOptimization.worstSeamAfter.score.toFixed(
+            2
+          )}`
+        : "none"
+    }`
+  );
+  console.log(`  Publishable: ${verdict.publishable}`);
+  console.log(`  Verdict reason: ${verdict.reason}`);
+  console.log(
+    `  Kill criteria failures: ${
+      verdict.killCriteriaFailures.length ? verdict.killCriteriaFailures.join(", ") : "none"
+    }`
+  );
 }
 
 async function insertJoinGaps({
@@ -676,6 +1027,10 @@ function countScriptWords(text: string): number {
 
 function roundToThreeDecimals(value: number): number {
   return Math.round(value * 1000) / 1000;
+}
+
+function roundToTwoDecimals(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 function readBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {

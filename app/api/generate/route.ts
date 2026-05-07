@@ -12,8 +12,11 @@ import {
   buildSegmentJoinPlan,
   buildSegmentBoundaryDiagnostics,
   buildSegmentSeamAdjustmentFilter,
+  buildMultiTakePairwiseSeamScoreMatrix,
   collectSegmentDiagnosticsWarnings,
+  computeMultiTakeCandidatePenalty,
   computeSegmentSeamAdjustments,
+  evaluateSegmentedPublishability,
   extractAudioClip,
   getFileExtension,
   getMimeType,
@@ -24,7 +27,9 @@ import {
   mergeAudioFiles,
   persistAudioDebugArtifact,
   resolveMasteringStrategy,
+  resolveMultiTakeCount,
   selectSeamRegenerationTargets,
+  selectBestMultiTakePath,
   SEGMENT_LEVELING_SETTINGS,
   STANDARD_INTERMEDIATE_CHANNELS,
   STANDARD_INTERMEDIATE_SAMPLE_RATE,
@@ -39,6 +44,10 @@ import {
   type SegmentDiagnosticsManifestSegment,
   type SegmentDiagnosticsWarning,
   type SegmentJoinPlan,
+  type MultiTakeCandidateInput,
+  type MultiTakeCandidateManifest,
+  type MultiTakeOptimizationManifest,
+  type MultiTakePathSelection,
   type VolumeBoost
 } from "@/lib/audio";
 import { parseMistralAudioResponse, postMistralSpeech } from "@/lib/mistral";
@@ -122,6 +131,13 @@ type ProcessedSegment = {
   standardizedSegmentPath: string;
   leveledSegmentPath: string;
   manifestSegment: SegmentDiagnosticsManifestSegment;
+};
+
+type ProcessedSegmentCandidate = {
+  candidateIndex: number;
+  processedSegment: ProcessedSegment;
+  candidatePenaltyScore: number;
+  candidatePenaltyReasons: string[];
 };
 
 export async function POST(request: Request): Promise<Response> {
@@ -987,6 +1003,8 @@ async function generateSegmentedSpeech({
     process.env.VOICEOVER_SEAM_RETRIES,
     DEFAULT_SEAM_RETRY_COUNT
   );
+  const multiTakeCount = resolveMultiTakeCount(process.env.VOICEOVER_MULTI_TAKE_COUNT);
+  let multiTakeOptimization: MultiTakeOptimizationManifest | null = null;
 
   try {
     await assertFfmpegAvailable();
@@ -995,7 +1013,8 @@ async function generateSegmentedSpeech({
       "[segmented] chunking",
       JSON.stringify({
         totalSegments: segments.length,
-        wordCounts: segments.map((segment) => segment.wordCount)
+        wordCounts: segments.map((segment) => segment.wordCount),
+        multiTakeCount
       })
     );
 
@@ -1048,6 +1067,35 @@ async function generateSegmentedSpeech({
       boundaryDiagnostics = regenerationResult.boundaryDiagnostics;
     }
 
+    if (multiTakeCount > 1) {
+      const optimizationResult = await optimizeMultiTakeSegments({
+        segments,
+        processedSegments,
+        joinPlan,
+        takeCount: multiTakeCount,
+        tempDirectoryPath,
+        voiceId,
+        sendEvent,
+        contextOverlapEnabled,
+        toneSeamScoringEnabled,
+        debugArtifactDirectoryPath
+      });
+      processedSegments = optimizationResult.processedSegments;
+      boundaryDiagnostics = optimizationResult.boundaryDiagnostics;
+      multiTakeOptimization = optimizationResult.multiTakeOptimization;
+    } else {
+      multiTakeOptimization = buildMultiTakeOptimizationForCandidateGroups({
+        candidateGroups: processedSegments.map((segment) => [
+          toProcessedSegmentCandidate(segment, 0)
+        ]),
+        joinPlan,
+        segments,
+        toneSeamScoringEnabled,
+        enabled: false,
+        takeCount: multiTakeCount
+      }).multiTakeOptimization;
+    }
+
     boundaryDiagnostics = await applyBoundaryAwareSeamAdjustments({
       processedSegments,
       boundaryDiagnostics,
@@ -1061,6 +1109,17 @@ async function generateSegmentedSpeech({
     const rawSegmentPaths = processedSegments.map((segment) => segment.rawSegmentPath);
     const leveledSegmentPaths = processedSegments.map((segment) => segment.leveledSegmentPath);
     const manifestSegments = processedSegments.map((segment) => segment.manifestSegment);
+
+    if (!multiTakeOptimization) {
+      throw new Error("Multi-take optimization manifest was not initialized.");
+    }
+
+    multiTakeOptimization = finalizeMultiTakeOptimizationManifest({
+      multiTakeOptimization,
+      boundaries: boundaryDiagnostics,
+      durationSeconds: sumSegmentDurationSeconds(manifestSegments, joinPlan)
+    });
+    logPublishabilityVerdict(multiTakeOptimization);
 
     if (debugArtifactDirectoryPath) {
       await persistSegmentedRawDebugArtifact({
@@ -1142,7 +1201,8 @@ async function generateSegmentedSpeech({
           segments: manifestSegments,
           boundaries: boundaryDiagnostics,
           warnings: diagnosticsWarnings,
-          finalMetrics: finalizedOutput.masteringResult?.metrics ?? null
+          finalMetrics: finalizedOutput.masteringResult?.metrics ?? null,
+          multiTakeOptimization
         }
       });
     }
@@ -1997,6 +2057,350 @@ async function applyBoundaryAwareSeamAdjustments({
   });
 }
 
+async function optimizeMultiTakeSegments({
+  segments,
+  processedSegments,
+  joinPlan,
+  takeCount,
+  tempDirectoryPath,
+  voiceId,
+  sendEvent,
+  contextOverlapEnabled,
+  toneSeamScoringEnabled,
+  debugArtifactDirectoryPath
+}: {
+  segments: TextChunk[];
+  processedSegments: ProcessedSegment[];
+  joinPlan: SegmentJoinPlan[];
+  takeCount: number;
+  tempDirectoryPath: string;
+  voiceId: string;
+  sendEvent: (event: StreamEvent) => void;
+  contextOverlapEnabled: boolean;
+  toneSeamScoringEnabled: boolean;
+  debugArtifactDirectoryPath?: string;
+}): Promise<{
+  processedSegments: ProcessedSegment[];
+  boundaryDiagnostics: SegmentBoundaryDiagnostic[];
+  multiTakeOptimization: MultiTakeOptimizationManifest;
+}> {
+  const candidateGroups: ProcessedSegmentCandidate[][] = processedSegments.map((segment) => [
+    toProcessedSegmentCandidate(segment, 0)
+  ]);
+
+  console.info(
+    "[segmented] multi-take-optimization",
+    JSON.stringify({
+      takeCount,
+      totalSegments: segments.length
+    })
+  );
+
+  for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
+    for (let candidateIndex = 1; candidateIndex < takeCount; candidateIndex += 1) {
+      const attempt = 200 + candidateIndex;
+
+      sendEvent({
+        type: "progress",
+        stage: "generating",
+        message: `Generating alternate take ${candidateIndex + 1} of ${takeCount} for section ${
+          segmentIndex + 1
+        } of ${segments.length}`,
+        currentSegment: segmentIndex + 1,
+        totalSegments: segments.length
+      });
+
+      const candidate = await generateAndProcessSegment({
+        segments,
+        segmentIndex,
+        totalSegments: segments.length,
+        attempt,
+        contextOverlapEnabled,
+        continuityStrength: "strong",
+        regenerationReason: `multi-take-candidate-${candidateIndex + 1}`,
+        tempDirectoryPath,
+        voiceId,
+        sendEvent,
+        debugArtifactDirectoryPath
+      });
+
+      candidateGroups[segmentIndex].push(
+        toProcessedSegmentCandidate(candidate, candidateIndex)
+      );
+    }
+  }
+
+  const { selectedProcessedSegments, boundaryDiagnostics, multiTakeOptimization } =
+    buildMultiTakeOptimizationForCandidateGroups({
+      candidateGroups,
+      joinPlan,
+      segments,
+      toneSeamScoringEnabled,
+      enabled: true,
+      takeCount
+    });
+
+  console.info(
+    "[segmented] multi-take-selection",
+    JSON.stringify({
+      baselinePath: multiTakeOptimization.baselinePath,
+      chosenPath: multiTakeOptimization.chosenPath,
+      baselineTotalScore: multiTakeOptimization.baselineTotalScore,
+      chosenTotalScore: multiTakeOptimization.chosenTotalScore,
+      improvementPercentage: multiTakeOptimization.improvementPercentage,
+      worstSeamBefore: multiTakeOptimization.worstSeamBefore,
+      worstSeamAfter: multiTakeOptimization.worstSeamAfter
+    })
+  );
+
+  return {
+    processedSegments: selectedProcessedSegments,
+    boundaryDiagnostics,
+    multiTakeOptimization
+  };
+}
+
+function buildMultiTakeOptimizationForCandidateGroups({
+  candidateGroups,
+  joinPlan,
+  segments,
+  toneSeamScoringEnabled,
+  enabled,
+  takeCount
+}: {
+  candidateGroups: ProcessedSegmentCandidate[][];
+  joinPlan: SegmentJoinPlan[];
+  segments: TextChunk[];
+  toneSeamScoringEnabled: boolean;
+  enabled: boolean;
+  takeCount: number;
+}): {
+  selectedProcessedSegments: ProcessedSegment[];
+  boundaryDiagnostics: SegmentBoundaryDiagnostic[];
+  multiTakeOptimization: MultiTakeOptimizationManifest;
+} {
+  const candidateInputs = candidateGroups.map((group) =>
+    group.map(
+      (candidate): MultiTakeCandidateInput => ({
+        segmentIndex: candidate.processedSegment.manifestSegment.segmentIndex,
+        candidateIndex: candidate.candidateIndex,
+        metrics: candidate.processedSegment.manifestSegment.leveledMetrics,
+        generationAttempt: candidate.processedSegment.manifestSegment.generationAttempt,
+        contextOverlapUsed: candidate.processedSegment.manifestSegment.contextOverlapUsed,
+        contextFallbackUsed: candidate.processedSegment.manifestSegment.contextFallbackUsed,
+        contextAudioTrimmed: candidate.processedSegment.manifestSegment.contextAudioTrimmed,
+        contextAudioTrimSeconds:
+          candidate.processedSegment.manifestSegment.contextAudioTrimSeconds
+      })
+    )
+  );
+  const pairwiseSeamScoreMatrix = buildMultiTakePairwiseSeamScoreMatrix({
+    candidates: candidateInputs,
+    joinPlan,
+    wordCounts: segments.map((segment) => segment.wordCount),
+    toneSeamScoringEnabled
+  });
+  const candidatePenaltyScores = candidateGroups.map((group) =>
+    group.map((candidate) => candidate.candidatePenaltyScore)
+  );
+  const selection = selectBestMultiTakePath({
+    candidatePenaltyScores,
+    pairwiseSeamScoreMatrix
+  });
+  const selectedProcessedSegments = selection.chosenPath.map((candidateIndex, segmentIndex) => {
+    const candidate = candidateGroups[segmentIndex].find(
+      (entry) => entry.candidateIndex === candidateIndex
+    );
+
+    if (!candidate) {
+      throw new Error(
+        `Missing selected candidate ${candidateIndex} for segment ${segmentIndex + 1}.`
+      );
+    }
+
+    return candidate.processedSegment;
+  });
+  const boundaryDiagnostics = buildCurrentBoundaryDiagnostics({
+    processedSegments: selectedProcessedSegments,
+    joinPlan,
+    segments,
+    toneSeamScoringEnabled
+  });
+  const multiTakeOptimization = buildMultiTakeOptimizationManifest({
+    candidateGroups,
+    pairwiseSeamScoreMatrix,
+    selection,
+    enabled,
+    takeCount
+  });
+
+  return {
+    selectedProcessedSegments,
+    boundaryDiagnostics,
+    multiTakeOptimization
+  };
+}
+
+function buildMultiTakeOptimizationManifest({
+  candidateGroups,
+  pairwiseSeamScoreMatrix,
+  selection,
+  enabled,
+  takeCount
+}: {
+  candidateGroups: ProcessedSegmentCandidate[][];
+  pairwiseSeamScoreMatrix: MultiTakeOptimizationManifest["pairwiseSeamScoreMatrix"];
+  selection: MultiTakePathSelection;
+  enabled: boolean;
+  takeCount: number;
+}): MultiTakeOptimizationManifest {
+  const candidates: MultiTakeCandidateManifest[][] = candidateGroups.map(
+    (group, segmentIndex) =>
+      group.map((candidate) => {
+        const manifestSegment = candidate.processedSegment.manifestSegment;
+
+        return {
+          segmentIndex: manifestSegment.segmentIndex,
+          candidateIndex: candidate.candidateIndex,
+          generationAttempt: manifestSegment.generationAttempt,
+          selected: selection.chosenPath[segmentIndex] === candidate.candidateIndex,
+          candidatePenaltyScore: candidate.candidatePenaltyScore,
+          candidatePenaltyReasons: candidate.candidatePenaltyReasons,
+          contextOverlapUsed: manifestSegment.contextOverlapUsed,
+          contextFallbackUsed: manifestSegment.contextFallbackUsed,
+          contextAudioTrimmed: manifestSegment.contextAudioTrimmed,
+          contextAudioTrimSeconds: manifestSegment.contextAudioTrimSeconds,
+          leveledMetrics: manifestSegment.leveledMetrics
+        };
+      })
+  );
+
+  return {
+    enabled,
+    takeCount,
+    candidateCounts: candidates.map((group) => group.length),
+    candidates,
+    pairwiseSeamScoreMatrix,
+    baselinePath: selection.baselinePath,
+    chosenPath: selection.chosenPath,
+    baselineTotalScore: selection.baselineTotalScore,
+    chosenTotalScore: selection.chosenTotalScore,
+    chosenTotalScoreAfterAdjustments: selection.chosenTotalScore,
+    improvementPercentage: selection.improvementPercentage,
+    worstSeamBefore: selection.baselineWorstSeam,
+    worstSeamAfter: selection.chosenWorstSeam,
+    worstSeamImprovementPercentage: selection.worstSeamImprovementPercentage,
+    finalPublishabilityVerdict: evaluateSegmentedPublishability({
+      boundaries: [],
+      multiTakeEnabled: enabled,
+      improvementPercentage: selection.improvementPercentage,
+      worstSeamImprovementPercentage: selection.worstSeamImprovementPercentage,
+      durationSeconds: null
+    })
+  };
+}
+
+function finalizeMultiTakeOptimizationManifest({
+  multiTakeOptimization,
+  boundaries,
+  durationSeconds
+}: {
+  multiTakeOptimization: MultiTakeOptimizationManifest;
+  boundaries: SegmentBoundaryDiagnostic[];
+  durationSeconds: number | null;
+}): MultiTakeOptimizationManifest {
+  const chosenTotalScoreAfterAdjustments = roundToTwoDecimals(
+    multiTakeOptimization.chosenPath.reduce((total, candidateIndex, segmentIndex) => {
+      const candidate = multiTakeOptimization.candidates[segmentIndex]?.find(
+        (entry) => entry.candidateIndex === candidateIndex
+      );
+      return total + (candidate?.candidatePenaltyScore ?? 0);
+    }, 0) + boundaries.reduce((total, boundary) => total + boundary.seamQualityScore, 0)
+  );
+
+  return {
+    ...multiTakeOptimization,
+    chosenTotalScoreAfterAdjustments,
+    worstSeamAfter: findWorstFinalBoundaryForPath(
+      boundaries,
+      multiTakeOptimization.chosenPath
+    ),
+    finalPublishabilityVerdict: evaluateSegmentedPublishability({
+      boundaries,
+      multiTakeEnabled: multiTakeOptimization.enabled,
+      improvementPercentage: multiTakeOptimization.improvementPercentage,
+      worstSeamImprovementPercentage:
+        multiTakeOptimization.worstSeamImprovementPercentage,
+      durationSeconds
+    })
+  };
+}
+
+function findWorstFinalBoundaryForPath(
+  boundaries: SegmentBoundaryDiagnostic[],
+  chosenPath: number[]
+): MultiTakeOptimizationManifest["worstSeamAfter"] {
+  const worstBoundary = boundaries
+    .slice()
+    .sort((left, right) => right.seamQualityScore - left.seamQualityScore)[0];
+
+  if (!worstBoundary) {
+    return null;
+  }
+
+  return {
+    boundaryIndex: worstBoundary.boundaryIndex,
+    score: worstBoundary.seamQualityScore,
+    seamFailureKind: worstBoundary.seamFailureKind,
+    seamFailureReason: worstBoundary.seamFailureReason,
+    leftCandidateIndex: chosenPath[worstBoundary.previousSegmentIndex - 1] ?? 0,
+    rightCandidateIndex: chosenPath[worstBoundary.nextSegmentIndex - 1] ?? 0
+  };
+}
+
+function toProcessedSegmentCandidate(
+  processedSegment: ProcessedSegment,
+  candidateIndex: number
+): ProcessedSegmentCandidate {
+  const penalty = computeMultiTakeCandidatePenalty({
+    metrics: processedSegment.manifestSegment.leveledMetrics,
+    generationAttempt: processedSegment.manifestSegment.generationAttempt,
+    contextFallbackUsed: processedSegment.manifestSegment.contextFallbackUsed,
+    contextAudioTrimmed: processedSegment.manifestSegment.contextAudioTrimmed,
+    contextAudioTrimSeconds: processedSegment.manifestSegment.contextAudioTrimSeconds
+  });
+
+  return {
+    candidateIndex,
+    processedSegment,
+    candidatePenaltyScore: penalty.score,
+    candidatePenaltyReasons: penalty.reasons
+  };
+}
+
+function sumSegmentDurationSeconds(
+  manifestSegments: SegmentDiagnosticsManifestSegment[],
+  joinPlan: SegmentJoinPlan[]
+): number | null {
+  let durationSeconds = 0;
+
+  for (const segment of manifestSegments) {
+    const segmentDuration = segment.leveledMetrics.durationSeconds;
+
+    if (segmentDuration === null) {
+      return null;
+    }
+
+    durationSeconds += segmentDuration;
+  }
+
+  for (const join of joinPlan) {
+    durationSeconds += join.pauseMs / 1000;
+  }
+
+  return roundToTwoDecimals(durationSeconds);
+}
+
 async function persistSegmentDebugArtifact({
   sourcePath,
   debugArtifactDirectoryPath,
@@ -2148,6 +2552,33 @@ function logSegmentedDiagnosticsWarnings(warnings: SegmentDiagnosticsWarning[]):
       warnings
     })
   );
+}
+
+function logPublishabilityVerdict(
+  multiTakeOptimization: MultiTakeOptimizationManifest
+): void {
+  const verdict = multiTakeOptimization.finalPublishabilityVerdict;
+  const payload = {
+    publishable: verdict.publishable,
+    reason: verdict.reason,
+    killCriteriaFailures: verdict.killCriteriaFailures,
+    enabled: multiTakeOptimization.enabled,
+    takeCount: multiTakeOptimization.takeCount,
+    baselineTotalScore: multiTakeOptimization.baselineTotalScore,
+    chosenTotalScore: multiTakeOptimization.chosenTotalScore,
+    chosenTotalScoreAfterAdjustments:
+      multiTakeOptimization.chosenTotalScoreAfterAdjustments,
+    improvementPercentage: multiTakeOptimization.improvementPercentage,
+    worstSeamBefore: multiTakeOptimization.worstSeamBefore,
+    worstSeamAfter: multiTakeOptimization.worstSeamAfter
+  };
+
+  if (verdict.publishable) {
+    console.info("[segmented] publishability", JSON.stringify(payload));
+    return;
+  }
+
+  console.warn("[segmented] publishability", JSON.stringify(payload));
 }
 
 async function generateSegmentSpeech({
@@ -2399,6 +2830,10 @@ function countRouteWords(text: string): number {
 
 function roundToThreeDecimals(value: number): number {
   return Math.round(value * 1000) / 1000;
+}
+
+function roundToTwoDecimals(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 function truncate(text: string, maxLength: number): string {

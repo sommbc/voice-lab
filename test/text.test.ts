@@ -10,6 +10,7 @@ import {
   buildLinearMasteringFilter,
   buildMergeArgs,
   buildMasteringFilter,
+  buildMultiTakePairwiseSeamScoreMatrix,
   buildSegmentBoundaryDiagnostics,
   buildSegmentJoinPlan,
   buildSegmentLevelingArgs,
@@ -20,16 +21,19 @@ import {
   buildTranscodeArgs,
   canLinearLoudnormEngage,
   collectSegmentDiagnosticsWarnings,
+  computeMultiTakeCandidatePenalty,
   computeSegmentDriftCorrectionDb,
   computeSegmentLevelingGainDb,
   computeSegmentSeamAdjustments,
   computeSeamQualityScore,
   computeToneMismatchScore,
   computeStaticMasteringGainDb,
+  evaluateSegmentedPublishability,
   formatAudioTimestamp,
   getAdaptiveJoinPauseMs,
   LOUDNORM_FILTER,
   parseEbur128Analysis,
+  resolveMultiTakeCount,
   resolveMasteringStrategy,
   SEGMENT_LEVELING_SETTINGS,
   SEGMENT_STANDARDIZATION_FILTER,
@@ -39,10 +43,13 @@ import {
   SPEECH_LEVELER_PREMASTER_FILTER,
   TRIM_SILENCE_FILTER,
   VOLUME_BOOST_SETTINGS,
+  scoreMultiTakePath,
   selectSeamRegenerationTargets,
+  selectBestMultiTakePath,
   summarizeFfmpegStderr,
   type SegmentAudioMetrics,
-  type SegmentDiagnosticsManifest
+  type SegmentDiagnosticsManifest,
+  type MultiTakeOptimizationManifest
 } from "../lib/audio";
 import {
   DEFAULT_HARD_MAX_WORDS,
@@ -719,7 +726,8 @@ test("segmented diagnostics manifest keeps metrics and gain shape serializable",
       truePeak: -1,
       maxVolume: null,
       measurementMode: "loudnorm"
-    }
+    },
+    multiTakeOptimization: makeMultiTakeOptimizationManifest()
   };
   const serialized = JSON.parse(JSON.stringify(manifest)) as SegmentDiagnosticsManifest;
 
@@ -736,12 +744,150 @@ test("segmented diagnostics manifest keeps metrics and gain shape serializable",
   assert.equal(serialized.segments[0].leveledMetrics.firstWindowLoudness, -18.2);
   assert.deepEqual(serialized.joinPlan, []);
   assert.equal(serialized.finalMetrics?.truePeak, -1);
+  assert.equal(serialized.multiTakeOptimization.enabled, false);
+  assert.deepEqual(serialized.multiTakeOptimization.chosenPath, [0]);
+});
+
+test("multi-take count env parsing defaults safely and clamps expensive runs", () => {
+  assert.equal(resolveMultiTakeCount(undefined), 1);
+  assert.equal(resolveMultiTakeCount(""), 1);
+  assert.equal(resolveMultiTakeCount("0"), 1);
+  assert.equal(resolveMultiTakeCount("3"), 3);
+  assert.equal(resolveMultiTakeCount("9"), 5);
+  assert.equal(resolveMultiTakeCount("bad"), 1);
+});
+
+test("multi-take pairwise seam matrix records every candidate pair per boundary", () => {
+  const matrix = buildMultiTakePairwiseSeamScoreMatrix({
+    candidates: [
+      [
+        { segmentIndex: 1, candidateIndex: 0, metrics: makeSegmentMetrics({ durationSeconds: 10, firstWindowLoudness: -18, lastWindowLoudness: -18 }) },
+        { segmentIndex: 1, candidateIndex: 1, metrics: makeSegmentMetrics({ durationSeconds: 10, firstWindowLoudness: -18, lastWindowLoudness: -22 }) }
+      ],
+      [
+        { segmentIndex: 2, candidateIndex: 0, metrics: makeSegmentMetrics({ durationSeconds: 11, firstWindowLoudness: -18.2, lastWindowLoudness: -18 }) },
+        { segmentIndex: 2, candidateIndex: 1, metrics: makeSegmentMetrics({ durationSeconds: 11, firstWindowLoudness: -25, lastWindowLoudness: -18 }) }
+      ]
+    ],
+    joinPlan: [{ pauseMs: 220 }],
+    wordCounts: [220, 230],
+    toneSeamScoringEnabled: true
+  });
+
+  assert.equal(matrix.length, 1);
+  assert.equal(matrix[0].boundaryIndex, 1);
+  assert.equal(matrix[0].scores.length, 4);
+  assert.ok(
+    matrix[0].scores.some(
+      (score) => score.leftCandidateIndex === 1 && score.rightCandidateIndex === 1
+    )
+  );
+});
+
+test("multi-take Viterbi selection chooses the globally best path", () => {
+  const pairwiseSeamScoreMatrix = [
+    makeSyntheticPairwiseBoundary(1, [
+      [1, 5],
+      [6, 6]
+    ]),
+    makeSyntheticPairwiseBoundary(2, [
+      [100, 100],
+      [1, 1]
+    ])
+  ];
+  const selection = selectBestMultiTakePath({
+    candidatePenaltyScores: [
+      [0, 0],
+      [0, 0],
+      [0, 0]
+    ],
+    pairwiseSeamScoreMatrix
+  });
+
+  assert.deepEqual(selection.baselinePath, [0, 0, 0]);
+  assert.deepEqual(selection.chosenPath, [0, 1, 0]);
+  assert.equal(selection.baselineTotalScore, 101);
+  assert.equal(selection.chosenTotalScore, 6);
+  assert.equal(
+    scoreMultiTakePath({
+      path: selection.chosenPath,
+      candidatePenaltyScores: [
+        [0, 0],
+        [0, 0],
+        [0, 0]
+      ],
+      pairwiseSeamScoreMatrix
+    }),
+    6
+  );
+  assert.ok(selection.improvementPercentage > 90);
+});
+
+test("multi-take candidate penalties include drift and fallback quality signals", () => {
+  const penalty = computeMultiTakeCandidatePenalty({
+    generationAttempt: 201,
+    contextFallbackUsed: true,
+    contextAudioTrimmed: true,
+    contextAudioTrimSeconds: null,
+    metrics: makeSegmentMetrics({
+      durationSeconds: 20,
+      firstWindowLoudness: -18,
+      lastWindowLoudness: -25
+    })
+  });
+
+  assert.ok(penalty.score > 0);
+  assert.ok(penalty.reasons.includes("internal-drift"));
+  assert.ok(penalty.reasons.includes("context-fallback"));
+  assert.ok(penalty.reasons.includes("invalid-context-trim"));
+  assert.ok(penalty.reasons.includes("regenerated-take"));
+});
+
+test("publishability verdict exposes provider take reset kill criteria", () => {
+  const boundaries = buildSegmentBoundaryDiagnostics(
+    [
+      makeSegmentMetrics({
+        durationSeconds: 100,
+        firstWindowLoudness: -18.2,
+        lastWindowLoudness: -18.1,
+        lastTwoSecondZeroCrossingRate: 0.36
+      }),
+      makeSegmentMetrics({
+        durationSeconds: 74,
+        firstWindowLoudness: -18,
+        lastWindowLoudness: -18.1,
+        firstTwoSecondZeroCrossingRate: 0.12
+      })
+    ],
+    [0.22],
+    undefined,
+    undefined,
+    {
+      wordCounts: [230, 230],
+      toneSeamScoringEnabled: true
+    }
+  );
+  const verdict = evaluateSegmentedPublishability({
+    boundaries,
+    multiTakeEnabled: true,
+    improvementPercentage: 10,
+    worstSeamImprovementPercentage: 5,
+    durationSeconds: 600
+  });
+
+  assert.equal(verdict.publishable, false);
+  assert.equal(verdict.reason, "provider_take_reset");
+  assert.ok(verdict.killCriteriaFailures.includes("average_improvement_below_threshold"));
+  assert.ok(verdict.killCriteriaFailures.includes("mechanically_clean_tonal_mismatch"));
+  assert.ok(verdict.killCriteriaFailures.includes("metrics_improved_but_tonal_mismatch_remains"));
 });
 
 test("segmented route no longer falls back to MP3 intermediates while merging", async () => {
   const routeSource = await readFile(path.join(__dirname, "../app/api/generate/route.ts"), "utf8");
 
   assert.match(routeSource, /merged-reencoded\.wav/);
+  assert.match(routeSource, /VOICEOVER_MULTI_TAKE_COUNT/);
+  assert.match(routeSource, /multiTakeOptimization/);
   assert.doesNotMatch(routeSource, /fallbackFormat\s*=\s*outputFormat\s*===\s*"mp3"/);
   assert.doesNotMatch(routeSource, /merged-reencoded\.\$\{getFileExtension\(fallbackFormat\)\}/);
 });
@@ -796,6 +942,90 @@ Duration: 00:04:32.25, start: 0.000000, bitrate: 384 kb/s
   assert.equal(analysis.largestJumps[0]?.deltaLufs, 3.8);
   assert.equal(formatAudioTimestamp(270), "04:30");
 });
+
+function makeMultiTakeOptimizationManifest(): MultiTakeOptimizationManifest {
+  return {
+    enabled: false,
+    takeCount: 1,
+    candidateCounts: [1],
+    candidates: [
+      [
+        {
+          segmentIndex: 1,
+          candidateIndex: 0,
+          generationAttempt: 1,
+          selected: true,
+          candidatePenaltyScore: 0,
+          candidatePenaltyReasons: [],
+          contextOverlapUsed: false,
+          contextFallbackUsed: false,
+          contextAudioTrimmed: false,
+          contextAudioTrimSeconds: null,
+          leveledMetrics: makeSegmentMetrics({
+            durationSeconds: 10,
+            firstWindowLoudness: -18,
+            lastWindowLoudness: -18
+          })
+        }
+      ]
+    ],
+    pairwiseSeamScoreMatrix: [],
+    baselinePath: [0],
+    chosenPath: [0],
+    baselineTotalScore: 0,
+    chosenTotalScore: 0,
+    chosenTotalScoreAfterAdjustments: 0,
+    improvementPercentage: 0,
+    worstSeamBefore: null,
+    worstSeamAfter: null,
+    worstSeamImprovementPercentage: 0,
+    finalPublishabilityVerdict: {
+      publishable: true,
+      reason: "passed",
+      killCriteriaFailures: [],
+      thresholds: {
+        seamScoreWarning: 35,
+        minimumAverageImprovementPercentage: 25,
+        minimumWorstSeamImprovementPercentage: 20,
+        tonalMixedSeamsPerTenMinutes: 1
+      }
+    }
+  };
+}
+
+function makeSyntheticPairwiseBoundary(
+  boundaryIndex: number,
+  scores: number[][]
+): MultiTakeOptimizationManifest["pairwiseSeamScoreMatrix"][number] {
+  return {
+    boundaryIndex,
+    previousSegmentIndex: boundaryIndex,
+    nextSegmentIndex: boundaryIndex + 1,
+    scores: scores.flatMap((row, leftCandidateIndex) =>
+      row.map((score, rightCandidateIndex) => ({
+        boundaryIndex,
+        previousSegmentIndex: boundaryIndex,
+        nextSegmentIndex: boundaryIndex + 1,
+        leftCandidateIndex,
+        rightCandidateIndex,
+        score,
+        seamQualityScore: score,
+        seamFailureKind: score >= 35 ? "tonal" : "passed",
+        seamFailureReason: score >= 35 ? "tonal:synthetic" : "passed",
+        deltaLufs: null,
+        rmsDeltaDb: null,
+        gapDurationMs: 220,
+        spectralDifferenceScore: null,
+        toneMismatchScore: 0,
+        speakingRateDeltaWps: null,
+        speechCutoffRiskBefore: false,
+        speechCutoffRiskAfter: false,
+        highTruePeakNearBoundary: false,
+        seamPassed: score < 35
+      }))
+    )
+  };
+}
 
 function makeSegmentMetrics({
   durationSeconds,
