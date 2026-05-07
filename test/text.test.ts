@@ -290,6 +290,13 @@ test("default narration delivery is Substack-ready normal MP3", async () => {
   const pageSource = await readFile(path.join(__dirname, "../app/page.tsx"), "utf8");
   assert.match(pageSource, /const DEFAULT_VOLUME_BOOST = "normal"/);
   assert.match(pageSource, /Normal \/ Substack/);
+  assert.ok(
+    pageSource.includes('{ name: "Brandon", id: "4482a650-b0e9-46d5-aa72-b3fbdb43fb20" }')
+  );
+  assert.ok(
+    pageSource.includes('const DEFAULT_VOICE_ID = "4482a650-b0e9-46d5-aa72-b3fbdb43fb20"')
+  );
+  assert.match(pageSource, /localStorage\.setItem\(VOICE_STORAGE_KEY, DEFAULT_VOICE_ID\)/);
 });
 
 test("linear mastering filter embeds the measured loudness stats and requests linear mode", () => {

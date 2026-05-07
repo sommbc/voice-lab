@@ -3,7 +3,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 
 const VOICES = [
-  { name: "Brandon", id: "29511880-fc64-4d77-af2f-59ea3eb3efb1" },
+  { name: "Brandon", id: "4482a650-b0e9-46d5-aa72-b3fbdb43fb20" },
   { name: "Paul — Neutral", id: "c69964a6-ab8b-4f8a-9465-ec0925096ec8" },
   { name: "Paul — Confident", id: "98559b22-62b5-4a64-a7cd-fc78ca41faa8" },
   { name: "Paul — Cheerful", id: "01d985cd-5e0c-4457-bfd8-80ba31a5bc03" },
@@ -15,7 +15,7 @@ const VOICES = [
   { name: "Jane — Curious", id: "5de47977-6e47-4266-a938-3bc1d76b4676" }
 ];
 
-const DEFAULT_VOICE_ID = "29511880-fc64-4d77-af2f-59ea3eb3efb1";
+const DEFAULT_VOICE_ID = "4482a650-b0e9-46d5-aa72-b3fbdb43fb20";
 const VOICE_STORAGE_KEY = "voiceover-selected-voice-id";
 const DEFAULT_VOLUME_BOOST = "normal";
 
@@ -85,6 +85,11 @@ export default function HomePage() {
     const stored = localStorage.getItem(VOICE_STORAGE_KEY);
     if (stored && VOICES.some((voice) => voice.id === stored)) {
       setVoiceId(stored);
+      return;
+    }
+
+    if (stored) {
+      localStorage.setItem(VOICE_STORAGE_KEY, DEFAULT_VOICE_ID);
     }
   }, []);
 
