@@ -171,7 +171,7 @@ export type SegmentDiagnosticsManifest = {
 };
 
 export const DEFAULT_OUTPUT_FORMAT: OutputFormat = "mp3";
-export const DEFAULT_VOLUME_BOOST: VolumeBoost = "louder";
+export const DEFAULT_VOLUME_BOOST: VolumeBoost = "normal";
 export const DEFAULT_SMOOTH_JOINS = true;
 export const DEFAULT_JOIN_PAUSE_MS = 300;
 export const DEFAULT_MASTERING_STRATEGY: MasteringStrategy = "current-static-master";

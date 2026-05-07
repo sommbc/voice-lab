@@ -17,7 +17,7 @@ const VOICES = [
 
 const DEFAULT_VOICE_ID = "29511880-fc64-4d77-af2f-59ea3eb3efb1";
 const VOICE_STORAGE_KEY = "voiceover-selected-voice-id";
-const DEFAULT_VOLUME_BOOST = "louder";
+const DEFAULT_VOLUME_BOOST = "normal";
 
 type OutputFormat = "mp3" | "wav";
 type VolumeBoost = "normal" | "louder" | "very-loud";
@@ -329,7 +329,7 @@ export default function HomePage() {
                     </label>
 
                     <label className="field-label">
-                      <span className="field-name">Volume Boost</span>
+                      <span className="field-name">Volume Preset</span>
                       <div className="select-wrap">
                         <select
                           className="select"
@@ -337,9 +337,9 @@ export default function HomePage() {
                           value={volumeBoost}
                           onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
                         >
-                          <option value="normal">Normal</option>
+                          <option value="normal">Normal / Substack</option>
                           <option value="louder">Louder</option>
-                          <option value="very-loud">Very Loud</option>
+                          <option value="very-loud">Very Loud / Emergency</option>
                         </select>
                       </div>
                     </label>

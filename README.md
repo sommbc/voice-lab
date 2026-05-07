@@ -7,6 +7,7 @@ Private tool for converting pasted long-form text into one narration file using 
 - Continuous Read is the default path for long-form essays.
 - The app cleans the full document, sends one Mistral TTS request first, then applies final mastering to the completed file before delivery.
 - If the full-document request fails for a chunking-worthy reason, the app falls back to deterministic segmented generation: smaller Mistral-safe chunks, WAV standardization, per-segment static loudness leveling, bounded fade-down correction, join smoothing, WAV merge, and gentle final mastering.
+- The default delivery preset is Substack-ready MP3: Normal volume, `-16 LUFS` integrated loudness, `-1.5 dBTP` true peak, 24 kHz mono WAV intermediates, and `192k` MP3 export.
 - Advanced controls can force segmented generation directly when needed.
 
 ## Running locally

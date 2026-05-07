@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   DEFAULT_MASTERING_STRATEGY,
+  DEFAULT_OUTPUT_FORMAT,
+  DEFAULT_VOLUME_BOOST,
   buildLinearMasteringFilter,
   buildMergeArgs,
   buildMasteringFilter,
@@ -172,6 +174,29 @@ test("audio command helpers expose the mastering path and correction gain hook",
   assert.ok(mergeArgs.includes("copy"));
   assert.ok(mergeReencodeArgs.includes("libmp3lame"));
   assert.ok(mergeReencodeArgs.includes("192k"));
+});
+
+test("default narration delivery is Substack-ready normal MP3", async () => {
+  assert.equal(DEFAULT_OUTPUT_FORMAT, "mp3");
+  assert.equal(DEFAULT_VOLUME_BOOST, "normal");
+  assert.equal(VOLUME_BOOST_SETTINGS.normal.integratedLoudness, -16);
+  assert.equal(VOLUME_BOOST_SETTINGS.normal.truePeak, -1.5);
+
+  const filter = buildMasteringFilter(DEFAULT_VOLUME_BOOST);
+  assert.match(filter, /^loudnorm=I=-16:TP=-1\.5:LRA=11/);
+
+  const mp3Args = buildTranscodeArgs({
+    inputPath: "/tmp/in.wav",
+    outputPath: "/tmp/out.mp3",
+    outputFormat: DEFAULT_OUTPUT_FORMAT,
+    applyLoudnorm: false
+  });
+  assert.ok(mp3Args.includes("libmp3lame"));
+  assert.ok(mp3Args.includes("192k"));
+
+  const pageSource = await readFile(path.join(__dirname, "../app/page.tsx"), "utf8");
+  assert.match(pageSource, /const DEFAULT_VOLUME_BOOST = "normal"/);
+  assert.match(pageSource, /Normal \/ Substack/);
 });
 
 test("linear mastering filter embeds the measured loudness stats and requests linear mode", () => {
