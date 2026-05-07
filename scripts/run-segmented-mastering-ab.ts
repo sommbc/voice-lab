@@ -24,6 +24,7 @@ import {
   measureSegmentAudioFile,
   mergeAudioFiles,
   resolveMultiTakeCount,
+  selectAcousticTrimPoint,
   selectSeamRegenerationTargets,
   selectBestMultiTakePath,
   standardizeSegmentAudioFile,
@@ -351,13 +352,22 @@ async function generateAndProcessScriptSegment({
   let contextFallbackUsed = false;
   let contextAudioTrimmed = false;
   let contextAudioTrimSeconds: number | null = null;
+  let contextAudioTrimEstimatedSeconds: number | null = null;
+  let contextAudioTrimSearch: Awaited<ReturnType<typeof selectAcousticTrimPoint>> | null = null;
 
   if (spokenOverlapInput && rawMetrics.durationSeconds !== null) {
-    const trimSeconds = estimateContextAudioTrimSeconds({
+    const estimatedTrimSeconds = estimateContextAudioTrimSeconds({
       durationSeconds: rawMetrics.durationSeconds,
       contextWordCount: spokenOverlapInput.contextWordCount,
       targetWordCount: segments[segmentIndex].wordCount
     });
+    contextAudioTrimEstimatedSeconds = estimatedTrimSeconds;
+    contextAudioTrimSearch = await selectAcousticTrimPoint({
+      inputPath: rawPath,
+      durationSeconds: rawMetrics.durationSeconds,
+      estimatedTrimSeconds
+    });
+    const trimSeconds = contextAudioTrimSearch.selectedTrimSeconds;
     finalRawPath = path.join(
       workspacePath,
       `segment-${segmentId}${attemptSuffix}-raw-context-trimmed.wav`
@@ -371,7 +381,11 @@ async function generateAndProcessScriptSegment({
     rawMetrics = await measureSegmentAudioFile(finalRawPath);
     contextAudioTrimmed = true;
     contextAudioTrimSeconds = trimSeconds;
-    console.log(`  trimmed ${trimSeconds.toFixed(2)} s of spoken continuity context`);
+    console.log(
+      `  trimmed ${trimSeconds.toFixed(2)} s of spoken continuity context (estimate ${estimatedTrimSeconds.toFixed(
+        2
+      )} s)`
+    );
 
     if (isContextTrimLikelyBadTake(rawMetrics)) {
       console.log("  context-trimmed take failed quality guard; regenerating target passage only");
@@ -407,6 +421,8 @@ async function generateAndProcessScriptSegment({
       contextFallbackUsed = true;
       contextAudioTrimmed = false;
       contextAudioTrimSeconds = null;
+      contextAudioTrimEstimatedSeconds = null;
+      contextAudioTrimSearch = null;
     }
   }
 
@@ -421,7 +437,9 @@ async function generateAndProcessScriptSegment({
     outputPath: leveledPath,
     metrics: standardizedMetrics
   });
-  const leveledMetrics = await measureSegmentAudioFile(leveledPath);
+  const leveledMetrics = await measureSegmentAudioFile(leveledPath, {
+    includeEdgeTone: true
+  });
 
   console.log(
     `  gain ${levelingResult.appliedGainDb.toFixed(
@@ -452,6 +470,8 @@ async function generateAndProcessScriptSegment({
       contextFallbackUsed,
       contextAudioTrimmed,
       contextAudioTrimSeconds,
+      contextAudioTrimEstimatedSeconds,
+      contextAudioTrimSearch,
       regenerationReason:
         candidateIndex === 0 ? undefined : `multi-take-candidate-${candidateIndex + 1}`,
       rawMetrics,
@@ -490,7 +510,11 @@ function buildScriptMultiTakeOptimization({
         contextFallbackUsed: candidate.processedSegment.manifestSegment.contextFallbackUsed,
         contextAudioTrimmed: candidate.processedSegment.manifestSegment.contextAudioTrimmed,
         contextAudioTrimSeconds:
-          candidate.processedSegment.manifestSegment.contextAudioTrimSeconds
+          candidate.processedSegment.manifestSegment.contextAudioTrimSeconds,
+        contextAudioTrimEstimatedSeconds:
+          candidate.processedSegment.manifestSegment.contextAudioTrimEstimatedSeconds,
+        contextAudioTrimSearch:
+          candidate.processedSegment.manifestSegment.contextAudioTrimSearch
       })
     )
   );
@@ -577,6 +601,9 @@ function buildScriptMultiTakeOptimizationManifest({
           contextFallbackUsed: manifestSegment.contextFallbackUsed,
           contextAudioTrimmed: manifestSegment.contextAudioTrimmed,
           contextAudioTrimSeconds: manifestSegment.contextAudioTrimSeconds,
+          contextAudioTrimEstimatedSeconds:
+            manifestSegment.contextAudioTrimEstimatedSeconds ?? null,
+          contextAudioTrimSearch: manifestSegment.contextAudioTrimSearch ?? null,
           leveledMetrics: manifestSegment.leveledMetrics
         };
       })
@@ -809,7 +836,10 @@ async function applyScriptSeamAdjustments({
 }): Promise<SegmentBoundaryDiagnostic[]> {
   const adjustments = computeSegmentSeamAdjustments(boundaries, leveledPaths.length);
   const actionableAdjustments = adjustments.filter(
-    (adjustment) => adjustment.startCutDb >= 0.05 || adjustment.endCutDb >= 0.05
+    (adjustment) =>
+      adjustment.startCutDb >= 0.05 ||
+      adjustment.endCutDb >= 0.05 ||
+      adjustment.entrySmoothingCutDb >= 0.05
   );
 
   if (actionableAdjustments.length === 0) {
@@ -841,17 +871,23 @@ async function applyScriptSeamAdjustments({
       durationSeconds
     });
 
-    const adjustedMetrics = await measureSegmentAudioFile(outputPath);
+    const adjustedMetrics = await measureSegmentAudioFile(outputPath, {
+      includeEdgeTone: true
+    });
     leveledPaths[segmentArrayIndex] = outputPath;
     segment.leveledMetrics = adjustedMetrics;
     segment.seamStartCutDb = adjustment.startCutDb;
     segment.seamEndCutDb = adjustment.endCutDb;
+    segment.seamEntrySmoothingCutDb = adjustment.entrySmoothingCutDb;
+    segment.seamEntrySmoothingReason = adjustment.entrySmoothingReason;
     segment.seamAdjustmentFilter = filter;
 
     console.log(
       `  segment ${adjustment.segmentIndex}: start -${adjustment.startCutDb.toFixed(
         2
-      )} dB, end -${adjustment.endCutDb.toFixed(2)} dB`
+      )} dB, end -${adjustment.endCutDb.toFixed(
+        2
+      )} dB, entry -${adjustment.entrySmoothingCutDb.toFixed(2)} dB`
     );
   }
 
@@ -866,7 +902,34 @@ async function applyScriptSeamAdjustments({
     }
   );
   hydrateScriptBoundaryContext(adjustedBoundaries, segments, manifestSegments);
+  hydrateScriptEntrySmoothingDiagnostics(adjustedBoundaries, adjustments);
   return adjustedBoundaries;
+}
+
+function hydrateScriptEntrySmoothingDiagnostics(
+  diagnostics: SegmentBoundaryDiagnostic[],
+  adjustments: ReturnType<typeof computeSegmentSeamAdjustments>
+): void {
+  for (const adjustment of adjustments) {
+    if (
+      adjustment.entrySmoothingBoundaryIndex === null ||
+      adjustment.entrySmoothingCutDb < 0.05
+    ) {
+      continue;
+    }
+
+    const boundary = diagnostics.find(
+      (entry) => entry.boundaryIndex === adjustment.entrySmoothingBoundaryIndex
+    );
+
+    if (!boundary) {
+      continue;
+    }
+
+    boundary.entrySmoothingApplied = true;
+    boundary.entrySmoothingCutDb = adjustment.entrySmoothingCutDb;
+    boundary.entrySmoothingReason = adjustment.entrySmoothingReason;
+  }
 }
 
 async function mergeWithWavFallback({
@@ -947,7 +1010,11 @@ function printBoundaries(boundaries: ReturnType<typeof buildSegmentBoundaryDiagn
         "LUFS"
       )} after ${formatMetric(boundary.afterLoudness, "LUFS")}  tone ${boundary.toneMismatchScore.toFixed(
         2
-      )} ${boundary.seamFailureKind}  clip ${
+      )} edge ${boundary.edgeToneMismatchScore.toFixed(2)} smooth ${
+        boundary.entrySmoothingApplied
+          ? `-${boundary.entrySmoothingCutDb.toFixed(2)}dB`
+          : "none"
+      } ${boundary.seamFailureKind}  clip ${
         boundary.seamClipPath ?? "none"
       }`
     );

@@ -105,6 +105,39 @@ export type AudioWindowStats = {
   zeroCrossingsRate: number | null;
 };
 
+export type EdgeToneBandMetrics = {
+  lowDb: number | null;
+  midDb: number | null;
+  highDb: number | null;
+};
+
+export type EdgeToneDeltaMetrics = {
+  lowDeltaDb: number | null;
+  midDeltaDb: number | null;
+  highDeltaDb: number | null;
+  averageDeltaDb: number | null;
+  weightedDeltaDb: number | null;
+  brightnessExcessDb: number | null;
+  presenceExcessDb: number | null;
+};
+
+export type AcousticTrimSearchCandidate = {
+  trimSeconds: number;
+  offsetSeconds: number;
+  beforeRmsDb: number | null;
+  afterRmsDb: number | null;
+  combinedRmsDb: number | null;
+  score: number;
+  selected: boolean;
+};
+
+export type AcousticTrimSearchResult = {
+  estimatedTrimSeconds: number;
+  selectedTrimSeconds: number;
+  searchRadiusSeconds: number;
+  candidates: AcousticTrimSearchCandidate[];
+};
+
 export type SegmentAudioMetrics = {
   durationSeconds: number | null;
   integratedLoudness: number | null;
@@ -122,6 +155,8 @@ export type SegmentAudioMetrics = {
   lastTwoSecondPeakDb: number | null;
   firstTwoSecondZeroCrossingRate: number | null;
   lastTwoSecondZeroCrossingRate: number | null;
+  firstTwoSecondEdgeTone: EdgeToneBandMetrics;
+  lastTwoSecondEdgeTone: EdgeToneBandMetrics;
   leadingEdgeRmsDb: number | null;
   trailingEdgeRmsDb: number | null;
   leadingSpeechCutoffRisk: boolean;
@@ -140,6 +175,10 @@ export type SegmentSeamAdjustment = {
   segmentIndex: number;
   startCutDb: number;
   endCutDb: number;
+  entrySmoothingCutDb: number;
+  entrySmoothingWindowSeconds: number;
+  entrySmoothingBoundaryIndex: number | null;
+  entrySmoothingReason: string | null;
   filter: string | null;
 };
 
@@ -186,6 +225,10 @@ export type SegmentBoundaryDiagnostic = {
   speechCutoffRiskBefore: boolean;
   speechCutoffRiskAfter: boolean;
   spectralDifferenceScore: number | null;
+  previousEdgeTone: EdgeToneBandMetrics;
+  nextEdgeTone: EdgeToneBandMetrics;
+  edgeToneDelta: EdgeToneDeltaMetrics;
+  edgeToneMismatchScore: number;
   suddenToneMismatch: boolean;
   previousSpeakingRateWps: number | null;
   nextSpeakingRateWps: number | null;
@@ -198,6 +241,9 @@ export type SegmentBoundaryDiagnostic = {
   contextOverlapUsed: boolean;
   regenerationAttempts: SegmentSeamRegenerationAttempt[];
   boundaryRepair: SegmentBoundaryRepairRecord | null;
+  entrySmoothingApplied: boolean;
+  entrySmoothingCutDb: number;
+  entrySmoothingReason: string | null;
   seamQualityScore: number;
   seamPassed: boolean;
   seamClipPath: string | null;
@@ -244,6 +290,8 @@ export type SegmentDiagnosticsManifestSegment = {
   contextFallbackUsed: boolean;
   contextAudioTrimmed: boolean;
   contextAudioTrimSeconds: number | null;
+  contextAudioTrimEstimatedSeconds?: number | null;
+  contextAudioTrimSearch?: AcousticTrimSearchResult | null;
   regenerationReason?: string;
   rawMetrics: SegmentAudioMetrics;
   standardizedMetrics: SegmentAudioMetrics;
@@ -253,6 +301,8 @@ export type SegmentDiagnosticsManifestSegment = {
   levelingFilter: string;
   seamStartCutDb?: number;
   seamEndCutDb?: number;
+  seamEntrySmoothingCutDb?: number;
+  seamEntrySmoothingReason?: string | null;
   seamAdjustmentFilter?: string | null;
 };
 
@@ -285,6 +335,8 @@ export type MultiTakeCandidateInput = {
   contextFallbackUsed?: boolean;
   contextAudioTrimmed?: boolean;
   contextAudioTrimSeconds?: number | null;
+  contextAudioTrimEstimatedSeconds?: number | null;
+  contextAudioTrimSearch?: AcousticTrimSearchResult | null;
 };
 
 export type MultiTakeCandidateManifest = {
@@ -298,6 +350,8 @@ export type MultiTakeCandidateManifest = {
   contextFallbackUsed: boolean;
   contextAudioTrimmed: boolean;
   contextAudioTrimSeconds: number | null;
+  contextAudioTrimEstimatedSeconds: number | null;
+  contextAudioTrimSearch: AcousticTrimSearchResult | null;
   leveledMetrics: SegmentAudioMetrics;
 };
 
@@ -315,6 +369,10 @@ export type MultiTakePairwiseSeamScore = {
   rmsDeltaDb: number | null;
   gapDurationMs: number;
   spectralDifferenceScore: number | null;
+  previousEdgeTone: EdgeToneBandMetrics;
+  nextEdgeTone: EdgeToneBandMetrics;
+  edgeToneDelta: EdgeToneDeltaMetrics;
+  edgeToneMismatchScore: number;
   toneMismatchScore: number;
   speakingRateDeltaWps: number | null;
   speechCutoffRiskBefore: boolean;
@@ -418,11 +476,14 @@ export const SEGMENT_SEAM_SCORE_WARNING = 35;
 export const SEGMENT_RMS_BOUNDARY_WARNING_DB = 3;
 export const SEGMENT_SPECTRAL_MISMATCH_WARNING = 12;
 export const SEGMENT_TONE_MISMATCH_WARNING = 18;
+export const SEGMENT_EDGE_TONE_MISMATCH_WARNING = 8;
 export const SEGMENT_SPEAKING_RATE_DELTA_WARNING_WPS = 0.35;
 export const SEGMENT_EDGE_CUTOFF_RMS_WARNING_DB = -20;
 export const SEGMENT_EDGE_MATCH_THRESHOLD_LU = 2;
 export const SEGMENT_EDGE_MATCH_MAX_CUT_DB = 3;
 export const SEGMENT_EDGE_MATCH_WINDOW_SECONDS = 3;
+export const SEGMENT_ENTRY_SMOOTHING_MAX_CUT_DB = 1.25;
+export const SEGMENT_ENTRY_SMOOTHING_WINDOW_SECONDS = 1.5;
 export const DEFAULT_MULTI_TAKE_COUNT = 1;
 export const MAX_MULTI_TAKE_COUNT = 5;
 export const MULTI_TAKE_MINIMUM_AVERAGE_IMPROVEMENT_PERCENTAGE = 25;
@@ -1540,7 +1601,8 @@ export async function measureAudioFile(inputPath: string): Promise<AudioLoudness
 export async function measureAudioWindowStats(
   inputPath: string,
   startSeconds: number,
-  durationSeconds: number
+  durationSeconds: number,
+  audioFilter = "astats=metadata=0:reset=0"
 ): Promise<AudioWindowStats> {
   await assertAudioFileReady(inputPath);
 
@@ -1558,7 +1620,7 @@ export async function measureAudioWindowStats(
       inputPath,
       "-vn",
       "-af",
-      "astats=metadata=0:reset=0",
+      audioFilter,
       "-f",
       "null",
       "-"
@@ -1569,7 +1631,176 @@ export async function measureAudioWindowStats(
   return parseAudioWindowStats(stderr);
 }
 
-export async function measureSegmentAudioFile(inputPath: string): Promise<SegmentAudioMetrics> {
+export function computeEdgeToneDelta(
+  previous: EdgeToneBandMetrics,
+  next: EdgeToneBandMetrics
+): EdgeToneDeltaMetrics {
+  const lowDeltaDb = computeNullableAbsDelta(previous.lowDb, next.lowDb);
+  const midDeltaDb = computeNullableAbsDelta(previous.midDb, next.midDb);
+  const highDeltaDb = computeNullableAbsDelta(previous.highDb, next.highDb);
+  const deltas = [lowDeltaDb, midDeltaDb, highDeltaDb].filter(
+    (value): value is number => value !== null
+  );
+  const weightedEntries = [
+    { value: lowDeltaDb, weight: 0.75 },
+    { value: midDeltaDb, weight: 1.25 },
+    { value: highDeltaDb, weight: 1.45 }
+  ].filter((entry): entry is { value: number; weight: number } => entry.value !== null);
+  const weightTotal = weightedEntries.reduce((total, entry) => total + entry.weight, 0);
+  const weightedDeltaDb =
+    weightTotal <= 0
+      ? null
+      : roundToTwoDecimals(
+          weightedEntries.reduce((total, entry) => total + entry.value * entry.weight, 0) /
+            weightTotal
+        );
+
+  return {
+    lowDeltaDb,
+    midDeltaDb,
+    highDeltaDb,
+    averageDeltaDb:
+      deltas.length === 0
+        ? null
+        : roundToTwoDecimals(deltas.reduce((total, value) => total + value, 0) / deltas.length),
+    weightedDeltaDb,
+    brightnessExcessDb: computePositiveDelta(next.highDb, previous.highDb),
+    presenceExcessDb: computePositiveDelta(next.midDb, previous.midDb)
+  };
+}
+
+export function computeEdgeToneMismatchScore(delta: EdgeToneDeltaMetrics): number {
+  const weightedDelta = delta.weightedDeltaDb;
+
+  if (weightedDelta === null) {
+    return 0;
+  }
+
+  const continuityPenalty = Math.max(0, weightedDelta - 1.4) * 4.5;
+  const brightnessPenalty = Math.max(0, (delta.brightnessExcessDb ?? 0) - 1.2) * 2.2;
+  const presencePenalty = Math.max(0, (delta.presenceExcessDb ?? 0) - 1.4) * 1.8;
+  return roundToTwoDecimals(
+    Math.min(40, continuityPenalty + brightnessPenalty + presencePenalty)
+  );
+}
+
+export function selectBestAcousticTrimSearchCandidate({
+  estimatedTrimSeconds,
+  searchRadiusSeconds,
+  candidates
+}: {
+  estimatedTrimSeconds: number;
+  searchRadiusSeconds: number;
+  candidates: Array<Omit<AcousticTrimSearchCandidate, "score" | "selected">>;
+}): AcousticTrimSearchResult {
+  const scoredCandidates = candidates.map((candidate) => ({
+    ...candidate,
+    score: scoreAcousticTrimCandidate(candidate),
+    selected: false
+  }));
+  let selectedIndex = 0;
+
+  for (const [index, candidate] of scoredCandidates.entries()) {
+    const selected = scoredCandidates[selectedIndex];
+
+    if (
+      !selected ||
+      candidate.score < selected.score ||
+      (candidate.score === selected.score &&
+        Math.abs(candidate.offsetSeconds) < Math.abs(selected.offsetSeconds))
+    ) {
+      selectedIndex = index;
+    }
+  }
+
+  const selectedTrimSeconds =
+    scoredCandidates[selectedIndex]?.trimSeconds ?? roundToThreeDecimals(estimatedTrimSeconds);
+
+  return {
+    estimatedTrimSeconds: roundToThreeDecimals(estimatedTrimSeconds),
+    selectedTrimSeconds,
+    searchRadiusSeconds: roundToThreeDecimals(searchRadiusSeconds),
+    candidates: scoredCandidates.map((candidate, index) => ({
+      ...candidate,
+      selected: index === selectedIndex
+    }))
+  };
+}
+
+export async function selectAcousticTrimPoint({
+  inputPath,
+  durationSeconds,
+  estimatedTrimSeconds,
+  searchRadiusSeconds = 0.4
+}: {
+  inputPath: string;
+  durationSeconds: number;
+  estimatedTrimSeconds: number;
+  searchRadiusSeconds?: number;
+}): Promise<AcousticTrimSearchResult> {
+  const maxTrimSeconds = Math.max(0, durationSeconds - 0.5);
+  const offsets = [-0.4, -0.27, -0.13, 0, 0.13, 0.27, 0.4].filter(
+    (offset) => Math.abs(offset) <= searchRadiusSeconds + 0.001
+  );
+  const candidateTrimSeconds = [
+    ...new Set(
+      offsets.map((offset) =>
+        roundToThreeDecimals(Math.min(Math.max(0, estimatedTrimSeconds + offset), maxTrimSeconds))
+      )
+    )
+  ];
+  const candidates = await Promise.all(
+    candidateTrimSeconds.map(async (trimSeconds) => {
+      const beforeStats = await measureAudioWindowStats(
+        inputPath,
+        Math.max(0, trimSeconds - 0.14),
+        0.14
+      );
+      const afterStats = await measureAudioWindowStats(inputPath, trimSeconds, 0.18);
+      const combinedRmsDb = averageNullableNumbers([
+        beforeStats.rmsLevelDb,
+        afterStats.rmsLevelDb
+      ]);
+
+      return {
+        trimSeconds,
+        offsetSeconds: roundToThreeDecimals(trimSeconds - estimatedTrimSeconds),
+        beforeRmsDb: beforeStats.rmsLevelDb,
+        afterRmsDb: afterStats.rmsLevelDb,
+        combinedRmsDb
+      };
+    })
+  );
+
+  return selectBestAcousticTrimSearchCandidate({
+    estimatedTrimSeconds,
+    searchRadiusSeconds,
+    candidates
+  });
+}
+
+async function measureEdgeToneBandMetrics(
+  inputPath: string,
+  startSeconds: number,
+  durationSeconds: number
+): Promise<EdgeToneBandMetrics> {
+  const [low, mid, high] = await Promise.all([
+    measureAudioWindowStats(inputPath, startSeconds, durationSeconds, edgeToneBandFilter(120, 420)),
+    measureAudioWindowStats(inputPath, startSeconds, durationSeconds, edgeToneBandFilter(700, 2500)),
+    measureAudioWindowStats(inputPath, startSeconds, durationSeconds, edgeToneBandFilter(3500, 9000))
+  ]);
+
+  return {
+    lowDb: low.rmsLevelDb,
+    midDb: mid.rmsLevelDb,
+    highDb: high.rmsLevelDb
+  };
+}
+
+export async function measureSegmentAudioFile(
+  inputPath: string,
+  { includeEdgeTone = false }: { includeEdgeTone?: boolean } = {}
+): Promise<SegmentAudioMetrics> {
   await assertAudioFileReady(inputPath);
 
   const timeline = await analyzeAudioFileOverTime(inputPath).catch((error) => {
@@ -1638,6 +1869,26 @@ export async function measureSegmentAudioFile(inputPath: string): Promise<Segmen
       );
       return [null, null, null, null] as const;
     });
+  const [firstTwoSecondEdgeTone, lastTwoSecondEdgeTone] = includeEdgeTone
+    ? await Promise.all([
+        measureEdgeToneBandMetrics(inputPath, 0, 2),
+        measureEdgeToneBandMetrics(
+          inputPath,
+          durationSeconds === null ? 0 : Math.max(0, durationSeconds - 2),
+          2
+        )
+      ]).catch((error) => {
+        console.warn(
+          "[segment-metrics] edge-tone analysis unavailable",
+          JSON.stringify({
+            filePath: inputPath,
+            reason:
+              error instanceof Error ? error.message : "Unknown edge-tone measurement failure."
+          })
+        );
+        return [nullEdgeToneBandMetrics(), nullEdgeToneBandMetrics()] as const;
+      })
+    : [nullEdgeToneBandMetrics(), nullEdgeToneBandMetrics()];
   const largestInternalJump = timeline?.largestJumps[0] ?? null;
   const internalDriftLufs =
     firstWindowLoudness === null || lastWindowLoudness === null
@@ -1661,6 +1912,8 @@ export async function measureSegmentAudioFile(inputPath: string): Promise<Segmen
     lastTwoSecondPeakDb: lastTwoSecondStats?.peakLevelDb ?? null,
     firstTwoSecondZeroCrossingRate: firstTwoSecondStats?.zeroCrossingsRate ?? null,
     lastTwoSecondZeroCrossingRate: lastTwoSecondStats?.zeroCrossingsRate ?? null,
+    firstTwoSecondEdgeTone,
+    lastTwoSecondEdgeTone,
     leadingEdgeRmsDb: leadingEdgeStats?.rmsLevelDb ?? null,
     trailingEdgeRmsDb: trailingEdgeStats?.rmsLevelDb ?? null,
     leadingSpeechCutoffRisk: isSpeechCutoffRisk(leadingEdgeStats?.rmsLevelDb ?? null),
@@ -2000,10 +2253,12 @@ export function getAdaptiveJoinPauseMs({
 export function computeToneMismatchScore({
   spectralDifferenceScore,
   speakingRateDeltaWps,
+  edgeToneMismatchScore = 0,
   toneSeamScoringEnabled = true
 }: {
   spectralDifferenceScore: number | null;
   speakingRateDeltaWps: number | null;
+  edgeToneMismatchScore?: number;
   toneSeamScoringEnabled?: boolean;
 }): number {
   if (!toneSeamScoringEnabled) {
@@ -2027,6 +2282,14 @@ export function computeToneMismatchScore({
       (speakingRateDeltaWps - SEGMENT_SPEAKING_RATE_DELTA_WARNING_WPS) * 42;
   }
 
+  if (edgeToneMismatchScore > SEGMENT_EDGE_TONE_MISMATCH_WARNING) {
+    score +=
+      SEGMENT_EDGE_TONE_MISMATCH_WARNING +
+      (edgeToneMismatchScore - SEGMENT_EDGE_TONE_MISMATCH_WARNING) * 1.4;
+  } else {
+    score += edgeToneMismatchScore * 0.65;
+  }
+
   return roundToTwoDecimals(Math.min(100, score));
 }
 
@@ -2036,6 +2299,7 @@ export function computeSeamQualityScore({
   gapDurationMs,
   spectralDifferenceScore,
   toneMismatchScore = 0,
+  edgeToneMismatchScore = 0,
   speechCutoffRiskBefore,
   speechCutoffRiskAfter,
   highTruePeakNearBoundary
@@ -2045,6 +2309,7 @@ export function computeSeamQualityScore({
   gapDurationMs: number;
   spectralDifferenceScore: number | null;
   toneMismatchScore?: number;
+  edgeToneMismatchScore?: number;
   speechCutoffRiskBefore: boolean;
   speechCutoffRiskAfter: boolean;
   highTruePeakNearBoundary: boolean;
@@ -2072,6 +2337,10 @@ export function computeSeamQualityScore({
     spectralDifferenceScore > SEGMENT_SPECTRAL_MISMATCH_WARNING
   ) {
     score += (spectralDifferenceScore - SEGMENT_SPECTRAL_MISMATCH_WARNING) * 1.2;
+  }
+
+  if (edgeToneMismatchScore > 0) {
+    score += edgeToneMismatchScore * 0.9;
   }
 
   if (toneMismatchScore > SEGMENT_TONE_MISMATCH_WARNING) {
@@ -2141,63 +2410,155 @@ export function computeSegmentSeamAdjustments(
       segmentIndex: index + 1,
       startCutDb: 0,
       endCutDb: 0,
+      entrySmoothingCutDb: 0,
+      entrySmoothingWindowSeconds: SEGMENT_ENTRY_SMOOTHING_WINDOW_SECONDS,
+      entrySmoothingBoundaryIndex: null,
+      entrySmoothingReason: null,
       filter: null
     })
   );
 
   for (const boundary of boundaries) {
-    if (boundary.deltaLufs === null || boundary.deltaLufs <= SEGMENT_EDGE_MATCH_THRESHOLD_LU) {
-      continue;
-    }
+    if (boundary.deltaLufs !== null && boundary.deltaLufs > SEGMENT_EDGE_MATCH_THRESHOLD_LU) {
+      const before = boundary.previousLast5sLoudness;
+      const after = boundary.nextFirst5sLoudness;
 
-    const before = boundary.previousLast5sLoudness;
-    const after = boundary.nextFirst5sLoudness;
+      if (before !== null && after !== null) {
+        const cutDb = roundToTwoDecimals(
+          Math.min(
+            SEGMENT_EDGE_MATCH_MAX_CUT_DB,
+            boundary.deltaLufs - SEGMENT_EDGE_MATCH_THRESHOLD_LU
+          )
+        );
 
-    if (before === null || after === null) {
-      continue;
-    }
+        if (cutDb > 0) {
+          if (before > after) {
+            const previous = adjustments[boundary.previousSegmentIndex - 1];
 
-    const cutDb = roundToTwoDecimals(
-      Math.min(SEGMENT_EDGE_MATCH_MAX_CUT_DB, boundary.deltaLufs - SEGMENT_EDGE_MATCH_THRESHOLD_LU)
-    );
+            if (previous) {
+              previous.endCutDb = Math.max(previous.endCutDb, cutDb);
+            }
+          } else {
+            const next = adjustments[boundary.nextSegmentIndex - 1];
 
-    if (cutDb <= 0) {
-      continue;
-    }
-
-    if (before > after) {
-      const previous = adjustments[boundary.previousSegmentIndex - 1];
-
-      if (previous) {
-        previous.endCutDb = Math.max(previous.endCutDb, cutDb);
-      }
-    } else {
-      const next = adjustments[boundary.nextSegmentIndex - 1];
-
-      if (next) {
-        next.startCutDb = Math.max(next.startCutDb, cutDb);
+            if (next) {
+              next.startCutDb = Math.max(next.startCutDb, cutDb);
+            }
+          }
+        }
       }
     }
+
+    const smoothing = computeEntrySmoothingForBoundary(boundary);
+
+    if (!smoothing) {
+      continue;
+    }
+
+    const next = adjustments[boundary.nextSegmentIndex - 1];
+
+    if (!next || smoothing.cutDb <= next.entrySmoothingCutDb) {
+      continue;
+    }
+
+    next.entrySmoothingCutDb = smoothing.cutDb;
+    next.entrySmoothingWindowSeconds = smoothing.windowSeconds;
+    next.entrySmoothingBoundaryIndex = boundary.boundaryIndex;
+    next.entrySmoothingReason = smoothing.reason;
   }
 
   return adjustments.map((adjustment) => ({
     ...adjustment,
     startCutDb: roundToTwoDecimals(adjustment.startCutDb),
     endCutDb: roundToTwoDecimals(adjustment.endCutDb),
+    entrySmoothingCutDb: roundToTwoDecimals(adjustment.entrySmoothingCutDb),
     filter: null
   }));
 }
 
+function computeEntrySmoothingForBoundary(
+  boundary: SegmentBoundaryDiagnostic
+): { cutDb: number; windowSeconds: number; reason: string } | null {
+  if (boundary.seamFailureKind !== "tonal" && boundary.seamFailureKind !== "mixed") {
+    return null;
+  }
+
+  const brightnessExcess = boundary.edgeToneDelta.brightnessExcessDb ?? 0;
+  const presenceExcess = boundary.edgeToneDelta.presenceExcessDb ?? 0;
+  const rmsExcess =
+    boundary.previousLast2sRmsDb === null || boundary.nextFirst2sRmsDb === null
+      ? 0
+      : Math.max(0, boundary.nextFirst2sRmsDb - boundary.previousLast2sRmsDb);
+  const loudnessExcess =
+    boundary.previousLast5sLoudness === null || boundary.nextFirst5sLoudness === null
+      ? 0
+      : Math.max(0, boundary.nextFirst5sLoudness - boundary.previousLast5sLoudness);
+  const tonalExcess = Math.max(
+    brightnessExcess - 1.1,
+    presenceExcess - 1.4,
+    rmsExcess - 1,
+    loudnessExcess - 0.8
+  );
+
+  if (tonalExcess <= 0) {
+    return null;
+  }
+
+  const cutDb = roundToTwoDecimals(
+    Math.min(SEGMENT_ENTRY_SMOOTHING_MAX_CUT_DB, Math.max(0.75, tonalExcess * 0.45))
+  );
+
+  return {
+    cutDb,
+    windowSeconds: SEGMENT_ENTRY_SMOOTHING_WINDOW_SECONDS,
+    reason: [
+      `boundary-${boundary.boundaryIndex}`,
+      `kind-${boundary.seamFailureKind}`,
+      `brightness-${brightnessExcess.toFixed(2)}`,
+      `presence-${presenceExcess.toFixed(2)}`,
+      `rms-${rmsExcess.toFixed(2)}`,
+      `loudness-${loudnessExcess.toFixed(2)}`
+    ].join(":")
+  };
+}
+
 export function buildSegmentSeamAdjustmentFilter(
-  adjustment: Pick<SegmentSeamAdjustment, "startCutDb" | "endCutDb">,
+  adjustment: Pick<SegmentSeamAdjustment, "startCutDb" | "endCutDb"> &
+    Partial<Pick<SegmentSeamAdjustment, "entrySmoothingCutDb" | "entrySmoothingWindowSeconds">>,
   durationSeconds: number | null
 ): string | null {
   const filters: string[] = [];
   const safeWindowSeconds = SEGMENT_EDGE_MATCH_WINDOW_SECONDS;
 
-  if (adjustment.startCutDb >= 0.05) {
+  const entrySmoothingCutDb =
+    "entrySmoothingCutDb" in adjustment
+      ? Math.min(
+          SEGMENT_ENTRY_SMOOTHING_MAX_CUT_DB,
+          Math.max(0, adjustment.entrySmoothingCutDb ?? 0)
+        )
+      : 0;
+  const entrySmoothingWindowSeconds =
+    "entrySmoothingWindowSeconds" in adjustment
+      ? Math.min(
+          2,
+          Math.max(1, adjustment.entrySmoothingWindowSeconds ?? SEGMENT_ENTRY_SMOOTHING_WINDOW_SECONDS)
+        )
+      : SEGMENT_ENTRY_SMOOTHING_WINDOW_SECONDS;
+  const remainingStartCutDb = Math.max(0, adjustment.startCutDb - entrySmoothingCutDb);
+
+  if (entrySmoothingCutDb >= 0.05) {
     filters.push(
-      `volume='if(lt(t\\,${safeWindowSeconds.toFixed(2)})\\,exp(log(10)*(-${adjustment.startCutDb.toFixed(
+      `volume='if(lt(t\\,${entrySmoothingWindowSeconds.toFixed(
+        2
+      )})\\,exp(log(10)*(-${entrySmoothingCutDb.toFixed(
+        2
+      )}*(1-t/${entrySmoothingWindowSeconds.toFixed(2)}))/20)\\,1)':eval=frame`
+    );
+  }
+
+  if (remainingStartCutDb >= 0.05) {
+    filters.push(
+      `volume='if(lt(t\\,${safeWindowSeconds.toFixed(2)})\\,exp(log(10)*(-${remainingStartCutDb.toFixed(
         2
       )}*(1-t/${safeWindowSeconds.toFixed(2)}))/20)\\,1)':eval=frame`
     );
@@ -2271,6 +2632,10 @@ export function buildSegmentBoundaryDiagnostics(
       nextZeroCrossingRate: next.firstTwoSecondZeroCrossingRate,
       rmsDeltaDb
     });
+    const previousEdgeTone = current.lastTwoSecondEdgeTone;
+    const nextEdgeTone = next.firstTwoSecondEdgeTone;
+    const edgeToneDelta = computeEdgeToneDelta(previousEdgeTone, nextEdgeTone);
+    const edgeToneMismatchScore = computeEdgeToneMismatchScore(edgeToneDelta);
     const previousSpeakingRateWps = computeSpeakingRateWps(
       wordCounts?.[index],
       current.durationSeconds
@@ -2286,6 +2651,7 @@ export function buildSegmentBoundaryDiagnostics(
     const toneMismatchScore = computeToneMismatchScore({
       spectralDifferenceScore,
       speakingRateDeltaWps,
+      edgeToneMismatchScore,
       toneSeamScoringEnabled
     });
     const highTruePeakNearBoundary =
@@ -2299,6 +2665,7 @@ export function buildSegmentBoundaryDiagnostics(
       gapDurationMs,
       spectralDifferenceScore,
       toneMismatchScore,
+      edgeToneMismatchScore,
       speechCutoffRiskBefore,
       speechCutoffRiskAfter,
       highTruePeakNearBoundary
@@ -2330,6 +2697,7 @@ export function buildSegmentBoundaryDiagnostics(
       spectralDifferenceScore,
       speakingRateDeltaWps,
       toneMismatchScore,
+      edgeToneMismatchScore,
       speechCutoffRiskBefore,
       speechCutoffRiskAfter
     });
@@ -2358,6 +2726,10 @@ export function buildSegmentBoundaryDiagnostics(
       highTruePeakNearBoundary,
       speechCutoffRiskBefore,
       speechCutoffRiskAfter,
+      previousEdgeTone,
+      nextEdgeTone,
+      edgeToneDelta,
+      edgeToneMismatchScore,
       spectralDifferenceScore,
       suddenToneMismatch,
       previousSpeakingRateWps,
@@ -2371,6 +2743,9 @@ export function buildSegmentBoundaryDiagnostics(
       contextOverlapUsed: false,
       regenerationAttempts: [],
       boundaryRepair: null,
+      entrySmoothingApplied: false,
+      entrySmoothingCutDb: 0,
+      entrySmoothingReason: null,
       seamQualityScore,
       seamPassed,
       seamClipPath: null
@@ -2544,6 +2919,10 @@ export function buildMultiTakePairwiseSeamScoreMatrix({
           rmsDeltaDb: diagnostic.rmsDeltaDb,
           gapDurationMs: diagnostic.gapDurationMs,
           spectralDifferenceScore: diagnostic.spectralDifferenceScore,
+          previousEdgeTone: diagnostic.previousEdgeTone,
+          nextEdgeTone: diagnostic.nextEdgeTone,
+          edgeToneDelta: diagnostic.edgeToneDelta,
+          edgeToneMismatchScore: diagnostic.edgeToneMismatchScore,
           toneMismatchScore: diagnostic.toneMismatchScore,
           speakingRateDeltaWps: diagnostic.speakingRateDeltaWps,
           speechCutoffRiskBefore: diagnostic.speechCutoffRiskBefore,
@@ -3478,6 +3857,7 @@ function describeSeamFailure({
   spectralDifferenceScore,
   speakingRateDeltaWps,
   toneMismatchScore,
+  edgeToneMismatchScore,
   speechCutoffRiskBefore,
   speechCutoffRiskAfter
 }: {
@@ -3489,6 +3869,7 @@ function describeSeamFailure({
   spectralDifferenceScore: number | null;
   speakingRateDeltaWps: number | null;
   toneMismatchScore: number;
+  edgeToneMismatchScore: number;
   speechCutoffRiskBefore: boolean;
   speechCutoffRiskAfter: boolean;
 }): string {
@@ -3516,6 +3897,10 @@ function describeSeamFailure({
 
   if (toneMismatchScore > SEGMENT_TONE_MISMATCH_WARNING) {
     reasons.push(`tone-score-${toneMismatchScore.toFixed(2)}`);
+  }
+
+  if (edgeToneMismatchScore > SEGMENT_EDGE_TONE_MISMATCH_WARNING) {
+    reasons.push(`edge-tone-${edgeToneMismatchScore.toFixed(2)}`);
   }
 
   if (
@@ -3652,6 +4037,72 @@ function parseNullableFiniteNumber(value: string | undefined): number | null {
 
 function roundToTwoDecimals(value: number): number {
   return Number(value.toFixed(2));
+}
+
+function roundToThreeDecimals(value: number): number {
+  return Number(value.toFixed(3));
+}
+
+function nullEdgeToneBandMetrics(): EdgeToneBandMetrics {
+  return {
+    lowDb: null,
+    midDb: null,
+    highDb: null
+  };
+}
+
+function computeNullableAbsDelta(previous: number | null, next: number | null): number | null {
+  if (previous === null || next === null) {
+    return null;
+  }
+
+  return roundToTwoDecimals(Math.abs(next - previous));
+}
+
+function computePositiveDelta(next: number | null, previous: number | null): number | null {
+  if (next === null || previous === null) {
+    return null;
+  }
+
+  return roundToTwoDecimals(Math.max(0, next - previous));
+}
+
+function averageNullableNumbers(values: Array<number | null>): number | null {
+  const finiteValues = values.filter((value): value is number => value !== null && Number.isFinite(value));
+
+  if (finiteValues.length === 0) {
+    return null;
+  }
+
+  return roundToTwoDecimals(
+    finiteValues.reduce((total, value) => total + value, 0) / finiteValues.length
+  );
+}
+
+function edgeToneBandFilter(lowFrequency: number, highFrequency: number): string {
+  return `highpass=f=${lowFrequency},lowpass=f=${highFrequency},astats=metadata=0:reset=0`;
+}
+
+function scoreAcousticTrimCandidate(
+  candidate: Omit<AcousticTrimSearchCandidate, "score" | "selected">
+): number {
+  const combinedRmsDb = candidate.combinedRmsDb ?? -20;
+  const afterRmsDb = candidate.afterRmsDb ?? -20;
+  const beforeRmsDb = candidate.beforeRmsDb ?? -20;
+  const offsetMagnitude = Math.abs(candidate.offsetSeconds);
+  const speechOnsetPenalty = Math.max(0, afterRmsDb + 30) * 0.9;
+  const cutoffPenalty = Math.max(0, beforeRmsDb + 24) * 0.35;
+  const lateCutPenalty = Math.max(0, candidate.offsetSeconds - 0.22) * 10;
+  const earlyDuplicatePenalty = Math.max(0, -candidate.offsetSeconds - 0.22) * 4;
+
+  return roundToTwoDecimals(
+    combinedRmsDb +
+      offsetMagnitude * 2.5 +
+      speechOnsetPenalty +
+      cutoffPenalty +
+      lateCutPenalty +
+      earlyDuplicatePenalty
+  );
 }
 
 function bucketShortTermSamples(

@@ -21,6 +21,8 @@ import {
   buildTranscodeArgs,
   canLinearLoudnormEngage,
   collectSegmentDiagnosticsWarnings,
+  computeEdgeToneDelta,
+  computeEdgeToneMismatchScore,
   computeMultiTakeCandidatePenalty,
   computeSegmentDriftCorrectionDb,
   computeSegmentLevelingGainDb,
@@ -44,6 +46,7 @@ import {
   TRIM_SILENCE_FILTER,
   VOLUME_BOOST_SETTINGS,
   scoreMultiTakePath,
+  selectBestAcousticTrimSearchCandidate,
   selectSeamRegenerationTargets,
   selectBestMultiTakePath,
   summarizeFfmpegStderr,
@@ -637,6 +640,121 @@ test("tonal seam scoring can fail a mechanically clean boundary", () => {
   assert.ok(warnings.some((warning) => warning.code === "tonal-mismatch"));
 });
 
+test("edge-tone scoring favors perceptual continuity across clean seams", () => {
+  const delta = computeEdgeToneDelta(
+    { lowDb: -32, midDb: -36, highDb: -50 },
+    { lowDb: -31, midDb: -28, highDb: -37 }
+  );
+  const edgeToneScore = computeEdgeToneMismatchScore(delta);
+  const toneScore = computeToneMismatchScore({
+    spectralDifferenceScore: null,
+    speakingRateDeltaWps: null,
+    edgeToneMismatchScore: edgeToneScore
+  });
+
+  assert.equal(delta.highDeltaDb, 13);
+  assert.equal(delta.brightnessExcessDb, 13);
+  assert.ok(edgeToneScore > 8, `expected edge-tone mismatch, got ${edgeToneScore}`);
+  assert.ok(toneScore > SEGMENT_TONE_MISMATCH_WARNING);
+
+  const boundaries = buildSegmentBoundaryDiagnostics(
+    [
+      makeSegmentMetrics({
+        durationSeconds: 90,
+        firstWindowLoudness: -18,
+        lastWindowLoudness: -18,
+        lastTwoSecondEdgeTone: { lowDb: -32, midDb: -36, highDb: -50 }
+      }),
+      makeSegmentMetrics({
+        durationSeconds: 90,
+        firstWindowLoudness: -18,
+        lastWindowLoudness: -18,
+        firstTwoSecondEdgeTone: { lowDb: -31, midDb: -28, highDb: -37 }
+      })
+    ],
+    [0.22],
+    undefined,
+    undefined,
+    {
+      wordCounts: [230, 230],
+      toneSeamScoringEnabled: true
+    }
+  );
+
+  assert.equal(boundaries[0].seamFailureKind, "tonal");
+  assert.equal(boundaries[0].edgeToneDelta.highDeltaDb, 13);
+  assert.ok(boundaries[0].edgeToneMismatchScore > 8);
+});
+
+test("acoustic trim search chooses a quiet valley near the estimate", () => {
+  const result = selectBestAcousticTrimSearchCandidate({
+    estimatedTrimSeconds: 1,
+    searchRadiusSeconds: 0.4,
+    candidates: [
+      {
+        trimSeconds: 0.6,
+        offsetSeconds: -0.4,
+        beforeRmsDb: -42,
+        afterRmsDb: -18,
+        combinedRmsDb: -30
+      },
+      {
+        trimSeconds: 1,
+        offsetSeconds: 0,
+        beforeRmsDb: -37,
+        afterRmsDb: -38,
+        combinedRmsDb: -37.5
+      },
+      {
+        trimSeconds: 1.4,
+        offsetSeconds: 0.4,
+        beforeRmsDb: -44,
+        afterRmsDb: -20,
+        combinedRmsDb: -32
+      }
+    ]
+  });
+
+  assert.equal(result.selectedTrimSeconds, 1);
+  assert.equal(result.candidates.filter((candidate) => candidate.selected).length, 1);
+});
+
+test("tonal entry smoothing is right-side only and hard capped", () => {
+  const boundaries = buildSegmentBoundaryDiagnostics(
+    [
+      makeSegmentMetrics({
+        durationSeconds: 20,
+        firstWindowLoudness: -18,
+        lastWindowLoudness: -18,
+        lastTwoSecondEdgeTone: { lowDb: -32, midDb: -37, highDb: -52 }
+      }),
+      makeSegmentMetrics({
+        durationSeconds: 20,
+        firstWindowLoudness: -17.8,
+        lastWindowLoudness: -18,
+        firstTwoSecondEdgeTone: { lowDb: -31, midDb: -27, highDb: -36 }
+      })
+    ],
+    [0.22],
+    undefined,
+    undefined,
+    {
+      wordCounts: [230, 230],
+      toneSeamScoringEnabled: true
+    }
+  );
+  const adjustments = computeSegmentSeamAdjustments(boundaries, 2);
+
+  assert.equal(adjustments[0].entrySmoothingCutDb, 0);
+  assert.ok(adjustments[1].entrySmoothingCutDb > 0);
+  assert.ok(adjustments[1].entrySmoothingCutDb <= 1.25);
+  assert.equal(adjustments[1].entrySmoothingBoundaryIndex, 1);
+
+  const filter = buildSegmentSeamAdjustmentFilter(adjustments[1], 20);
+  assert.match(filter ?? "", /1\.50/);
+  assert.match(filter ?? "", /alimiter=limit=/);
+});
+
 test("boundary-aware edge adjustments attenuate the louder side of a seam", () => {
   const boundaries = buildSegmentBoundaryDiagnostics(
     [
@@ -718,12 +836,31 @@ test("segmented diagnostics manifest keeps metrics and gain shape serializable",
         contextFallbackUsed: false,
         contextAudioTrimmed: true,
         contextAudioTrimSeconds: 1.25,
+        contextAudioTrimEstimatedSeconds: 1.1,
+        contextAudioTrimSearch: {
+          estimatedTrimSeconds: 1.1,
+          selectedTrimSeconds: 1.25,
+          searchRadiusSeconds: 0.4,
+          candidates: [
+            {
+              trimSeconds: 1.25,
+              offsetSeconds: 0.15,
+              beforeRmsDb: -38,
+              afterRmsDb: -39,
+              combinedRmsDb: -38.5,
+              score: -38.13,
+              selected: true
+            }
+          ]
+        },
         rawMetrics: metrics,
         standardizedMetrics: metrics,
         leveledMetrics: metrics,
         appliedGainDb: 1.25,
         driftCorrectionDb: 3.5,
-        levelingFilter: buildSegmentLevelingFilter(SEGMENT_LEVELING_SETTINGS, 1.25)
+        levelingFilter: buildSegmentLevelingFilter(SEGMENT_LEVELING_SETTINGS, 1.25),
+        seamEntrySmoothingCutDb: 0.75,
+        seamEntrySmoothingReason: "boundary-1-kind-tonal"
       }
     ],
     boundaries: [],
@@ -746,6 +883,9 @@ test("segmented diagnostics manifest keeps metrics and gain shape serializable",
   assert.equal(serialized.segments[0].contextLikelySpoken, false);
   assert.equal(serialized.segments[0].contextAudioTrimmed, true);
   assert.equal(serialized.segments[0].contextAudioTrimSeconds, 1.25);
+  assert.equal(serialized.segments[0].contextAudioTrimEstimatedSeconds, 1.1);
+  assert.equal(serialized.segments[0].contextAudioTrimSearch?.selectedTrimSeconds, 1.25);
+  assert.equal(serialized.segments[0].seamEntrySmoothingCutDb, 0.75);
   assert.equal(serialized.segments[0].appliedGainDb, 1.25);
   assert.equal(serialized.segments[0].driftCorrectionDb, 3.5);
   assert.equal(serialized.segments[0].leveledMetrics.firstWindowLoudness, -18.2);
@@ -784,6 +924,8 @@ test("multi-take pairwise seam matrix records every candidate pair per boundary"
   assert.equal(matrix.length, 1);
   assert.equal(matrix[0].boundaryIndex, 1);
   assert.equal(matrix[0].scores.length, 4);
+  assert.ok(matrix[0].scores.every((score) => score.edgeToneDelta !== undefined));
+  assert.ok(matrix[0].scores.every((score) => score.edgeToneMismatchScore >= 0));
   assert.ok(
     matrix[0].scores.some(
       (score) => score.leftCandidateIndex === 1 && score.rightCandidateIndex === 1
@@ -968,6 +1110,8 @@ function makeMultiTakeOptimizationManifest(): MultiTakeOptimizationManifest {
           contextFallbackUsed: false,
           contextAudioTrimmed: false,
           contextAudioTrimSeconds: null,
+          contextAudioTrimEstimatedSeconds: null,
+          contextAudioTrimSearch: null,
           leveledMetrics: makeSegmentMetrics({
             durationSeconds: 10,
             firstWindowLoudness: -18,
@@ -1023,6 +1167,18 @@ function makeSyntheticPairwiseBoundary(
         rmsDeltaDb: null,
         gapDurationMs: 220,
         spectralDifferenceScore: null,
+        previousEdgeTone: { lowDb: null, midDb: null, highDb: null },
+        nextEdgeTone: { lowDb: null, midDb: null, highDb: null },
+        edgeToneDelta: {
+          lowDeltaDb: null,
+          midDeltaDb: null,
+          highDeltaDb: null,
+          averageDeltaDb: null,
+          weightedDeltaDb: null,
+          brightnessExcessDb: null,
+          presenceExcessDb: null
+        },
+        edgeToneMismatchScore: 0,
         toneMismatchScore: 0,
         speakingRateDeltaWps: null,
         speechCutoffRiskBefore: false,
@@ -1039,13 +1195,17 @@ function makeSegmentMetrics({
   firstWindowLoudness,
   lastWindowLoudness,
   firstTwoSecondZeroCrossingRate = 0.12,
-  lastTwoSecondZeroCrossingRate = 0.12
+  lastTwoSecondZeroCrossingRate = 0.12,
+  firstTwoSecondEdgeTone = { lowDb: -32, midDb: -34, highDb: -45 },
+  lastTwoSecondEdgeTone = { lowDb: -32, midDb: -34, highDb: -45 }
 }: {
   durationSeconds: number;
   firstWindowLoudness: number;
   lastWindowLoudness: number;
   firstTwoSecondZeroCrossingRate?: number;
   lastTwoSecondZeroCrossingRate?: number;
+  firstTwoSecondEdgeTone?: SegmentAudioMetrics["firstTwoSecondEdgeTone"];
+  lastTwoSecondEdgeTone?: SegmentAudioMetrics["lastTwoSecondEdgeTone"];
 }): SegmentAudioMetrics {
   const internalDriftLufs = Number(
     Math.abs(lastWindowLoudness - firstWindowLoudness).toFixed(2)
@@ -1071,6 +1231,8 @@ function makeSegmentMetrics({
     lastTwoSecondPeakDb: -3,
     firstTwoSecondZeroCrossingRate,
     lastTwoSecondZeroCrossingRate,
+    firstTwoSecondEdgeTone,
+    lastTwoSecondEdgeTone,
     leadingEdgeRmsDb: -45,
     trailingEdgeRmsDb: -45,
     leadingSpeechCutoffRisk: false,

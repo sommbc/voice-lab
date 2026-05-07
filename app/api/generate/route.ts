@@ -28,6 +28,7 @@ import {
   persistAudioDebugArtifact,
   resolveMasteringStrategy,
   resolveMultiTakeCount,
+  selectAcousticTrimPoint,
   selectSeamRegenerationTargets,
   selectBestMultiTakePath,
   SEGMENT_LEVELING_SETTINGS,
@@ -1316,13 +1317,22 @@ async function generateAndProcessSegment({
   let contextFallbackUsed = false;
   let contextAudioTrimmed = false;
   let contextAudioTrimSeconds: number | null = null;
+  let contextAudioTrimEstimatedSeconds: number | null = null;
+  let contextAudioTrimSearch: Awaited<ReturnType<typeof selectAcousticTrimPoint>> | null = null;
 
   if (spokenOverlapInput && rawMetrics.durationSeconds !== null) {
-    const trimSeconds = estimateContextAudioTrimSeconds({
+    const estimatedTrimSeconds = estimateContextAudioTrimSeconds({
       durationSeconds: rawMetrics.durationSeconds,
       contextWordCount: spokenOverlapInput.contextWordCount,
       targetWordCount: segment.wordCount
     });
+    contextAudioTrimEstimatedSeconds = estimatedTrimSeconds;
+    contextAudioTrimSearch = await selectAcousticTrimPoint({
+      inputPath: rawSegmentPath,
+      durationSeconds: rawMetrics.durationSeconds,
+      estimatedTrimSeconds
+    });
+    const trimSeconds = contextAudioTrimSearch.selectedTrimSeconds;
     const trimmedPath = path.join(
       tempDirectoryPath,
       `segment-${segmentId}${attemptSuffix}-raw-context-trimmed.wav`
@@ -1371,6 +1381,8 @@ async function generateAndProcessSegment({
       contextFallbackUsed = true;
       contextAudioTrimmed = false;
       contextAudioTrimSeconds = null;
+      contextAudioTrimEstimatedSeconds = null;
+      contextAudioTrimSearch = null;
     }
   } else if (contextLikelySpoken) {
     console.warn(
@@ -1451,7 +1463,9 @@ async function generateAndProcessSegment({
     outputPath: leveledSegmentPath,
     metrics: standardizedMetrics
   });
-  const leveledMetrics = await measureSegmentAudioFile(leveledSegmentPath);
+  const leveledMetrics = await measureSegmentAudioFile(leveledSegmentPath, {
+    includeEdgeTone: true
+  });
 
   if (debugArtifactDirectoryPath) {
     await persistSegmentDebugArtifact({
@@ -1481,6 +1495,8 @@ async function generateAndProcessSegment({
       contextFallbackUsed,
       contextAudioTrimmed,
       contextAudioTrimSeconds,
+      contextAudioTrimEstimatedSeconds,
+      contextAudioTrimSearch,
       regenerationReason,
       rawMetrics,
       standardizedMetrics,
@@ -1583,6 +1599,8 @@ async function regenerateFailedSeams({
             rmsDeltaDb: boundary.rmsDeltaDb,
             gapDurationMs: boundary.gapDurationMs,
             spectralDifferenceScore: boundary.spectralDifferenceScore,
+            edgeToneMismatchScore: boundary.edgeToneMismatchScore,
+            edgeToneDelta: boundary.edgeToneDelta,
             speakingRateDeltaWps: boundary.speakingRateDeltaWps,
             toneMismatchScore: boundary.toneMismatchScore
           }))
@@ -1976,7 +1994,10 @@ async function applyBoundaryAwareSeamAdjustments({
 }): Promise<SegmentBoundaryDiagnostic[]> {
   const adjustments = computeSegmentSeamAdjustments(boundaryDiagnostics, processedSegments.length);
   const actionableAdjustments = adjustments.filter(
-    (adjustment) => adjustment.startCutDb >= 0.05 || adjustment.endCutDb >= 0.05
+    (adjustment) =>
+      adjustment.startCutDb >= 0.05 ||
+      adjustment.endCutDb >= 0.05 ||
+      adjustment.entrySmoothingCutDb >= 0.05
   );
 
   if (actionableAdjustments.length === 0) {
@@ -1990,7 +2011,10 @@ async function applyBoundaryAwareSeamAdjustments({
       adjustments: actionableAdjustments.map((adjustment) => ({
         segmentIndex: adjustment.segmentIndex,
         startCutDb: adjustment.startCutDb,
-        endCutDb: adjustment.endCutDb
+        endCutDb: adjustment.endCutDb,
+        entrySmoothingCutDb: adjustment.entrySmoothingCutDb,
+        entrySmoothingBoundaryIndex: adjustment.entrySmoothingBoundaryIndex,
+        entrySmoothingReason: adjustment.entrySmoothingReason
       }))
     })
   );
@@ -2017,11 +2041,17 @@ async function applyBoundaryAwareSeamAdjustments({
       durationSeconds
     });
 
-    const adjustedMetrics = await measureSegmentAudioFile(adjustedPath);
+    const adjustedMetrics = await measureSegmentAudioFile(adjustedPath, {
+      includeEdgeTone: true
+    });
     processedSegment.leveledSegmentPath = adjustedPath;
     processedSegment.manifestSegment.leveledMetrics = adjustedMetrics;
     processedSegment.manifestSegment.seamStartCutDb = adjustment.startCutDb;
     processedSegment.manifestSegment.seamEndCutDb = adjustment.endCutDb;
+    processedSegment.manifestSegment.seamEntrySmoothingCutDb =
+      adjustment.entrySmoothingCutDb;
+    processedSegment.manifestSegment.seamEntrySmoothingReason =
+      adjustment.entrySmoothingReason;
     processedSegment.manifestSegment.seamAdjustmentFilter = filter;
 
     if (debugArtifactDirectoryPath) {
@@ -2035,7 +2065,7 @@ async function applyBoundaryAwareSeamAdjustments({
     }
   }
 
-  return buildCurrentBoundaryDiagnostics({
+  const adjustedDiagnostics = buildCurrentBoundaryDiagnostics({
     processedSegments,
     joinPlan,
     segments,
@@ -2055,6 +2085,34 @@ async function applyBoundaryAwareSeamAdjustments({
         ])
     )
   });
+  hydrateEntrySmoothingDiagnostics(adjustedDiagnostics, adjustments);
+  return adjustedDiagnostics;
+}
+
+function hydrateEntrySmoothingDiagnostics(
+  diagnostics: SegmentBoundaryDiagnostic[],
+  adjustments: ReturnType<typeof computeSegmentSeamAdjustments>
+): void {
+  for (const adjustment of adjustments) {
+    if (
+      adjustment.entrySmoothingBoundaryIndex === null ||
+      adjustment.entrySmoothingCutDb < 0.05
+    ) {
+      continue;
+    }
+
+    const boundary = diagnostics.find(
+      (entry) => entry.boundaryIndex === adjustment.entrySmoothingBoundaryIndex
+    );
+
+    if (!boundary) {
+      continue;
+    }
+
+    boundary.entrySmoothingApplied = true;
+    boundary.entrySmoothingCutDb = adjustment.entrySmoothingCutDb;
+    boundary.entrySmoothingReason = adjustment.entrySmoothingReason;
+  }
 }
 
 async function optimizeMultiTakeSegments({
@@ -2190,7 +2248,11 @@ function buildMultiTakeOptimizationForCandidateGroups({
         contextFallbackUsed: candidate.processedSegment.manifestSegment.contextFallbackUsed,
         contextAudioTrimmed: candidate.processedSegment.manifestSegment.contextAudioTrimmed,
         contextAudioTrimSeconds:
-          candidate.processedSegment.manifestSegment.contextAudioTrimSeconds
+          candidate.processedSegment.manifestSegment.contextAudioTrimSeconds,
+        contextAudioTrimEstimatedSeconds:
+          candidate.processedSegment.manifestSegment.contextAudioTrimEstimatedSeconds,
+        contextAudioTrimSearch:
+          candidate.processedSegment.manifestSegment.contextAudioTrimSearch
       })
     )
   );
@@ -2270,6 +2332,9 @@ function buildMultiTakeOptimizationManifest({
           contextFallbackUsed: manifestSegment.contextFallbackUsed,
           contextAudioTrimmed: manifestSegment.contextAudioTrimmed,
           contextAudioTrimSeconds: manifestSegment.contextAudioTrimSeconds,
+          contextAudioTrimEstimatedSeconds:
+            manifestSegment.contextAudioTrimEstimatedSeconds ?? null,
+          contextAudioTrimSearch: manifestSegment.contextAudioTrimSearch ?? null,
           leveledMetrics: manifestSegment.leveledMetrics
         };
       })
