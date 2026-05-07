@@ -6,7 +6,7 @@ Private tool for converting pasted long-form text into one narration file using 
 
 - Continuous Read is the default path for long-form essays.
 - The app cleans the full document, sends one Mistral TTS request first, then applies final mastering to the completed file before delivery.
-- If the full-document request fails for a chunking-worthy reason, the app falls back to segmented generation, optional join smoothing, merge, and final mastering.
+- If the full-document request fails for a chunking-worthy reason, the app falls back to deterministic segmented generation: smaller Mistral-safe chunks, WAV standardization, per-segment static loudness leveling, bounded fade-down correction, join smoothing, WAV merge, and gentle final mastering.
 - Advanced controls can force segmented generation directly when needed.
 
 ## Running locally
@@ -25,6 +25,7 @@ npm test
 npx tsc --noEmit
 npm run build
 npm run analyze-audio -- ./path/to/file.mp3
+npm run segmented-ab -- ./path/to/long-form-essay.md
 ```
 
 ## Environment variables
@@ -40,6 +41,6 @@ VOICEOVER_MASTERING_STRATEGY
 
 Optional server-only audio diagnostics:
 
-- `VOICEOVER_DEBUG_AUDIO=true` keeps raw, pre-master, final, and speech-leveler debug artifacts under `/tmp` and logs file references server-side only.
+- `VOICEOVER_DEBUG_AUDIO=true` keeps raw, standardized, leveled, merged pre-master, final, seam-clip, and manifest debug artifacts under `/tmp` and logs file references server-side only.
 - `VOICEOVER_MASTERING_STRATEGY=static` keeps the current static chain as the default.
 - `VOICEOVER_MASTERING_STRATEGY=speech-leveler` enables the speech-leveler mastering experiment.

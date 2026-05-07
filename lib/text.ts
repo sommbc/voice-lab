@@ -1,6 +1,6 @@
-const DEFAULT_TARGET_MIN_WORDS = 350;
-const DEFAULT_TARGET_MAX_WORDS = 600;
-const DEFAULT_HARD_MAX_WORDS = 650;
+export const DEFAULT_TARGET_MIN_WORDS = 220;
+export const DEFAULT_TARGET_MAX_WORDS = 280;
+export const DEFAULT_HARD_MAX_WORDS = 295;
 
 const sentenceSegmenter =
   typeof Intl !== "undefined" && "Segmenter" in Intl

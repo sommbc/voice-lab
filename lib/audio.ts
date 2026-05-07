@@ -52,6 +52,16 @@ type LoudnormStats = {
   normalization_type?: string;
 };
 
+export type SegmentLevelingSettings = {
+  integratedLoudness: number;
+  truePeak: number;
+  limiter: number;
+  maxBoostDb: number;
+  maxCutDb: number;
+  maxDriftCorrectionDb: number;
+  driftCorrectionThresholdLufs: number;
+};
+
 export type AudioLoudnessMetrics = {
   integratedLoudness: number | null;
   truePeak: number | null;
@@ -81,11 +91,83 @@ export type AudioLoudnessJump = {
 };
 
 export type AudioLoudnessTimeline = {
+  durationSeconds: number | null;
   integratedLoudness: number | null;
   truePeak: number | null;
   loudnessRange: number | null;
   shortTermByTimestamp: AudioLoudnessTimelinePoint[];
   largestJumps: AudioLoudnessJump[];
+};
+
+export type SegmentAudioMetrics = {
+  durationSeconds: number | null;
+  integratedLoudness: number | null;
+  truePeak: number | null;
+  maxVolume: number | null;
+  loudnessRange: number | null;
+  shortTermByTimestamp: AudioLoudnessTimelinePoint[];
+  firstWindowLoudness: number | null;
+  lastWindowLoudness: number | null;
+  largestInternalJump: AudioLoudnessJump | null;
+  internalDriftLufs: number | null;
+};
+
+export type SegmentLevelingResult = {
+  appliedGainDb: number;
+  driftCorrectionDb: number;
+  filter: string;
+};
+
+export type SegmentBoundaryDiagnostic = {
+  boundaryIndex: number;
+  previousSegmentIndex: number;
+  nextSegmentIndex: number;
+  boundaryTimestampSeconds: number | null;
+  nextSpeechTimestampSeconds: number | null;
+  beforeLoudness: number | null;
+  afterLoudness: number | null;
+  deltaLufs: number | null;
+  exceedsThreshold: boolean;
+  nearBoundaryJumpLufs: number | null;
+  nearBoundaryJumpExceedsThreshold: boolean;
+};
+
+export type SegmentDiagnosticsWarning = {
+  code:
+    | "boundary-delta"
+    | "near-boundary-jump"
+    | "segment-internal-drift"
+    | "final-true-peak"
+    | "final-metrics-missing";
+  message: string;
+  segmentIndex?: number;
+  boundaryIndex?: number;
+  value?: number;
+  threshold?: number;
+};
+
+export type SegmentDiagnosticsManifestSegment = {
+  segmentIndex: number;
+  wordCount: number;
+  rawMetrics: SegmentAudioMetrics;
+  standardizedMetrics: SegmentAudioMetrics;
+  leveledMetrics: SegmentAudioMetrics;
+  appliedGainDb: number;
+  driftCorrectionDb: number;
+  levelingFilter: string;
+};
+
+export type SegmentDiagnosticsManifest = {
+  version: 1;
+  createdAt: string;
+  totalSegments: number;
+  smoothJoins: boolean;
+  joinPauseMs: number;
+  segmentLeveling: SegmentLevelingSettings;
+  segments: SegmentDiagnosticsManifestSegment[];
+  boundaries: SegmentBoundaryDiagnostic[];
+  warnings: SegmentDiagnosticsWarning[];
+  finalMetrics: AudioLoudnessMetrics | null;
 };
 
 export const DEFAULT_OUTPUT_FORMAT: OutputFormat = "mp3";
@@ -97,6 +179,9 @@ export const STANDARD_INTERMEDIATE_SAMPLE_RATE = 24_000;
 export const STANDARD_INTERMEDIATE_CHANNELS = 1;
 export const TRIM_SILENCE_FILTER =
   "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB:start_silence=0.04:detection=rms,areverse,silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB:start_silence=0.08:detection=rms,areverse";
+export const SEGMENT_EDGE_FADE_FILTER =
+  "afade=t=in:st=0:d=0.006,areverse,afade=t=in:st=0:d=0.006,areverse";
+export const SEGMENT_STANDARDIZATION_FILTER = `${TRIM_SILENCE_FILTER},${SEGMENT_EDGE_FADE_FILTER}`;
 export const LOUDNORM_FILTER =
   "loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.841:level=disabled";
 export const SPEECH_PREMASTER_FILTER =
@@ -104,6 +189,18 @@ export const SPEECH_PREMASTER_FILTER =
 export const SPEECH_LEVELER_PREMASTER_FILTER = "highpass=f=70";
 export const SPEECH_LEVELER_FILTER =
   "speechnorm=peak=0.9:expansion=1.4:compression=2:raise=0.0005:fall=0.00015:link=1,acompressor=threshold=0.125:ratio=1.35:attack=8:release=140:makeup=1.25";
+export const SEGMENT_LEVELING_SETTINGS: SegmentLevelingSettings = {
+  integratedLoudness: -18,
+  truePeak: -1,
+  limiter: getLimiterLimit(-1),
+  maxBoostDb: 8,
+  maxCutDb: 8,
+  maxDriftCorrectionDb: 10,
+  driftCorrectionThresholdLufs: 2
+};
+export const SEGMENT_BOUNDARY_DELTA_WARNING_LU = 2;
+export const SEGMENT_NEAR_BOUNDARY_JUMP_WARNING_LU = 3;
+export const SEGMENT_INTERNAL_DRIFT_WARNING_LU = 4;
 const PREMASTER_INTERMEDIATE_SAMPLE_RATE = 24_000;
 const PREMASTER_INTERMEDIATE_CHANNELS = 1;
 const LINEAR_LOUDNORM_HEADROOM_DB = 0.2;
@@ -319,6 +416,110 @@ export async function transcodeAudioFile({
     {
       stage: stage ?? (applyLoudnorm ? "final-normalization" : "encoding")
     }
+  );
+
+  await assertAudioFileReady(outputPath);
+}
+
+export async function standardizeSegmentAudioFile({
+  inputPath,
+  outputPath
+}: {
+  inputPath: string;
+  outputPath: string;
+}): Promise<void> {
+  await assertAudioFileReady(inputPath);
+
+  await runFfmpeg(buildSegmentStandardizationArgs({ inputPath, outputPath }), {
+    stage: "segment-normalization"
+  });
+
+  await assertAudioFileReady(outputPath);
+}
+
+export async function levelSegmentAudioFile({
+  inputPath,
+  outputPath,
+  metrics,
+  settings = SEGMENT_LEVELING_SETTINGS
+}: {
+  inputPath: string;
+  outputPath: string;
+  metrics: Pick<
+    SegmentAudioMetrics,
+    | "durationSeconds"
+    | "integratedLoudness"
+    | "truePeak"
+    | "firstWindowLoudness"
+    | "lastWindowLoudness"
+  >;
+  settings?: SegmentLevelingSettings;
+}): Promise<SegmentLevelingResult> {
+  await assertAudioFileReady(inputPath);
+
+  const appliedGainDb = computeSegmentLevelingGainDb(settings, metrics);
+  const driftCorrectionDb = computeSegmentDriftCorrectionDb(settings, metrics);
+  const filter = buildSegmentLevelingFilter(
+    settings,
+    appliedGainDb,
+    driftCorrectionDb,
+    metrics.durationSeconds
+  );
+
+  await runFfmpeg(
+    buildSegmentLevelingArgs({
+      inputPath,
+      outputPath,
+      filter
+    }),
+    { stage: "segment-normalization" }
+  );
+
+  await assertAudioFileReady(outputPath);
+
+  return {
+    appliedGainDb,
+    driftCorrectionDb,
+    filter
+  };
+}
+
+export async function extractAudioClip({
+  inputPath,
+  outputPath,
+  startSeconds,
+  durationSeconds,
+  outputFormat = "wav"
+}: {
+  inputPath: string;
+  outputPath: string;
+  startSeconds: number;
+  durationSeconds: number;
+  outputFormat?: OutputFormat;
+}): Promise<void> {
+  await assertAudioFileReady(inputPath);
+
+  const start = Math.max(0, startSeconds);
+  const duration = Math.max(0.1, durationSeconds);
+
+  await runFfmpeg(
+    [
+      "-y",
+      "-ss",
+      start.toFixed(3),
+      "-t",
+      duration.toFixed(3),
+      "-i",
+      inputPath,
+      "-vn",
+      "-ac",
+      String(STANDARD_INTERMEDIATE_CHANNELS),
+      "-ar",
+      String(STANDARD_INTERMEDIATE_SAMPLE_RATE),
+      ...getCodecArgs(outputFormat),
+      outputPath
+    ],
+    { stage: "encoding" }
   );
 
   await assertAudioFileReady(outputPath);
@@ -1066,6 +1267,70 @@ export async function measureAudioFile(inputPath: string): Promise<AudioLoudness
   throw new Error(`Unable to measure loudness for ${path.basename(inputPath)}.`);
 }
 
+export async function measureSegmentAudioFile(inputPath: string): Promise<SegmentAudioMetrics> {
+  await assertAudioFileReady(inputPath);
+
+  const timeline = await analyzeAudioFileOverTime(inputPath).catch((error) => {
+    console.warn(
+      "[segment-metrics] ebur128 analysis unavailable",
+      JSON.stringify({
+        filePath: inputPath,
+        reason: error instanceof Error ? error.message : "Unknown segment analysis failure."
+      })
+    );
+    return null;
+  });
+  const hasEbur128Loudness =
+    timeline?.integratedLoudness !== null &&
+    timeline?.integratedLoudness !== undefined &&
+    timeline?.truePeak !== null &&
+    timeline?.truePeak !== undefined;
+  const fallbackMetrics =
+    hasEbur128Loudness
+      ? null
+      : await measureAudioFile(inputPath).catch((error) => {
+          console.warn(
+            "[segment-metrics] loudnorm fallback unavailable",
+            JSON.stringify({
+              filePath: inputPath,
+              reason: error instanceof Error ? error.message : "Unknown segment measurement failure."
+            })
+          );
+          return null;
+        });
+  const maxVolume = await measureMaxVolume(inputPath).catch((error) => {
+    console.warn(
+      "[segment-metrics] max volume unavailable",
+      JSON.stringify({
+        filePath: inputPath,
+        reason: error instanceof Error ? error.message : "Unknown max-volume measurement failure."
+      })
+    );
+    return null;
+  });
+  const shortTermByTimestamp = timeline?.shortTermByTimestamp ?? [];
+  const firstWindowLoudness = shortTermByTimestamp[0]?.shortTermLufs ?? null;
+  const lastWindowLoudness = shortTermByTimestamp.at(-1)?.shortTermLufs ?? null;
+  const largestInternalJump = timeline?.largestJumps[0] ?? null;
+  const internalDriftLufs =
+    firstWindowLoudness === null || lastWindowLoudness === null
+      ? null
+      : roundToTwoDecimals(Math.abs(lastWindowLoudness - firstWindowLoudness));
+
+  return {
+    durationSeconds: timeline?.durationSeconds ?? null,
+    integratedLoudness: timeline?.integratedLoudness ?? fallbackMetrics?.integratedLoudness ?? null,
+    truePeak: timeline?.truePeak ?? fallbackMetrics?.truePeak ?? null,
+    maxVolume: maxVolume ?? fallbackMetrics?.maxVolume ?? null,
+    loudnessRange: timeline?.loudnessRange ?? null,
+    shortTermByTimestamp,
+    firstWindowLoudness,
+    lastWindowLoudness,
+    largestInternalJump,
+    internalDriftLufs
+  };
+}
+
 export async function analyzeAudioFileOverTime(
   inputPath: string,
   {
@@ -1190,6 +1455,7 @@ export function parseEbur128Analysis(
   const shortTermByTimestamp = bucketShortTermSamples(samples, bucketSeconds);
 
   return {
+    durationSeconds: parseDurationSeconds(output),
     integratedLoudness: parseSummaryMetric(
       output,
       /Summary:[\s\S]*?Integrated loudness:\s+I:\s*(-?(?:\d+(?:\.\d+)?|inf))\s+LUFS/i
@@ -1220,6 +1486,261 @@ export function formatAudioTimestamp(seconds: number): string {
   }
 
   return `${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
+export function buildSegmentStandardizationArgs({
+  inputPath,
+  outputPath
+}: {
+  inputPath: string;
+  outputPath: string;
+}): string[] {
+  return [
+    "-y",
+    "-i",
+    inputPath,
+    "-vn",
+    "-af",
+    SEGMENT_STANDARDIZATION_FILTER,
+    "-ac",
+    String(STANDARD_INTERMEDIATE_CHANNELS),
+    "-ar",
+    String(STANDARD_INTERMEDIATE_SAMPLE_RATE),
+    "-c:a",
+    "pcm_s16le",
+    outputPath
+  ];
+}
+
+export function buildSegmentLevelingArgs({
+  inputPath,
+  outputPath,
+  filter
+}: {
+  inputPath: string;
+  outputPath: string;
+  filter: string;
+}): string[] {
+  return [
+    "-y",
+    "-i",
+    inputPath,
+    "-vn",
+    "-af",
+    filter,
+    "-ac",
+    String(STANDARD_INTERMEDIATE_CHANNELS),
+    "-ar",
+    String(STANDARD_INTERMEDIATE_SAMPLE_RATE),
+    "-c:a",
+    "pcm_s16le",
+    outputPath
+  ];
+}
+
+export function buildSegmentLevelingFilter(
+  settings: SegmentLevelingSettings,
+  gainDb: number,
+  driftCorrectionDb = 0,
+  durationSeconds: number | null = null
+): string {
+  const filters: string[] = [];
+
+  if (Math.abs(gainDb) >= 0.05) {
+    filters.push(`volume=${gainDb.toFixed(2)}dB`);
+  }
+
+  if (
+    driftCorrectionDb >= 0.05 &&
+    durationSeconds !== null &&
+    Number.isFinite(durationSeconds) &&
+    durationSeconds > 0
+  ) {
+    const safeDurationSeconds = Math.max(0.1, durationSeconds);
+    filters.push(
+      `volume='if(isnan(t)\\,1\\,exp(log(10)*(${driftCorrectionDb.toFixed(
+        2
+      )}*t/${safeDurationSeconds.toFixed(2)})/20))':eval=frame`
+    );
+  }
+
+  filters.push(`alimiter=limit=${settings.limiter}:level=disabled`);
+  return filters.join(",");
+}
+
+export function computeSegmentLevelingGainDb(
+  settings: SegmentLevelingSettings,
+  metrics: Pick<SegmentAudioMetrics, "integratedLoudness" | "truePeak">
+): number {
+  const measuredLoudness = metrics.integratedLoudness;
+  const measuredTruePeak = metrics.truePeak;
+
+  if (
+    measuredLoudness === null ||
+    measuredTruePeak === null ||
+    !Number.isFinite(measuredLoudness) ||
+    !Number.isFinite(measuredTruePeak)
+  ) {
+    return 0;
+  }
+
+  const requiredGainDb = settings.integratedLoudness - measuredLoudness;
+  const boundedByGainRange =
+    requiredGainDb >= 0
+      ? Math.min(requiredGainDb, settings.maxBoostDb)
+      : Math.max(requiredGainDb, -settings.maxCutDb);
+
+  if (boundedByGainRange <= 0) {
+    return roundToTwoDecimals(boundedByGainRange);
+  }
+
+  const peakHeadroomDb = settings.truePeak - measuredTruePeak;
+  return roundToTwoDecimals(Math.max(0, Math.min(boundedByGainRange, peakHeadroomDb)));
+}
+
+export function computeSegmentDriftCorrectionDb(
+  settings: SegmentLevelingSettings,
+  metrics: Pick<SegmentAudioMetrics, "firstWindowLoudness" | "lastWindowLoudness">
+): number {
+  const firstWindowLoudness = metrics.firstWindowLoudness;
+  const lastWindowLoudness = metrics.lastWindowLoudness;
+
+  if (
+    firstWindowLoudness === null ||
+    lastWindowLoudness === null ||
+    !Number.isFinite(firstWindowLoudness) ||
+    !Number.isFinite(lastWindowLoudness)
+  ) {
+    return 0;
+  }
+
+  const fadeDownDb = firstWindowLoudness - lastWindowLoudness;
+
+  if (fadeDownDb <= settings.driftCorrectionThresholdLufs) {
+    return 0;
+  }
+
+  return roundToTwoDecimals(Math.min(fadeDownDb, settings.maxDriftCorrectionDb));
+}
+
+export function buildSegmentBoundaryDiagnostics(
+  segmentMetrics: SegmentAudioMetrics[],
+  pauseDurationSeconds = 0,
+  boundaryThresholdLufs = SEGMENT_BOUNDARY_DELTA_WARNING_LU,
+  nearBoundaryThresholdLufs = SEGMENT_NEAR_BOUNDARY_JUMP_WARNING_LU
+): SegmentBoundaryDiagnostic[] {
+  const diagnostics: SegmentBoundaryDiagnostic[] = [];
+  let segmentStartSeconds: number | null = 0;
+
+  for (let index = 0; index < segmentMetrics.length - 1; index += 1) {
+    const current = segmentMetrics[index];
+    const next = segmentMetrics[index + 1];
+    const boundaryTimestampSeconds: number | null =
+      segmentStartSeconds === null || current.durationSeconds === null
+        ? null
+        : roundToTwoDecimals(segmentStartSeconds + current.durationSeconds);
+    const nextSpeechTimestampSeconds: number | null =
+      boundaryTimestampSeconds === null
+        ? null
+        : roundToTwoDecimals(boundaryTimestampSeconds + pauseDurationSeconds);
+    const deltaLufs =
+      current.lastWindowLoudness === null || next.firstWindowLoudness === null
+        ? null
+        : roundToTwoDecimals(Math.abs(next.firstWindowLoudness - current.lastWindowLoudness));
+
+    diagnostics.push({
+      boundaryIndex: index + 1,
+      previousSegmentIndex: index + 1,
+      nextSegmentIndex: index + 2,
+      boundaryTimestampSeconds,
+      nextSpeechTimestampSeconds,
+      beforeLoudness: current.lastWindowLoudness,
+      afterLoudness: next.firstWindowLoudness,
+      deltaLufs,
+      exceedsThreshold: deltaLufs !== null && deltaLufs > boundaryThresholdLufs,
+      nearBoundaryJumpLufs: deltaLufs,
+      nearBoundaryJumpExceedsThreshold:
+        deltaLufs !== null && deltaLufs > nearBoundaryThresholdLufs
+    });
+
+    segmentStartSeconds =
+      nextSpeechTimestampSeconds === null ? null : nextSpeechTimestampSeconds;
+  }
+
+  return diagnostics;
+}
+
+export function collectSegmentDiagnosticsWarnings({
+  boundaries,
+  segmentMetrics,
+  finalMetrics,
+  finalTruePeakTarget
+}: {
+  boundaries: SegmentBoundaryDiagnostic[];
+  segmentMetrics: SegmentAudioMetrics[];
+  finalMetrics: AudioLoudnessMetrics | null;
+  finalTruePeakTarget: number;
+}): SegmentDiagnosticsWarning[] {
+  const warnings: SegmentDiagnosticsWarning[] = [];
+
+  for (const boundary of boundaries) {
+    if (boundary.deltaLufs !== null && boundary.deltaLufs > SEGMENT_BOUNDARY_DELTA_WARNING_LU) {
+      warnings.push({
+        code: "boundary-delta",
+        message: `Boundary ${boundary.boundaryIndex} loudness delta is ${boundary.deltaLufs.toFixed(
+          2
+        )} LU.`,
+        boundaryIndex: boundary.boundaryIndex,
+        value: boundary.deltaLufs,
+        threshold: SEGMENT_BOUNDARY_DELTA_WARNING_LU
+      });
+    }
+
+    if (
+      boundary.nearBoundaryJumpLufs !== null &&
+      boundary.nearBoundaryJumpLufs > SEGMENT_NEAR_BOUNDARY_JUMP_WARNING_LU
+    ) {
+      warnings.push({
+        code: "near-boundary-jump",
+        message: `Boundary ${boundary.boundaryIndex} near-boundary jump is ${boundary.nearBoundaryJumpLufs.toFixed(
+          2
+        )} LU.`,
+        boundaryIndex: boundary.boundaryIndex,
+        value: boundary.nearBoundaryJumpLufs,
+        threshold: SEGMENT_NEAR_BOUNDARY_JUMP_WARNING_LU
+      });
+    }
+  }
+
+  for (const [index, metrics] of segmentMetrics.entries()) {
+    if (metrics.internalDriftLufs !== null && metrics.internalDriftLufs > SEGMENT_INTERNAL_DRIFT_WARNING_LU) {
+      warnings.push({
+        code: "segment-internal-drift",
+        message: `Segment ${index + 1} internal drift is ${metrics.internalDriftLufs.toFixed(
+          2
+        )} LU.`,
+        segmentIndex: index + 1,
+        value: metrics.internalDriftLufs,
+        threshold: SEGMENT_INTERNAL_DRIFT_WARNING_LU
+      });
+    }
+  }
+
+  if (!finalMetrics || finalMetrics.truePeak === null) {
+    warnings.push({
+      code: "final-metrics-missing",
+      message: "Final true-peak metrics are missing."
+    });
+  } else if (finalMetrics.truePeak > finalTruePeakTarget + 0.1) {
+    warnings.push({
+      code: "final-true-peak",
+      message: `Final true peak is ${finalMetrics.truePeak.toFixed(2)} dBFS.`,
+      value: finalMetrics.truePeak,
+      threshold: finalTruePeakTarget
+    });
+  }
+
+  return warnings;
 }
 
 export function buildTranscodeArgs({
@@ -1642,6 +2163,33 @@ function parseMaxVolume(output: string): number | null {
   return parseFiniteNumber(match?.[1]);
 }
 
+async function measureMaxVolume(inputPath: string): Promise<number | null> {
+  const { stderr } = await runFfmpegAndCapture(
+    ["-hide_banner", "-nostats", "-i", inputPath, "-vn", "-af", "volumedetect", "-f", "null", "-"],
+    { stage: "measurement" }
+  );
+
+  return parseMaxVolume(stderr);
+}
+
+function parseDurationSeconds(output: string): number | null {
+  const match = output.match(/Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/i);
+
+  if (!match) {
+    return null;
+  }
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) {
+    return null;
+  }
+
+  return roundToTwoDecimals(hours * 3600 + minutes * 60 + seconds);
+}
+
 function parseSummaryMetric(output: string, pattern: RegExp): number | null {
   const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
   const matches = [...output.matchAll(new RegExp(pattern.source, flags))];
@@ -1671,6 +2219,10 @@ function parseNullableFiniteNumber(value: string | undefined): number | null {
 
   const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function roundToTwoDecimals(value: number): number {
+  return Number(value.toFixed(2));
 }
 
 function bucketShortTermSamples(

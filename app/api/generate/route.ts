@@ -8,18 +8,31 @@ import {
   DEFAULT_OUTPUT_FORMAT,
   DEFAULT_SMOOTH_JOINS,
   DEFAULT_VOLUME_BOOST,
+  VOLUME_BOOST_SETTINGS,
+  buildSegmentBoundaryDiagnostics,
+  collectSegmentDiagnosticsWarnings,
+  extractAudioClip,
   getFileExtension,
   getMimeType,
   generateSilenceAudioFile,
+  levelSegmentAudioFile,
   masterAudioFile,
+  measureSegmentAudioFile,
   mergeAudioFiles,
   persistAudioDebugArtifact,
   resolveMasteringStrategy,
+  SEGMENT_LEVELING_SETTINGS,
   STANDARD_INTERMEDIATE_CHANNELS,
   STANDARD_INTERMEDIATE_SAMPLE_RATE,
+  standardizeSegmentAudioFile,
   transcodeAudioFile,
+  type AudioMasteringResult,
   type MasteringStrategy,
   type OutputFormat,
+  type SegmentBoundaryDiagnostic,
+  type SegmentDiagnosticsManifest,
+  type SegmentDiagnosticsManifestSegment,
+  type SegmentDiagnosticsWarning,
   type VolumeBoost
 } from "@/lib/audio";
 import { parseMistralAudioResponse, postMistralSpeech } from "@/lib/mistral";
@@ -396,27 +409,7 @@ async function prepareSegmentsForJoinSmoothing({
   const smoothedPaths: string[] = [];
 
   for (let index = 0; index < segmentPaths.length; index += 1) {
-    const smoothedSegmentPath = path.join(
-      tempDirectoryPath,
-      `segment-${String(index + 1).padStart(3, "0")}-smoothed.wav`
-    );
-
-    try {
-      await transcodeAudioFile({
-        inputPath: segmentPaths[index],
-        outputPath: smoothedSegmentPath,
-        outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
-        applyLoudnorm: false,
-        trimSilence: true,
-        sampleRate: STANDARD_INTERMEDIATE_SAMPLE_RATE,
-        channels: STANDARD_INTERMEDIATE_CHANNELS,
-        stage: "join-smoothing"
-      });
-    } catch (error) {
-      throw new Error(`Join smoothing failed on section ${index + 1}: ${extractErrorReason(error)}`);
-    }
-
-    smoothedPaths.push(smoothedSegmentPath);
+    smoothedPaths.push(segmentPaths[index]);
 
     if (index < segmentPaths.length - 1) {
       smoothedPaths.push(joinGapPath);
@@ -429,12 +422,10 @@ async function prepareSegmentsForJoinSmoothing({
 async function mergeSegmentsWithFallback({
   segmentPaths,
   tempDirectoryPath,
-  outputFormat,
   sendEvent
 }: {
   segmentPaths: string[];
   tempDirectoryPath: string;
-  outputFormat: OutputFormat;
   sendEvent: (event: StreamEvent) => void;
 }): Promise<string> {
   if (segmentPaths.length === 1) {
@@ -460,11 +451,7 @@ async function mergeSegmentsWithFallback({
     return copyMergedPath;
   } catch (error) {
     const concatFailureReason = extractErrorReason(error);
-    const fallbackFormat = outputFormat === "mp3" ? "mp3" : INTERMEDIATE_SEGMENT_FORMAT;
-    const fallbackMergedPath = path.join(
-      tempDirectoryPath,
-      `merged-reencoded.${getFileExtension(fallbackFormat)}`
-    );
+    const fallbackMergedPath = path.join(tempDirectoryPath, "merged-reencoded.wav");
 
     sendEvent({
       type: "progress",
@@ -476,7 +463,7 @@ async function mergeSegmentsWithFallback({
       await mergeAudioFiles({
         inputPaths: segmentPaths,
         outputPath: fallbackMergedPath,
-        outputFormat: fallbackFormat,
+        outputFormat: INTERMEDIATE_SEGMENT_FORMAT,
         strategy: "reencode"
       });
     } catch (fallbackError) {
@@ -555,6 +542,7 @@ async function finalizeOutput({
   deliverPath: string;
   normalizationApplied: boolean;
   normalizationFallbackUsed: boolean;
+  masteringResult: AudioMasteringResult | null;
 }> {
   const targetExtension = `.${getFileExtension(outputFormat)}`;
   const assembledMatchesOutput = path.extname(assembledPath).toLowerCase() === targetExtension;
@@ -581,7 +569,8 @@ async function finalizeOutput({
       return {
         deliverPath: assembledPath,
         normalizationApplied: false,
-        normalizationFallbackUsed: false
+        normalizationFallbackUsed: false,
+        masteringResult: null
       };
     }
 
@@ -615,7 +604,8 @@ async function finalizeOutput({
     return {
       deliverPath,
       normalizationApplied: false,
-      normalizationFallbackUsed: false
+      normalizationFallbackUsed: false,
+      masteringResult: null
     };
   }
 
@@ -631,7 +621,7 @@ async function finalizeOutput({
   });
 
   try {
-    await masterAudioFile({
+    const masteringResult = await masterAudioFile({
       inputPath: assembledPath,
       outputPath: normalizedOutputPath,
       outputFormat,
@@ -643,7 +633,8 @@ async function finalizeOutput({
     return {
       deliverPath: normalizedOutputPath,
       normalizationApplied: true,
-      normalizationFallbackUsed: false
+      normalizationFallbackUsed: false,
+      masteringResult
     };
   } catch (error) {
     const normalizationFailureReason = extractErrorReason(error);
@@ -670,7 +661,8 @@ async function finalizeOutput({
       return {
         deliverPath: assembledPath,
         normalizationApplied: false,
-        normalizationFallbackUsed: true
+        normalizationFallbackUsed: true,
+        masteringResult: null
       };
     }
 
@@ -716,7 +708,8 @@ async function finalizeOutput({
     return {
       deliverPath: fallbackOutputPath,
       normalizationApplied: false,
-      normalizationFallbackUsed: true
+      normalizationFallbackUsed: true,
+      masteringResult: null
     };
   }
 }
@@ -942,13 +935,24 @@ async function generateSegmentedSpeech({
   });
 
   const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
-  const segmentPaths: string[] = [];
+  const rawSegmentPaths: string[] = [];
+  const leveledSegmentPaths: string[] = [];
+  const manifestSegments: SegmentDiagnosticsManifestSegment[] = [];
 
   try {
     await assertFfmpegAvailable();
 
+    console.info(
+      "[segmented] chunking",
+      JSON.stringify({
+        totalSegments: segments.length,
+        wordCounts: segments.map((segment) => segment.wordCount)
+      })
+    );
+
     for (let index = 0; index < segments.length; index += 1) {
       const segmentNumber = index + 1;
+      const segmentId = String(segmentNumber).padStart(3, "0");
 
       sendEvent({
         type: "progress",
@@ -967,23 +971,103 @@ async function generateSegmentedSpeech({
 
       const rawSegmentPath = path.join(
         tempDirectoryPath,
-        `segment-${String(segmentNumber).padStart(3, "0")}.wav`
+        `segment-${segmentId}-raw.wav`
       );
 
       await writeFile(rawSegmentPath, audioBuffer);
-      segmentPaths.push(rawSegmentPath);
+      rawSegmentPaths.push(rawSegmentPath);
+
+      const rawMetrics = await measureSegmentAudioFile(rawSegmentPath);
+
+      if (debugArtifactDirectoryPath) {
+        await persistSegmentDebugArtifact({
+          sourcePath: rawSegmentPath,
+          debugArtifactDirectoryPath,
+          segmentNumber,
+          kind: "raw"
+        });
+      }
+
+      sendEvent({
+        type: "progress",
+        stage: "normalizing",
+        message: `Leveling section ${segmentNumber} of ${segments.length}`,
+        currentSegment: segmentNumber,
+        totalSegments: segments.length
+      });
+
+      const standardizedSegmentPath = path.join(
+        tempDirectoryPath,
+        `segment-${segmentId}-standardized.wav`
+      );
+
+      await standardizeSegmentAudioFile({
+        inputPath: rawSegmentPath,
+        outputPath: standardizedSegmentPath
+      });
+
+      const standardizedMetrics = await measureSegmentAudioFile(standardizedSegmentPath);
+
+      if (debugArtifactDirectoryPath) {
+        await persistSegmentDebugArtifact({
+          sourcePath: standardizedSegmentPath,
+          debugArtifactDirectoryPath,
+          segmentNumber,
+          kind: "standardized"
+        });
+      }
+
+      const leveledSegmentPath = path.join(
+        tempDirectoryPath,
+        `segment-${segmentId}-leveled.wav`
+      );
+      const levelingResult = await levelSegmentAudioFile({
+        inputPath: standardizedSegmentPath,
+        outputPath: leveledSegmentPath,
+        metrics: standardizedMetrics
+      });
+      const leveledMetrics = await measureSegmentAudioFile(leveledSegmentPath);
+
+      if (debugArtifactDirectoryPath) {
+        await persistSegmentDebugArtifact({
+          sourcePath: leveledSegmentPath,
+          debugArtifactDirectoryPath,
+          segmentNumber,
+          kind: "leveled"
+        });
+      }
+
+      leveledSegmentPaths.push(leveledSegmentPath);
+      manifestSegments.push({
+        segmentIndex: segmentNumber,
+        wordCount: segments[index].wordCount,
+        rawMetrics,
+        standardizedMetrics,
+        leveledMetrics,
+        appliedGainDb: levelingResult.appliedGainDb,
+        driftCorrectionDb: levelingResult.driftCorrectionDb,
+        levelingFilter: levelingResult.filter
+      });
     }
 
     if (debugArtifactDirectoryPath) {
       await persistSegmentedRawDebugArtifact({
-        segmentPaths,
+        segmentPaths: rawSegmentPaths,
         tempDirectoryPath,
         debugArtifactDirectoryPath
       });
     }
 
+    if (smoothJoins && leveledSegmentPaths.length > 1) {
+      sendEvent({
+        type: "progress",
+        stage: "smoothing",
+        message: "Smoothing joins"
+      });
+    }
+
     const joinReadyPaths = await prepareSegmentsForJoinSmoothing({
-      segmentPaths,
+      segmentPaths: leveledSegmentPaths,
       tempDirectoryPath,
       smoothJoins
     });
@@ -991,9 +1075,30 @@ async function generateSegmentedSpeech({
     const assembledPath = await mergeSegmentsWithFallback({
       segmentPaths: joinReadyPaths,
       tempDirectoryPath,
-      outputFormat,
       sendEvent
     });
+    const boundaryDiagnostics = buildSegmentBoundaryDiagnostics(
+      manifestSegments.map((segment) => segment.leveledMetrics),
+      smoothJoins ? DEFAULT_JOIN_PAUSE_MS / 1000 : 0
+    );
+
+    logSegmentedBoundaryDiagnostics(boundaryDiagnostics);
+
+    if (debugArtifactDirectoryPath) {
+      await persistAudioDebugArtifact({
+        sourcePath: assembledPath,
+        directoryPath: debugArtifactDirectoryPath,
+        filename: "merged-premaster.wav",
+        note: "Merged leveled WAV segments before final mastering."
+      });
+
+      await persistSeamDebugArtifacts({
+        assembledPath,
+        debugArtifactDirectoryPath,
+        boundaries: boundaryDiagnostics,
+        smoothJoins
+      });
+    }
 
     const finalizedOutput = await finalizeOutput({
       assembledPath,
@@ -1005,6 +1110,32 @@ async function generateSegmentedSpeech({
       masteringStrategy,
       debugArtifactDirectoryPath
     });
+    const diagnosticsWarnings = collectSegmentDiagnosticsWarnings({
+      boundaries: boundaryDiagnostics,
+      segmentMetrics: manifestSegments.map((segment) => segment.leveledMetrics),
+      finalMetrics: finalizedOutput.masteringResult?.metrics ?? null,
+      finalTruePeakTarget: VOLUME_BOOST_SETTINGS[volumeBoost].truePeak
+    });
+
+    logSegmentedDiagnosticsWarnings(diagnosticsWarnings);
+
+    if (debugArtifactDirectoryPath) {
+      await persistSegmentedDiagnosticsManifest({
+        debugArtifactDirectoryPath,
+        manifest: {
+          version: 1,
+          createdAt: new Date().toISOString(),
+          totalSegments: segments.length,
+          smoothJoins,
+          joinPauseMs: smoothJoins && segments.length > 1 ? DEFAULT_JOIN_PAUSE_MS : 0,
+          segmentLeveling: SEGMENT_LEVELING_SETTINGS,
+          segments: manifestSegments,
+          boundaries: boundaryDiagnostics,
+          warnings: diagnosticsWarnings,
+          finalMetrics: finalizedOutput.masteringResult?.metrics ?? null
+        }
+      });
+    }
 
     return {
       audioBuffer: await readFile(finalizedOutput.deliverPath),
@@ -1017,6 +1148,137 @@ async function generateSegmentedSpeech({
     await rm(tempDirectoryPath, { force: true, recursive: true });
     throw error;
   }
+}
+
+async function persistSegmentDebugArtifact({
+  sourcePath,
+  debugArtifactDirectoryPath,
+  segmentNumber,
+  kind
+}: {
+  sourcePath: string;
+  debugArtifactDirectoryPath: string;
+  segmentNumber: number;
+  kind: "raw" | "standardized" | "leveled";
+}): Promise<void> {
+  await persistAudioDebugArtifact({
+    sourcePath,
+    directoryPath: debugArtifactDirectoryPath,
+    filename: `${kind}-segment-${String(segmentNumber).padStart(3, "0")}.wav`,
+    note: `${kind} segmented Mistral WAV artifact.`
+  });
+}
+
+async function persistSeamDebugArtifacts({
+  assembledPath,
+  debugArtifactDirectoryPath,
+  boundaries,
+  smoothJoins
+}: {
+  assembledPath: string;
+  debugArtifactDirectoryPath: string;
+  boundaries: SegmentBoundaryDiagnostic[];
+  smoothJoins: boolean;
+}): Promise<void> {
+  for (const boundary of boundaries) {
+    if (boundary.boundaryTimestampSeconds === null) {
+      continue;
+    }
+
+    const filename = `seam-${String(boundary.boundaryIndex).padStart(3, "0")}.wav`;
+    const outputPath = path.join(debugArtifactDirectoryPath, filename);
+
+    await extractAudioClip({
+      inputPath: assembledPath,
+      outputPath,
+      startSeconds: boundary.boundaryTimestampSeconds - 3,
+      durationSeconds: 6 + (smoothJoins ? DEFAULT_JOIN_PAUSE_MS / 1000 : 0)
+    });
+
+    console.info(
+      "[audio-debug] artifact",
+      JSON.stringify({
+        filename,
+        path: outputPath,
+        note: "Short merged-audio clip around a leveled segment boundary."
+      })
+    );
+  }
+}
+
+async function persistSegmentedDiagnosticsManifest({
+  debugArtifactDirectoryPath,
+  manifest
+}: {
+  debugArtifactDirectoryPath: string;
+  manifest: SegmentDiagnosticsManifest;
+}): Promise<void> {
+  const filename = "segmented-audio-manifest.json";
+  const outputPath = path.join(debugArtifactDirectoryPath, filename);
+
+  await writeFile(outputPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+  console.info(
+    "[audio-debug] artifact",
+    JSON.stringify({
+      filename,
+      path: outputPath,
+      note: "Segmented generation metrics, gain, boundary, and warning manifest."
+    })
+  );
+}
+
+function logSegmentedBoundaryDiagnostics(boundaries: SegmentBoundaryDiagnostic[]): void {
+  if (boundaries.length === 0) {
+    return;
+  }
+
+  const largestBoundaryDelta = boundaries
+    .filter((boundary) => boundary.deltaLufs !== null)
+    .sort((left, right) => (right.deltaLufs ?? 0) - (left.deltaLufs ?? 0))[0];
+
+  console.info(
+    "[segmented] boundary-diagnostics",
+    JSON.stringify({
+      totalBoundaries: boundaries.length,
+      largestBoundaryDelta: largestBoundaryDelta
+        ? {
+            boundaryIndex: largestBoundaryDelta.boundaryIndex,
+            deltaLufs: largestBoundaryDelta.deltaLufs,
+            boundaryTimestampSeconds: largestBoundaryDelta.boundaryTimestampSeconds
+          }
+        : null,
+      boundaries: boundaries.map((boundary) => ({
+        boundaryIndex: boundary.boundaryIndex,
+        boundaryTimestampSeconds: boundary.boundaryTimestampSeconds,
+        nextSpeechTimestampSeconds: boundary.nextSpeechTimestampSeconds,
+        beforeLoudness: boundary.beforeLoudness,
+        afterLoudness: boundary.afterLoudness,
+        deltaLufs: boundary.deltaLufs,
+        exceedsThreshold: boundary.exceedsThreshold,
+        nearBoundaryJumpExceedsThreshold: boundary.nearBoundaryJumpExceedsThreshold
+      }))
+    })
+  );
+}
+
+function logSegmentedDiagnosticsWarnings(warnings: SegmentDiagnosticsWarning[]): void {
+  if (warnings.length === 0) {
+    console.info(
+      "[segmented] diagnostics",
+      JSON.stringify({
+        warnings: 0
+      })
+    );
+    return;
+  }
+
+  console.warn(
+    "[segmented] diagnostics warnings",
+    JSON.stringify({
+      warnings
+    })
+  );
 }
 
 async function generateSegmentSpeech({
