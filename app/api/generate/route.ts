@@ -42,7 +42,18 @@ import {
   type VolumeBoost
 } from "@/lib/audio";
 import { parseMistralAudioResponse, postMistralSpeech } from "@/lib/mistral";
-import { chunkText, prepareTextForSpeech, slugifyFilename, type TextChunk } from "@/lib/text";
+import {
+  buildSegmentContinuityPrompt,
+  chunkText,
+  extractFirstSentences,
+  extractLastSentences,
+  prepareTextForSpeech,
+  repairChunkBoundary,
+  slugifyFilename,
+  type ChunkBoundaryRepair,
+  type SegmentContinuityPrompt,
+  type TextChunk
+} from "@/lib/text";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -52,6 +63,7 @@ const SINGLE_PASS_TIMEOUT_MS = 180_000;
 const SEGMENT_TIMEOUT_MS = 120_000;
 const INTERMEDIATE_SEGMENT_FORMAT: OutputFormat = "wav";
 const MAX_SEAM_REGENERATION_SEGMENTS = 2;
+const DEFAULT_SEAM_RETRY_COUNT = 2;
 
 type ProgressStage =
   | "cleaning"
@@ -943,7 +955,7 @@ async function generateSegmentedSpeech({
   normalizationApplied: boolean;
   normalizationFallbackUsed: boolean;
 }> {
-  const segments = chunkText(paragraphs);
+  let segments = chunkText(paragraphs);
 
   if (segments.length === 0) {
     throw new Error("No narration segments were created after cleaning.");
@@ -956,13 +968,25 @@ async function generateSegmentedSpeech({
   });
 
   const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
-  const processedSegments: ProcessedSegment[] = [];
-  const joinPlan = buildSegmentJoinPlan(
+  let processedSegments: ProcessedSegment[] = [];
+  let joinPlan = buildSegmentJoinPlan(
     segments.map((segment) => segment.text),
     smoothJoins
   );
   const seamRegenerationEnabled =
     process.env.VOICEOVER_REGENERATE_BAD_SEAMS?.trim().toLowerCase() !== "false";
+  const contextOverlapEnabled = readBooleanEnv(
+    process.env.VOICEOVER_CONTEXT_OVERLAP,
+    true
+  );
+  const toneSeamScoringEnabled = readBooleanEnv(
+    process.env.VOICEOVER_TONE_SEAM_SCORING,
+    true
+  );
+  const seamRetryCount = readPositiveIntegerEnv(
+    process.env.VOICEOVER_SEAM_RETRIES,
+    DEFAULT_SEAM_RETRY_COUNT
+  );
 
   try {
     await assertFfmpegAvailable();
@@ -978,10 +1002,11 @@ async function generateSegmentedSpeech({
     for (let index = 0; index < segments.length; index += 1) {
       processedSegments.push(
         await generateAndProcessSegment({
-          segment: segments[index],
+          segments,
           segmentIndex: index,
           totalSegments: segments.length,
           attempt: 1,
+          contextOverlapEnabled,
           tempDirectoryPath,
           voiceId,
           sendEvent,
@@ -992,11 +1017,18 @@ async function generateSegmentedSpeech({
 
     let boundaryDiagnostics = buildSegmentBoundaryDiagnostics(
       processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
-      joinPlan.map((join) => join.pauseMs / 1000)
+      joinPlan.map((join) => join.pauseMs / 1000),
+      undefined,
+      undefined,
+      {
+        wordCounts: segments.map((segment) => segment.wordCount),
+        toneSeamScoringEnabled
+      }
     );
+    hydrateBoundaryContextDiagnostics(boundaryDiagnostics, segments, processedSegments);
 
     if (seamRegenerationEnabled) {
-      boundaryDiagnostics = await regenerateFailedSeams({
+      const regenerationResult = await regenerateFailedSeams({
         segments,
         processedSegments,
         boundaryDiagnostics,
@@ -1004,8 +1036,16 @@ async function generateSegmentedSpeech({
         tempDirectoryPath,
         voiceId,
         sendEvent,
+        contextOverlapEnabled,
+        toneSeamScoringEnabled,
+        seamRetryCount,
+        smoothJoins,
         debugArtifactDirectoryPath
       });
+      segments = regenerationResult.segments;
+      processedSegments = regenerationResult.processedSegments;
+      joinPlan = regenerationResult.joinPlan;
+      boundaryDiagnostics = regenerationResult.boundaryDiagnostics;
     }
 
     boundaryDiagnostics = await applyBoundaryAwareSeamAdjustments({
@@ -1013,6 +1053,8 @@ async function generateSegmentedSpeech({
       boundaryDiagnostics,
       joinPlan,
       tempDirectoryPath,
+      segments,
+      toneSeamScoringEnabled,
       debugArtifactDirectoryPath
     });
 
@@ -1119,27 +1161,53 @@ async function generateSegmentedSpeech({
 }
 
 async function generateAndProcessSegment({
-  segment,
+  segments,
   segmentIndex,
   totalSegments,
   attempt,
+  contextOverlapEnabled,
+  continuityStrength,
+  regenerationReason,
   tempDirectoryPath,
   voiceId,
   sendEvent,
   debugArtifactDirectoryPath
 }: {
-  segment: TextChunk;
+  segments: TextChunk[];
   segmentIndex: number;
   totalSegments: number;
   attempt: number;
+  contextOverlapEnabled: boolean;
+  continuityStrength?: "standard" | "strong";
+  regenerationReason?: string;
   tempDirectoryPath: string;
   voiceId: string;
   sendEvent: (event: StreamEvent) => void;
   debugArtifactDirectoryPath?: string;
 }): Promise<ProcessedSegment> {
+  const segment = segments[segmentIndex];
+
+  if (!segment) {
+    throw new Error(`Missing segment ${segmentIndex + 1}.`);
+  }
+
   const segmentNumber = segmentIndex + 1;
   const segmentId = String(segmentNumber).padStart(3, "0");
   const attemptSuffix = attempt > 1 ? `-attempt-${attempt}` : "";
+  const prompt = buildSegmentContinuityPrompt({
+    previousText: segments[segmentIndex - 1]?.text,
+    targetText: segment.text,
+    nextText: segments[segmentIndex + 1]?.text,
+    enabled: false,
+    instructionStrength: continuityStrength ?? (attempt > 1 ? "strong" : "standard")
+  });
+  const continuityContextPrompt = buildSegmentContinuityPrompt({
+    previousText: segments[segmentIndex - 1]?.text,
+    targetText: segment.text,
+    nextText: segments[segmentIndex + 1]?.text,
+    enabled: contextOverlapEnabled,
+    instructionStrength: continuityStrength ?? (attempt > 1 ? "strong" : "standard")
+  });
 
   sendEvent({
     type: "progress",
@@ -1152,8 +1220,15 @@ async function generateAndProcessSegment({
     totalSegments
   });
 
+  const spokenOverlapInput =
+    contextOverlapEnabled && continuityContextPrompt.previousContext
+      ? buildSpokenContextOverlapInput({
+          previousContext: continuityContextPrompt.previousContext,
+          targetText: segment.text
+        })
+      : null;
   const audioBuffer = await generateSegmentSpeech({
-    input: segment.text,
+    input: spokenOverlapInput?.input ?? prompt.input,
     voiceId,
     segmentNumber,
     totalSegments
@@ -1165,11 +1240,111 @@ async function generateAndProcessSegment({
   );
 
   await writeFile(rawSegmentPath, audioBuffer);
-  const rawMetrics = await measureSegmentAudioFile(rawSegmentPath);
+  let rawMetrics = await measureSegmentAudioFile(rawSegmentPath);
+  let finalRawSegmentPath = rawSegmentPath;
+  let finalPrompt: SegmentContinuityPrompt = spokenOverlapInput
+    ? {
+        ...continuityContextPrompt,
+        input: spokenOverlapInput.input,
+        nextContext: "",
+        contextOverlapUsed: true,
+        instructionStrength: continuityStrength ?? (attempt > 1 ? "strong" : "standard"),
+        inputWordCount: spokenOverlapInput.inputWordCount
+      }
+    : prompt;
+  let contextLikelySpoken = false;
+  let contextFallbackUsed = false;
+  let contextAudioTrimmed = false;
+  let contextAudioTrimSeconds: number | null = null;
+
+  if (spokenOverlapInput && rawMetrics.durationSeconds !== null) {
+    const trimSeconds = estimateContextAudioTrimSeconds({
+      durationSeconds: rawMetrics.durationSeconds,
+      contextWordCount: spokenOverlapInput.contextWordCount,
+      targetWordCount: segment.wordCount
+    });
+    const trimmedPath = path.join(
+      tempDirectoryPath,
+      `segment-${segmentId}${attemptSuffix}-raw-context-trimmed.wav`
+    );
+
+    await extractAudioClip({
+      inputPath: rawSegmentPath,
+      outputPath: trimmedPath,
+      startSeconds: trimSeconds,
+      durationSeconds: Math.max(0.5, rawMetrics.durationSeconds - trimSeconds)
+    });
+
+    finalRawSegmentPath = trimmedPath;
+    rawMetrics = await measureSegmentAudioFile(finalRawSegmentPath);
+    contextAudioTrimmed = true;
+    contextAudioTrimSeconds = trimSeconds;
+
+    if (isContextTrimLikelyBadTake(rawMetrics)) {
+      console.warn(
+        "[segmented] context-overlap-trim-rejected",
+        JSON.stringify({
+          segmentIndex: segmentNumber,
+          trimSeconds,
+          integratedLoudness: rawMetrics.integratedLoudness,
+          truePeak: rawMetrics.truePeak,
+          internalDriftLufs: rawMetrics.internalDriftLufs
+        })
+      );
+
+      finalPrompt = buildSegmentContinuityPrompt({
+        targetText: segment.text,
+        enabled: false
+      });
+      const targetOnlyAudioBuffer = await generateSegmentSpeech({
+        input: finalPrompt.input,
+        voiceId,
+        segmentNumber,
+        totalSegments
+      });
+      finalRawSegmentPath = path.join(
+        tempDirectoryPath,
+        `segment-${segmentId}${attemptSuffix}-raw-target-only.wav`
+      );
+      await writeFile(finalRawSegmentPath, targetOnlyAudioBuffer);
+      rawMetrics = await measureSegmentAudioFile(finalRawSegmentPath);
+      contextFallbackUsed = true;
+      contextAudioTrimmed = false;
+      contextAudioTrimSeconds = null;
+    }
+  } else if (contextLikelySpoken) {
+    console.warn(
+      "[segmented] context-overlap-likely-spoken",
+      JSON.stringify({
+        segmentIndex: segmentNumber,
+        targetWordCount: prompt.targetWordCount,
+        inputWordCount: prompt.inputWordCount,
+        durationSeconds: rawMetrics.durationSeconds
+      })
+    );
+
+    finalPrompt = buildSegmentContinuityPrompt({
+      targetText: segment.text,
+      enabled: false
+    });
+    const targetOnlyAudioBuffer = await generateSegmentSpeech({
+      input: finalPrompt.input,
+      voiceId,
+      segmentNumber,
+      totalSegments
+    });
+    finalRawSegmentPath = path.join(
+      tempDirectoryPath,
+      `segment-${segmentId}${attemptSuffix}-raw-target-only.wav`
+    );
+    await writeFile(finalRawSegmentPath, targetOnlyAudioBuffer);
+    rawMetrics = await measureSegmentAudioFile(finalRawSegmentPath);
+    contextFallbackUsed = true;
+  }
 
   if (debugArtifactDirectoryPath) {
     await persistSegmentDebugArtifact({
-      sourcePath: rawSegmentPath,
+      sourcePath: finalRawSegmentPath,
       debugArtifactDirectoryPath,
       segmentNumber,
       attempt,
@@ -1191,7 +1366,7 @@ async function generateAndProcessSegment({
   );
 
   await standardizeSegmentAudioFile({
-    inputPath: rawSegmentPath,
+    inputPath: finalRawSegmentPath,
     outputPath: standardizedSegmentPath
   });
 
@@ -1229,13 +1404,24 @@ async function generateAndProcessSegment({
   }
 
   return {
-    rawSegmentPath,
+    rawSegmentPath: finalRawSegmentPath,
     standardizedSegmentPath,
     leveledSegmentPath,
     manifestSegment: {
       segmentIndex: segmentNumber,
       wordCount: segment.wordCount,
       generationAttempt: attempt,
+      generationInputWordCount: finalPrompt.inputWordCount,
+      targetWordCount: finalPrompt.targetWordCount,
+      contextOverlapUsed: finalPrompt.contextOverlapUsed,
+      contextInstructionStrength: finalPrompt.instructionStrength,
+      previousContext: finalPrompt.previousContext,
+      nextContext: finalPrompt.nextContext,
+      contextLikelySpoken,
+      contextFallbackUsed,
+      contextAudioTrimmed,
+      contextAudioTrimSeconds,
+      regenerationReason,
       rawMetrics,
       standardizedMetrics,
       leveledMetrics,
@@ -1254,6 +1440,10 @@ async function regenerateFailedSeams({
   tempDirectoryPath,
   voiceId,
   sendEvent,
+  contextOverlapEnabled,
+  toneSeamScoringEnabled,
+  seamRetryCount,
+  smoothJoins,
   debugArtifactDirectoryPath
 }: {
   segments: TextChunk[];
@@ -1263,87 +1453,205 @@ async function regenerateFailedSeams({
   tempDirectoryPath: string;
   voiceId: string;
   sendEvent: (event: StreamEvent) => void;
+  contextOverlapEnabled: boolean;
+  toneSeamScoringEnabled: boolean;
+  seamRetryCount: number;
+  smoothJoins: boolean;
   debugArtifactDirectoryPath?: string;
-}): Promise<SegmentBoundaryDiagnostic[]> {
-  let currentDiagnostics = boundaryDiagnostics;
-  const targets = selectSeamRegenerationTargets(
+}): Promise<{
+  segments: TextChunk[];
+  processedSegments: ProcessedSegment[];
+  joinPlan: SegmentJoinPlan[];
+  boundaryDiagnostics: SegmentBoundaryDiagnostic[];
+}> {
+  let currentSegments = segments;
+  let currentProcessedSegments = processedSegments;
+  let currentJoinPlan = joinPlan;
+  const attemptRecordsByBoundary = new Map<number, SegmentBoundaryDiagnostic["regenerationAttempts"]>();
+  const repairRecordsByBoundary = new Map<number, NonNullable<SegmentBoundaryDiagnostic["boundaryRepair"]>>();
+  let currentDiagnostics =
+    boundaryDiagnostics.length > 0
+      ? boundaryDiagnostics
+      : buildCurrentBoundaryDiagnostics({
+          processedSegments: currentProcessedSegments,
+          joinPlan: currentJoinPlan,
+          segments: currentSegments,
+          toneSeamScoringEnabled,
+          attemptRecordsByBoundary,
+          repairRecordsByBoundary
+        });
+  hydrateBoundaryContextDiagnostics(
     currentDiagnostics,
-    processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
-    MAX_SEAM_REGENERATION_SEGMENTS
+    currentSegments,
+    currentProcessedSegments
   );
 
-  if (targets.length === 0) {
-    return currentDiagnostics;
+  if (!currentDiagnostics.some((boundary) => !boundary.seamPassed)) {
+    return {
+      segments: currentSegments,
+      processedSegments: currentProcessedSegments,
+      joinPlan: currentJoinPlan,
+      boundaryDiagnostics: currentDiagnostics
+    };
   }
 
-  console.warn(
-    "[segmented] seam-regeneration",
-    JSON.stringify({
-      targets,
-      failedBoundaries: currentDiagnostics
-        .filter((boundary) => !boundary.seamPassed)
-        .map((boundary) => ({
-          boundaryIndex: boundary.boundaryIndex,
-          seamQualityScore: boundary.seamQualityScore,
-          deltaLufs: boundary.deltaLufs,
-          rmsDeltaDb: boundary.rmsDeltaDb,
-          gapDurationMs: boundary.gapDurationMs,
-          spectralDifferenceScore: boundary.spectralDifferenceScore
-        }))
-    })
-  );
-
-  for (const segmentNumber of targets) {
-    const segmentIndex = segmentNumber - 1;
-    const previousSegment = processedSegments[segmentIndex];
-    const previousScore = scoreSeamsTouchingSegment(currentDiagnostics, segmentNumber);
-    const candidate = await generateAndProcessSegment({
-      segment: segments[segmentIndex],
-      segmentIndex,
-      totalSegments: segments.length,
-      attempt: 2,
-      tempDirectoryPath,
-      voiceId,
-      sendEvent,
-      debugArtifactDirectoryPath
-    });
-
-    processedSegments[segmentIndex] = candidate;
-
-    const candidateDiagnostics = buildSegmentBoundaryDiagnostics(
-      processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
-      joinPlan.map((join) => join.pauseMs / 1000)
+  for (let retryIndex = 0; retryIndex < seamRetryCount; retryIndex += 1) {
+    const attempt = retryIndex + 2;
+    const targets = selectSeamRegenerationTargets(
+      currentDiagnostics,
+      currentProcessedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
+      MAX_SEAM_REGENERATION_SEGMENTS
     );
-    const candidateScore = scoreSeamsTouchingSegment(candidateDiagnostics, segmentNumber);
 
-    if (candidateScore <= previousScore) {
-      currentDiagnostics = candidateDiagnostics;
-      console.info(
-        "[segmented] seam-regeneration accepted",
+    if (targets.length === 0) {
+      break;
+    }
+
+    console.warn(
+      "[segmented] seam-regeneration",
+      JSON.stringify({
+        attempt,
+        targets,
+        failedBoundaries: currentDiagnostics
+          .filter((boundary) => !boundary.seamPassed)
+          .map((boundary) => ({
+            boundaryIndex: boundary.boundaryIndex,
+            seamQualityScore: boundary.seamQualityScore,
+            failureKind: boundary.seamFailureKind,
+            failureReason: boundary.seamFailureReason,
+            deltaLufs: boundary.deltaLufs,
+            rmsDeltaDb: boundary.rmsDeltaDb,
+            gapDurationMs: boundary.gapDurationMs,
+            spectralDifferenceScore: boundary.spectralDifferenceScore,
+            speakingRateDeltaWps: boundary.speakingRateDeltaWps,
+            toneMismatchScore: boundary.toneMismatchScore
+          }))
+      })
+    );
+
+    for (const segmentNumber of targets) {
+      const segmentIndex = segmentNumber - 1;
+      const previousSegment = currentProcessedSegments[segmentIndex];
+
+      if (!previousSegment || !currentSegments[segmentIndex]) {
+        continue;
+      }
+
+      const previousScore = scoreSeamsTouchingSegment(currentDiagnostics, segmentNumber);
+      const regenerationReason = summarizeSeamsTouchingSegment(
+        currentDiagnostics,
+        segmentNumber
+      );
+      const candidate = await generateAndProcessSegment({
+        segments: currentSegments,
+        segmentIndex,
+        totalSegments: currentSegments.length,
+        attempt,
+        contextOverlapEnabled,
+        continuityStrength: "strong",
+        regenerationReason,
+        tempDirectoryPath,
+        voiceId,
+        sendEvent,
+        debugArtifactDirectoryPath
+      });
+
+      currentProcessedSegments[segmentIndex] = candidate;
+
+      const candidateDiagnostics = buildCurrentBoundaryDiagnostics({
+        processedSegments: currentProcessedSegments,
+        joinPlan: currentJoinPlan,
+        segments: currentSegments,
+        toneSeamScoringEnabled,
+        attemptRecordsByBoundary,
+        repairRecordsByBoundary
+      });
+      const candidateScore = scoreSeamsTouchingSegment(candidateDiagnostics, segmentNumber);
+      const accepted = candidateScore <= previousScore;
+      const record = {
+        attempt,
+        segmentIndex: segmentNumber,
+        reason: regenerationReason,
+        contextOverlapUsed: candidate.manifestSegment.contextOverlapUsed,
+        contextLikelySpoken: candidate.manifestSegment.contextLikelySpoken,
+        accepted,
+        scoreBefore: previousScore,
+        scoreAfter: candidateScore
+      };
+
+      recordRegenerationAttempt(attemptRecordsByBoundary, segmentNumber, currentSegments.length, record);
+
+      if (accepted) {
+        currentDiagnostics = buildCurrentBoundaryDiagnostics({
+          processedSegments: currentProcessedSegments,
+          joinPlan: currentJoinPlan,
+          segments: currentSegments,
+          toneSeamScoringEnabled,
+          attemptRecordsByBoundary,
+          repairRecordsByBoundary
+        });
+        console.info(
+          "[segmented] seam-regeneration accepted",
+          JSON.stringify({
+            segmentIndex: segmentNumber,
+            previousScore,
+            candidateScore,
+            regenerationReason,
+            contextOverlapUsed: candidate.manifestSegment.contextOverlapUsed,
+            contextLikelySpoken: candidate.manifestSegment.contextLikelySpoken
+          })
+        );
+        continue;
+      }
+
+      currentProcessedSegments[segmentIndex] = previousSegment;
+      currentDiagnostics = buildCurrentBoundaryDiagnostics({
+        processedSegments: currentProcessedSegments,
+        joinPlan: currentJoinPlan,
+        segments: currentSegments,
+        toneSeamScoringEnabled,
+        attemptRecordsByBoundary,
+        repairRecordsByBoundary
+      });
+      console.warn(
+        "[segmented] seam-regeneration rejected",
         JSON.stringify({
           segmentIndex: segmentNumber,
           previousScore,
-          candidateScore
+          candidateScore,
+          regenerationReason
         })
       );
-      continue;
     }
-
-    processedSegments[segmentIndex] = previousSegment;
-    console.warn(
-      "[segmented] seam-regeneration rejected",
-      JSON.stringify({
-        segmentIndex: segmentNumber,
-        previousScore,
-        candidateScore
-      })
-    );
   }
 
-  return buildSegmentBoundaryDiagnostics(
-    processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
-    joinPlan.map((join) => join.pauseMs / 1000)
-  );
+  const repairResult = await repairWorstRemainingSeam({
+    segments: currentSegments,
+    processedSegments: currentProcessedSegments,
+    joinPlan: currentJoinPlan,
+    boundaryDiagnostics: currentDiagnostics,
+    attemptRecordsByBoundary,
+    repairRecordsByBoundary,
+    tempDirectoryPath,
+    voiceId,
+    sendEvent,
+    smoothJoins,
+    contextOverlapEnabled,
+    toneSeamScoringEnabled,
+    debugArtifactDirectoryPath
+  });
+
+  currentSegments = repairResult.segments;
+  currentProcessedSegments = repairResult.processedSegments;
+  currentJoinPlan = repairResult.joinPlan;
+  currentDiagnostics = repairResult.boundaryDiagnostics;
+
+  return {
+    segments: currentSegments,
+    processedSegments: currentProcessedSegments,
+    joinPlan: currentJoinPlan,
+    boundaryDiagnostics: currentDiagnostics
+  };
 }
 
 function scoreSeamsTouchingSegment(
@@ -1359,17 +1667,251 @@ function scoreSeamsTouchingSegment(
     .reduce((total, boundary) => total + boundary.seamQualityScore, 0);
 }
 
+function summarizeSeamsTouchingSegment(
+  boundaries: SegmentBoundaryDiagnostic[],
+  segmentNumber: number
+): string {
+  const failures = boundaries
+    .filter(
+      (boundary) =>
+        !boundary.seamPassed &&
+        (boundary.previousSegmentIndex === segmentNumber ||
+          boundary.nextSegmentIndex === segmentNumber)
+    )
+    .map(
+      (boundary) =>
+        `boundary-${boundary.boundaryIndex}-${boundary.seamFailureKind}-${boundary.seamFailureReason}`
+    );
+
+  return failures.join(";") || "retry-for-seam-continuity";
+}
+
+function buildCurrentBoundaryDiagnostics({
+  processedSegments,
+  joinPlan,
+  segments,
+  toneSeamScoringEnabled,
+  attemptRecordsByBoundary,
+  repairRecordsByBoundary
+}: {
+  processedSegments: ProcessedSegment[];
+  joinPlan: SegmentJoinPlan[];
+  segments: TextChunk[];
+  toneSeamScoringEnabled: boolean;
+  attemptRecordsByBoundary?: Map<
+    number,
+    SegmentBoundaryDiagnostic["regenerationAttempts"]
+  >;
+  repairRecordsByBoundary?: Map<
+    number,
+    NonNullable<SegmentBoundaryDiagnostic["boundaryRepair"]>
+  >;
+}): SegmentBoundaryDiagnostic[] {
+  const diagnostics = buildSegmentBoundaryDiagnostics(
+    processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
+    joinPlan.map((join) => join.pauseMs / 1000),
+    undefined,
+    undefined,
+    {
+      wordCounts: segments.map((segment) => segment.wordCount),
+      toneSeamScoringEnabled
+    }
+  );
+
+  hydrateBoundaryContextDiagnostics(diagnostics, segments, processedSegments);
+
+  for (const boundary of diagnostics) {
+    boundary.regenerationAttempts = [
+      ...(attemptRecordsByBoundary?.get(boundary.boundaryIndex) ?? [])
+    ];
+    boundary.boundaryRepair =
+      repairRecordsByBoundary?.get(boundary.boundaryIndex) ?? boundary.boundaryRepair;
+  }
+
+  return diagnostics;
+}
+
+function hydrateBoundaryContextDiagnostics(
+  diagnostics: SegmentBoundaryDiagnostic[],
+  segments: TextChunk[],
+  processedSegments: ProcessedSegment[]
+): void {
+  for (const boundary of diagnostics) {
+    const previous = segments[boundary.previousSegmentIndex - 1];
+    const next = segments[boundary.nextSegmentIndex - 1];
+    const nextManifest = processedSegments[boundary.nextSegmentIndex - 1]?.manifestSegment;
+
+    boundary.previousContextTail = previous ? extractLastSentences(previous.text, 2) : null;
+    boundary.nextContextHead = next ? extractFirstSentences(next.text, 1) : null;
+    boundary.contextOverlapUsed = nextManifest?.contextOverlapUsed ?? false;
+  }
+}
+
+function recordRegenerationAttempt(
+  attemptsByBoundary: Map<number, SegmentBoundaryDiagnostic["regenerationAttempts"]>,
+  segmentNumber: number,
+  totalSegments: number,
+  record: SegmentBoundaryDiagnostic["regenerationAttempts"][number]
+): void {
+  const boundaryIndexes = [segmentNumber - 1, segmentNumber].filter(
+    (boundaryIndex) => boundaryIndex >= 1 && boundaryIndex < totalSegments
+  );
+
+  for (const boundaryIndex of boundaryIndexes) {
+    const records = attemptsByBoundary.get(boundaryIndex) ?? [];
+    attemptsByBoundary.set(boundaryIndex, [...records, record]);
+  }
+}
+
+async function repairWorstRemainingSeam({
+  segments,
+  processedSegments,
+  joinPlan,
+  boundaryDiagnostics,
+  attemptRecordsByBoundary,
+  repairRecordsByBoundary,
+  tempDirectoryPath,
+  voiceId,
+  sendEvent,
+  smoothJoins,
+  contextOverlapEnabled,
+  toneSeamScoringEnabled,
+  debugArtifactDirectoryPath
+}: {
+  segments: TextChunk[];
+  processedSegments: ProcessedSegment[];
+  joinPlan: SegmentJoinPlan[];
+  boundaryDiagnostics: SegmentBoundaryDiagnostic[];
+  attemptRecordsByBoundary: Map<number, SegmentBoundaryDiagnostic["regenerationAttempts"]>;
+  repairRecordsByBoundary: Map<number, NonNullable<SegmentBoundaryDiagnostic["boundaryRepair"]>>;
+  tempDirectoryPath: string;
+  voiceId: string;
+  sendEvent: (event: StreamEvent) => void;
+  smoothJoins: boolean;
+  contextOverlapEnabled: boolean;
+  toneSeamScoringEnabled: boolean;
+  debugArtifactDirectoryPath?: string;
+}): Promise<{
+  segments: TextChunk[];
+  processedSegments: ProcessedSegment[];
+  joinPlan: SegmentJoinPlan[];
+  boundaryDiagnostics: SegmentBoundaryDiagnostic[];
+}> {
+  const worstBoundary = boundaryDiagnostics
+    .filter(
+      (boundary) =>
+        !boundary.seamPassed &&
+        (boundary.seamFailureKind === "tonal" || boundary.seamFailureKind === "mixed")
+    )
+    .sort((left, right) => right.seamQualityScore - left.seamQualityScore)[0];
+
+  if (!worstBoundary) {
+    return {
+      segments,
+      processedSegments,
+      joinPlan,
+      boundaryDiagnostics
+    };
+  }
+
+  const repair = repairChunkBoundary(segments, worstBoundary.boundaryIndex);
+
+  if (!repair.applied) {
+    repairRecordsByBoundary.set(worstBoundary.boundaryIndex, toBoundaryRepairRecord(repair));
+    return {
+      segments,
+      processedSegments,
+      joinPlan,
+      boundaryDiagnostics: buildCurrentBoundaryDiagnostics({
+        processedSegments,
+        joinPlan,
+        segments,
+        toneSeamScoringEnabled,
+        attemptRecordsByBoundary,
+        repairRecordsByBoundary
+      })
+    };
+  }
+
+  console.warn(
+    "[segmented] seam-boundary-repair",
+    JSON.stringify({
+      boundaryIndex: worstBoundary.boundaryIndex,
+      strategy: repair.strategy,
+      reason: repair.reason
+    })
+  );
+
+  const repairedSegments = repair.chunks;
+  const repairedJoinPlan = buildSegmentJoinPlan(
+    repairedSegments.map((segment) => segment.text),
+    smoothJoins
+  );
+  const repairedProcessedSegments: ProcessedSegment[] = [];
+
+  for (let index = 0; index < repairedSegments.length; index += 1) {
+    repairedProcessedSegments.push(
+      await generateAndProcessSegment({
+        segments: repairedSegments,
+        segmentIndex: index,
+        totalSegments: repairedSegments.length,
+        attempt: 100 + index,
+        contextOverlapEnabled,
+        continuityStrength: "strong",
+        regenerationReason: `boundary-repair-${repair.strategy}-${repair.reason}`,
+        tempDirectoryPath,
+        voiceId,
+        sendEvent,
+        debugArtifactDirectoryPath
+      })
+    );
+  }
+
+  const repairedBoundaryIndex = Math.min(
+    repair.boundaryIndex,
+    Math.max(1, repairedSegments.length - 1)
+  );
+  repairRecordsByBoundary.set(repairedBoundaryIndex, toBoundaryRepairRecord(repair));
+
+  return {
+    segments: repairedSegments,
+    processedSegments: repairedProcessedSegments,
+    joinPlan: repairedJoinPlan,
+    boundaryDiagnostics: buildCurrentBoundaryDiagnostics({
+      processedSegments: repairedProcessedSegments,
+      joinPlan: repairedJoinPlan,
+      segments: repairedSegments,
+      toneSeamScoringEnabled,
+      repairRecordsByBoundary
+    })
+  };
+}
+
+function toBoundaryRepairRecord(
+  repair: ChunkBoundaryRepair
+): NonNullable<SegmentBoundaryDiagnostic["boundaryRepair"]> {
+  return {
+    applied: repair.applied,
+    strategy: repair.strategy,
+    reason: repair.reason
+  };
+}
+
 async function applyBoundaryAwareSeamAdjustments({
   processedSegments,
   boundaryDiagnostics,
   joinPlan,
   tempDirectoryPath,
+  segments,
+  toneSeamScoringEnabled,
   debugArtifactDirectoryPath
 }: {
   processedSegments: ProcessedSegment[];
   boundaryDiagnostics: SegmentBoundaryDiagnostic[];
   joinPlan: SegmentJoinPlan[];
   tempDirectoryPath: string;
+  segments: TextChunk[];
+  toneSeamScoringEnabled: boolean;
   debugArtifactDirectoryPath?: string;
 }): Promise<SegmentBoundaryDiagnostic[]> {
   const adjustments = computeSegmentSeamAdjustments(boundaryDiagnostics, processedSegments.length);
@@ -1378,6 +1920,7 @@ async function applyBoundaryAwareSeamAdjustments({
   );
 
   if (actionableAdjustments.length === 0) {
+    hydrateBoundaryContextDiagnostics(boundaryDiagnostics, segments, processedSegments);
     return boundaryDiagnostics;
   }
 
@@ -1432,10 +1975,26 @@ async function applyBoundaryAwareSeamAdjustments({
     }
   }
 
-  return buildSegmentBoundaryDiagnostics(
-    processedSegments.map((segment) => segment.manifestSegment.leveledMetrics),
-    joinPlan.map((join) => join.pauseMs / 1000)
-  );
+  return buildCurrentBoundaryDiagnostics({
+    processedSegments,
+    joinPlan,
+    segments,
+    toneSeamScoringEnabled,
+    attemptRecordsByBoundary: new Map(
+      boundaryDiagnostics.map((boundary) => [
+        boundary.boundaryIndex,
+        boundary.regenerationAttempts
+      ])
+    ),
+    repairRecordsByBoundary: new Map(
+      boundaryDiagnostics
+        .filter((boundary) => boundary.boundaryRepair !== null)
+        .map((boundary) => [
+          boundary.boundaryIndex,
+          boundary.boundaryRepair as NonNullable<SegmentBoundaryDiagnostic["boundaryRepair"]>
+        ])
+    )
+  });
 }
 
 async function persistSegmentDebugArtifact({
@@ -1554,6 +2113,13 @@ function logSegmentedBoundaryDiagnostics(boundaries: SegmentBoundaryDiagnostic[]
         nextFirst2sRmsDb: boundary.nextFirst2sRmsDb,
         rmsDeltaDb: boundary.rmsDeltaDb,
         spectralDifferenceScore: boundary.spectralDifferenceScore,
+        speakingRateDeltaWps: boundary.speakingRateDeltaWps,
+        toneMismatchScore: boundary.toneMismatchScore,
+        seamFailureKind: boundary.seamFailureKind,
+        seamFailureReason: boundary.seamFailureReason,
+        contextOverlapUsed: boundary.contextOverlapUsed,
+        regenerationAttempts: boundary.regenerationAttempts.length,
+        boundaryRepair: boundary.boundaryRepair,
         speechCutoffRiskBefore: boundary.speechCutoffRiskBefore,
         speechCutoffRiskAfter: boundary.speechCutoffRiskAfter,
         seamQualityScore: boundary.seamQualityScore,
@@ -1775,6 +2341,66 @@ function formatSeconds(milliseconds: number): number {
   return Math.round(milliseconds / 1000);
 }
 
+function buildSpokenContextOverlapInput({
+  previousContext,
+  targetText
+}: {
+  previousContext: string;
+  targetText: string;
+}): {
+  input: string;
+  inputWordCount: number;
+  contextWordCount: number;
+} {
+  const input = `${previousContext.trim()}\n\n${targetText.trim()}`.trim();
+
+  return {
+    input,
+    inputWordCount: countRouteWords(input),
+    contextWordCount: countRouteWords(previousContext)
+  };
+}
+
+function estimateContextAudioTrimSeconds({
+  durationSeconds,
+  contextWordCount,
+  targetWordCount
+}: {
+  durationSeconds: number;
+  contextWordCount: number;
+  targetWordCount: number;
+}): number {
+  const totalWords = Math.max(1, contextWordCount + targetWordCount);
+  const estimated = durationSeconds * (contextWordCount / totalWords);
+  const pauseAllowanceSeconds = 0.08;
+  return roundToThreeDecimals(
+    Math.min(Math.max(0, estimated + pauseAllowanceSeconds), Math.max(0, durationSeconds - 0.5))
+  );
+}
+
+function isContextTrimLikelyBadTake(
+  metrics: Awaited<ReturnType<typeof measureSegmentAudioFile>>
+): boolean {
+  if (metrics.integratedLoudness === null || metrics.truePeak === null) {
+    return false;
+  }
+
+  const desiredGainDb =
+    SEGMENT_LEVELING_SETTINGS.integratedLoudness - metrics.integratedLoudness;
+  const peakLimitedGainDb = SEGMENT_LEVELING_SETTINGS.truePeak - metrics.truePeak;
+  const gainShortfallDb = desiredGainDb - peakLimitedGainDb;
+
+  return gainShortfallDb > 4 || (metrics.internalDriftLufs ?? 0) > 8;
+}
+
+function countRouteWords(text: string): number {
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+function roundToThreeDecimals(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
 function truncate(text: string, maxLength: number): string {
   const compact = text.replace(/\s+/g, " ").trim();
   if (compact.length <= maxLength) {
@@ -1784,6 +2410,20 @@ function truncate(text: string, maxLength: number): string {
   return `${compact.slice(0, maxLength)}...`;
 }
 
-function readBooleanEnv(value: string | undefined): boolean {
-  return /^(1|true|yes|on)$/i.test(value ?? "");
+function readBooleanEnv(value: string | undefined, defaultValue = false): boolean {
+  if (value === undefined || value.trim() === "") {
+    return defaultValue;
+  }
+
+  return /^(1|true|yes|on)$/i.test(value);
+}
+
+function readPositiveIntegerEnv(value: string | undefined, defaultValue: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return defaultValue;
+  }
+
+  return parsed;
 }

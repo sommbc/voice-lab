@@ -14,6 +14,25 @@ export interface TextChunk {
   wordCount: number;
 }
 
+export interface SegmentContinuityPrompt {
+  input: string;
+  targetText: string;
+  previousContext: string;
+  nextContext: string;
+  contextOverlapUsed: boolean;
+  instructionStrength: "none" | "standard" | "strong";
+  targetWordCount: number;
+  inputWordCount: number;
+}
+
+export interface ChunkBoundaryRepair {
+  applied: boolean;
+  strategy: "merge" | "move-next-first-sentence" | "move-previous-last-sentence" | "none";
+  reason: string;
+  chunks: TextChunk[];
+  boundaryIndex: number;
+}
+
 export interface PreparedParagraph {
   kind: ParagraphKind;
   text: string;
@@ -146,8 +165,191 @@ export function chunkText(
 
   flushChunk();
   rebalanceTrailingChunk(chunks, targetMinWords, hardMaxWords);
+  rebalanceBoundarySensitiveChunks(chunks, targetMinWords, hardMaxWords);
 
   return chunks;
+}
+
+export function buildSegmentContinuityPrompt({
+  previousText,
+  targetText,
+  nextText,
+  enabled = true,
+  instructionStrength = "standard"
+}: {
+  previousText?: string;
+  targetText: string;
+  nextText?: string;
+  enabled?: boolean;
+  instructionStrength?: "standard" | "strong";
+}): SegmentContinuityPrompt {
+  const previousContext = previousText ? extractLastSentences(previousText, 2) : "";
+  const nextContext = nextText ? extractFirstSentences(nextText, 1) : "";
+  const contextOverlapUsed = enabled && Boolean(previousContext || nextContext);
+  const targetWordCount = countWords(targetText);
+
+  if (!contextOverlapUsed) {
+    return {
+      input: targetText,
+      targetText,
+      previousContext: "",
+      nextContext: "",
+      contextOverlapUsed: false,
+      instructionStrength: "none",
+      targetWordCount,
+      inputWordCount: targetWordCount
+    };
+  }
+
+  const continuityInstruction =
+    instructionStrength === "strong"
+      ? "You are continuing the same narration take. Match the exact same voice, tone, pacing, energy, emphasis, and emotional delivery from the previous passage. Do not restart with a new announcer tone. Read aloud only the target passage."
+      : "You are continuing the same narration take. Match the same voice, tone, pacing, energy, and emotional delivery from the previous passage. Read aloud only the target passage.";
+  const parts = [
+    continuityInstruction,
+    previousContext
+      ? `Previous context for continuity only, do not read aloud:\n${previousContext}`
+      : "",
+    `Target passage to read aloud:\n${targetText}`,
+    nextContext ? `Next context for pacing only, do not read aloud:\n${nextContext}` : ""
+  ].filter(Boolean);
+  const input = parts.join("\n\n");
+
+  return {
+    input,
+    targetText,
+    previousContext,
+    nextContext,
+    contextOverlapUsed: true,
+    instructionStrength,
+    targetWordCount,
+    inputWordCount: countWords(input)
+  };
+}
+
+export function extractLastSentences(text: string, sentenceCount: number): string {
+  return splitIntoSentences(text).slice(-sentenceCount).join(" ").trim();
+}
+
+export function extractFirstSentences(text: string, sentenceCount: number): string {
+  return splitIntoSentences(text).slice(0, sentenceCount).join(" ").trim();
+}
+
+export function repairChunkBoundary(
+  chunks: TextChunk[],
+  boundaryIndex: number,
+  {
+    hardMaxWords = DEFAULT_HARD_MAX_WORDS,
+    targetMinWords = DEFAULT_TARGET_MIN_WORDS
+  }: {
+    hardMaxWords?: number;
+    targetMinWords?: number;
+  } = {}
+): ChunkBoundaryRepair {
+  const previousIndex = boundaryIndex - 1;
+  const nextIndex = boundaryIndex;
+  const previous = chunks[previousIndex];
+  const next = chunks[nextIndex];
+
+  if (!previous || !next) {
+    return {
+      applied: false,
+      strategy: "none",
+      reason: "boundary-index-out-of-range",
+      chunks,
+      boundaryIndex
+    };
+  }
+
+  if (!isBoundaryLikelyTonalCliff(previous.text, next.text)) {
+    return {
+      applied: false,
+      strategy: "none",
+      reason: "boundary-not-sensitive",
+      chunks,
+      boundaryIndex
+    };
+  }
+
+  if (previous.wordCount + next.wordCount <= hardMaxWords) {
+    const repaired = chunks.slice();
+    repaired.splice(previousIndex, 2, {
+      text: `${previous.text}\n\n${next.text}`.trim(),
+      wordCount: previous.wordCount + next.wordCount
+    });
+
+    return {
+      applied: true,
+      strategy: "merge",
+      reason: "adjacent-chunks-fit-under-hard-cap",
+      chunks: repaired,
+      boundaryIndex
+    };
+  }
+
+  const nextSentences = splitIntoSentences(next.text);
+  const firstNextSentence = nextSentences[0] ?? "";
+  const firstNextWordCount = countWords(firstNextSentence);
+
+  if (
+    firstNextSentence &&
+    previous.wordCount + firstNextWordCount <= hardMaxWords &&
+    next.wordCount - firstNextWordCount >= Math.min(targetMinWords, 120)
+  ) {
+    const repaired = chunks.slice();
+    repaired[previousIndex] = {
+      text: `${previous.text}\n\n${firstNextSentence}`.trim(),
+      wordCount: previous.wordCount + firstNextWordCount
+    };
+    repaired[nextIndex] = {
+      text: nextSentences.slice(1).join(" ").trim(),
+      wordCount: next.wordCount - firstNextWordCount
+    };
+
+    return {
+      applied: true,
+      strategy: "move-next-first-sentence",
+      reason: "moved-sensitive-next-opening-into-previous-chunk",
+      chunks: repaired,
+      boundaryIndex
+    };
+  }
+
+  const previousSentences = splitIntoSentences(previous.text);
+  const lastPreviousSentence = previousSentences.at(-1) ?? "";
+  const lastPreviousWordCount = countWords(lastPreviousSentence);
+
+  if (
+    lastPreviousSentence &&
+    next.wordCount + lastPreviousWordCount <= hardMaxWords &&
+    previous.wordCount - lastPreviousWordCount >= Math.min(targetMinWords, 120)
+  ) {
+    const repaired = chunks.slice();
+    repaired[previousIndex] = {
+      text: previousSentences.slice(0, -1).join(" ").trim(),
+      wordCount: previous.wordCount - lastPreviousWordCount
+    };
+    repaired[nextIndex] = {
+      text: `${lastPreviousSentence}\n\n${next.text}`.trim(),
+      wordCount: next.wordCount + lastPreviousWordCount
+    };
+
+    return {
+      applied: true,
+      strategy: "move-previous-last-sentence",
+      reason: "moved-sensitive-previous-ending-into-next-chunk",
+      chunks: repaired,
+      boundaryIndex
+    };
+  }
+
+  return {
+    applied: false,
+    strategy: "none",
+    reason: "adjacent-chunks-too-large-to-repair-safely",
+    chunks,
+    boundaryIndex
+  };
 }
 
 export function slugifyFilename(input: string, fallback = "voiceover"): string {
@@ -284,6 +486,29 @@ function rebalanceTrailingChunk(
   }
 }
 
+function rebalanceBoundarySensitiveChunks(
+  chunks: TextChunk[],
+  targetMinWords: number,
+  hardMaxWords: number
+): void {
+  let index = 1;
+  const maxPasses = Math.max(1, chunks.length * 2);
+  let passes = 0;
+
+  while (index < chunks.length && passes < maxPasses) {
+    passes += 1;
+    const repair = repairChunkBoundary(chunks, index, { targetMinWords, hardMaxWords });
+
+    if (!repair.applied) {
+      index += 1;
+      continue;
+    }
+
+    chunks.splice(0, chunks.length, ...repair.chunks);
+    index += 1;
+  }
+}
+
 function shouldKeepBoundaryOpen(previousPart: TextChunk | undefined, nextPart: TextChunk): boolean {
   if (!previousPart) {
     return false;
@@ -314,6 +539,29 @@ function isBoundarySensitivePart(part: TextChunk): boolean {
   }
 
   return part.wordCount <= 48 && sentenceCount <= 2 && isHeadingLikeParagraph(trimmed);
+}
+
+function isBoundaryLikelyTonalCliff(previousText: string, nextText: string): boolean {
+  const previous = previousText.trim();
+  const next = nextText.trim();
+  const lastSentence = splitIntoSentences(previous).at(-1) ?? previous;
+  const firstSentence = splitIntoSentences(next)[0] ?? next;
+
+  if (!previous || !next) {
+    return false;
+  }
+
+  return (
+    /[:;]$/.test(lastSentence) ||
+    isQuoteLikeParagraph(lastSentence) ||
+    countWords(lastSentence) <= 12 ||
+    /^(but|and|so|because|then|still|instead|meanwhile|this|that|these|those|which|the point|the problem|the truth)\b/i.test(
+      firstSentence
+    ) ||
+    /^(this is|that is|here is|the question is|the point is|the problem is|the future|the standard)\b/i.test(
+      firstSentence
+    )
+  );
 }
 
 function isShortFollowUpParagraph(part: TextChunk): boolean {

@@ -143,6 +143,25 @@ export type SegmentSeamAdjustment = {
   filter: string | null;
 };
 
+export type SegmentSeamFailureKind = "passed" | "mechanical" | "tonal" | "mixed";
+
+export type SegmentSeamRegenerationAttempt = {
+  attempt: number;
+  segmentIndex: number;
+  reason: string;
+  contextOverlapUsed: boolean;
+  contextLikelySpoken: boolean;
+  accepted: boolean;
+  scoreBefore: number;
+  scoreAfter: number;
+};
+
+export type SegmentBoundaryRepairRecord = {
+  applied: boolean;
+  strategy: "merge" | "move-next-first-sentence" | "move-previous-last-sentence" | "none";
+  reason: string;
+};
+
 export type SegmentBoundaryDiagnostic = {
   boundaryIndex: number;
   previousSegmentIndex: number;
@@ -168,6 +187,17 @@ export type SegmentBoundaryDiagnostic = {
   speechCutoffRiskAfter: boolean;
   spectralDifferenceScore: number | null;
   suddenToneMismatch: boolean;
+  previousSpeakingRateWps: number | null;
+  nextSpeakingRateWps: number | null;
+  speakingRateDeltaWps: number | null;
+  toneMismatchScore: number;
+  seamFailureKind: SegmentSeamFailureKind;
+  seamFailureReason: string;
+  previousContextTail: string | null;
+  nextContextHead: string | null;
+  contextOverlapUsed: boolean;
+  regenerationAttempts: SegmentSeamRegenerationAttempt[];
+  boundaryRepair: SegmentBoundaryRepairRecord | null;
   seamQualityScore: number;
   seamPassed: boolean;
   seamClipPath: string | null;
@@ -188,6 +218,7 @@ export type SegmentDiagnosticsWarning = {
     | "seam-quality"
     | "speech-cutoff-risk"
     | "spectral-mismatch"
+    | "tonal-mismatch"
     | "seam-gap"
     | "segment-internal-drift"
     | "final-true-peak"
@@ -203,6 +234,17 @@ export type SegmentDiagnosticsManifestSegment = {
   segmentIndex: number;
   wordCount: number;
   generationAttempt: number;
+  generationInputWordCount: number;
+  targetWordCount: number;
+  contextOverlapUsed: boolean;
+  contextInstructionStrength: "none" | "standard" | "strong";
+  previousContext: string;
+  nextContext: string;
+  contextLikelySpoken: boolean;
+  contextFallbackUsed: boolean;
+  contextAudioTrimmed: boolean;
+  contextAudioTrimSeconds: number | null;
+  regenerationReason?: string;
   rawMetrics: SegmentAudioMetrics;
   standardizedMetrics: SegmentAudioMetrics;
   leveledMetrics: SegmentAudioMetrics;
@@ -265,6 +307,8 @@ export const SEGMENT_INTERNAL_DRIFT_WARNING_LU = 4;
 export const SEGMENT_SEAM_SCORE_WARNING = 35;
 export const SEGMENT_RMS_BOUNDARY_WARNING_DB = 3;
 export const SEGMENT_SPECTRAL_MISMATCH_WARNING = 12;
+export const SEGMENT_TONE_MISMATCH_WARNING = 18;
+export const SEGMENT_SPEAKING_RATE_DELTA_WARNING_WPS = 0.35;
 export const SEGMENT_EDGE_CUTOFF_RMS_WARNING_DB = -20;
 export const SEGMENT_EDGE_MATCH_THRESHOLD_LU = 2;
 export const SEGMENT_EDGE_MATCH_MAX_CUT_DB = 3;
@@ -1838,11 +1882,45 @@ export function getAdaptiveJoinPauseMs({
   return classifyJoinPause(previousText, nextText, smoothJoins).pauseMs;
 }
 
+export function computeToneMismatchScore({
+  spectralDifferenceScore,
+  speakingRateDeltaWps,
+  toneSeamScoringEnabled = true
+}: {
+  spectralDifferenceScore: number | null;
+  speakingRateDeltaWps: number | null;
+  toneSeamScoringEnabled?: boolean;
+}): number {
+  if (!toneSeamScoringEnabled) {
+    return 0;
+  }
+
+  let score = 0;
+
+  if (
+    spectralDifferenceScore !== null &&
+    spectralDifferenceScore > SEGMENT_SPECTRAL_MISMATCH_WARNING
+  ) {
+    score += (spectralDifferenceScore - SEGMENT_SPECTRAL_MISMATCH_WARNING) * 1.5;
+  }
+
+  if (
+    speakingRateDeltaWps !== null &&
+    speakingRateDeltaWps > SEGMENT_SPEAKING_RATE_DELTA_WARNING_WPS
+  ) {
+    score +=
+      (speakingRateDeltaWps - SEGMENT_SPEAKING_RATE_DELTA_WARNING_WPS) * 42;
+  }
+
+  return roundToTwoDecimals(Math.min(100, score));
+}
+
 export function computeSeamQualityScore({
   loudnessDeltaLufs,
   rmsDeltaDb,
   gapDurationMs,
   spectralDifferenceScore,
+  toneMismatchScore = 0,
   speechCutoffRiskBefore,
   speechCutoffRiskAfter,
   highTruePeakNearBoundary
@@ -1851,6 +1929,7 @@ export function computeSeamQualityScore({
   rmsDeltaDb: number | null;
   gapDurationMs: number;
   spectralDifferenceScore: number | null;
+  toneMismatchScore?: number;
   speechCutoffRiskBefore: boolean;
   speechCutoffRiskAfter: boolean;
   highTruePeakNearBoundary: boolean;
@@ -1878,6 +1957,10 @@ export function computeSeamQualityScore({
     spectralDifferenceScore > SEGMENT_SPECTRAL_MISMATCH_WARNING
   ) {
     score += (spectralDifferenceScore - SEGMENT_SPECTRAL_MISMATCH_WARNING) * 1.2;
+  }
+
+  if (toneMismatchScore > SEGMENT_TONE_MISMATCH_WARNING) {
+    score += toneMismatchScore;
   }
 
   if (speechCutoffRiskBefore) {
@@ -1915,7 +1998,11 @@ export function selectSeamRegenerationTargets(
     const previousMetrics = segmentMetrics[previousIndex - 1];
     const nextMetrics = segmentMetrics[nextIndex - 1];
 
-    if (boundary.speechCutoffRiskBefore) {
+    if (boundary.seamFailureKind === "tonal") {
+      targets.add(nextIndex);
+    } else if (boundary.seamFailureKind === "mixed" && boundary.suddenToneMismatch) {
+      targets.add(nextIndex);
+    } else if (boundary.speechCutoffRiskBefore) {
       targets.add(previousIndex);
     } else if (boundary.speechCutoffRiskAfter) {
       targets.add(nextIndex);
@@ -2027,7 +2114,14 @@ export function buildSegmentBoundaryDiagnostics(
   segmentMetrics: SegmentAudioMetrics[],
   pauseDurationsSeconds: number | number[] = 0,
   boundaryThresholdLufs = SEGMENT_BOUNDARY_DELTA_WARNING_LU,
-  nearBoundaryThresholdLufs = SEGMENT_NEAR_BOUNDARY_JUMP_WARNING_LU
+  nearBoundaryThresholdLufs = SEGMENT_NEAR_BOUNDARY_JUMP_WARNING_LU,
+  {
+    wordCounts,
+    toneSeamScoringEnabled = true
+  }: {
+    wordCounts?: number[];
+    toneSeamScoringEnabled?: boolean;
+  } = {}
 ): SegmentBoundaryDiagnostic[] {
   const diagnostics: SegmentBoundaryDiagnostic[] = [];
   let segmentStartSeconds: number | null = 0;
@@ -2062,6 +2156,23 @@ export function buildSegmentBoundaryDiagnostics(
       nextZeroCrossingRate: next.firstTwoSecondZeroCrossingRate,
       rmsDeltaDb
     });
+    const previousSpeakingRateWps = computeSpeakingRateWps(
+      wordCounts?.[index],
+      current.durationSeconds
+    );
+    const nextSpeakingRateWps = computeSpeakingRateWps(
+      wordCounts?.[index + 1],
+      next.durationSeconds
+    );
+    const speakingRateDeltaWps =
+      previousSpeakingRateWps === null || nextSpeakingRateWps === null
+        ? null
+        : roundToTwoDecimals(Math.abs(nextSpeakingRateWps - previousSpeakingRateWps));
+    const toneMismatchScore = computeToneMismatchScore({
+      spectralDifferenceScore,
+      speakingRateDeltaWps,
+      toneSeamScoringEnabled
+    });
     const highTruePeakNearBoundary =
       (current.truePeak !== null && current.truePeak > SEGMENT_LEVELING_SETTINGS.truePeak + 0.5) ||
       (next.truePeak !== null && next.truePeak > SEGMENT_LEVELING_SETTINGS.truePeak + 0.5);
@@ -2072,13 +2183,41 @@ export function buildSegmentBoundaryDiagnostics(
       rmsDeltaDb,
       gapDurationMs,
       spectralDifferenceScore,
+      toneMismatchScore,
       speechCutoffRiskBefore,
       speechCutoffRiskAfter,
       highTruePeakNearBoundary
     });
     const suddenToneMismatch =
-      spectralDifferenceScore !== null &&
-      spectralDifferenceScore > SEGMENT_SPECTRAL_MISMATCH_WARNING;
+      toneSeamScoringEnabled && toneMismatchScore > SEGMENT_TONE_MISMATCH_WARNING;
+    const mechanicalFailed =
+      (deltaLufs !== null && deltaLufs > nearBoundaryThresholdLufs) ||
+      (rmsDeltaDb !== null && rmsDeltaDb > SEGMENT_RMS_BOUNDARY_WARNING_DB) ||
+      speechCutoffRiskBefore ||
+      speechCutoffRiskAfter ||
+      highTruePeakNearBoundary ||
+      gapDurationMs > SECTION_JOIN_PAUSE_MS;
+    const seamPassed =
+      seamQualityScore < SEGMENT_SEAM_SCORE_WARNING && !mechanicalFailed && !suddenToneMismatch;
+    const seamFailureKind: SegmentSeamFailureKind = seamPassed
+      ? "passed"
+      : mechanicalFailed && suddenToneMismatch
+        ? "mixed"
+        : suddenToneMismatch
+          ? "tonal"
+          : "mechanical";
+    const seamFailureReason = describeSeamFailure({
+      seamPassed,
+      seamFailureKind,
+      deltaLufs,
+      rmsDeltaDb,
+      gapDurationMs,
+      spectralDifferenceScore,
+      speakingRateDeltaWps,
+      toneMismatchScore,
+      speechCutoffRiskBefore,
+      speechCutoffRiskAfter
+    });
 
     diagnostics.push({
       boundaryIndex: index + 1,
@@ -2106,14 +2245,19 @@ export function buildSegmentBoundaryDiagnostics(
       speechCutoffRiskAfter,
       spectralDifferenceScore,
       suddenToneMismatch,
+      previousSpeakingRateWps,
+      nextSpeakingRateWps,
+      speakingRateDeltaWps,
+      toneMismatchScore,
+      seamFailureKind,
+      seamFailureReason,
+      previousContextTail: null,
+      nextContextHead: null,
+      contextOverlapUsed: false,
+      regenerationAttempts: [],
+      boundaryRepair: null,
       seamQualityScore,
-      seamPassed:
-        seamQualityScore < SEGMENT_SEAM_SCORE_WARNING &&
-        !(deltaLufs !== null && deltaLufs > nearBoundaryThresholdLufs) &&
-        !(rmsDeltaDb !== null && rmsDeltaDb > SEGMENT_RMS_BOUNDARY_WARNING_DB) &&
-        !suddenToneMismatch &&
-        !speechCutoffRiskBefore &&
-        !speechCutoffRiskAfter,
+      seamPassed,
       seamClipPath: null
     });
 
@@ -2194,6 +2338,21 @@ export function collectSegmentDiagnosticsWarnings({
         boundaryIndex: boundary.boundaryIndex,
         value: boundary.spectralDifferenceScore,
         threshold: SEGMENT_SPECTRAL_MISMATCH_WARNING
+      });
+    }
+
+    if (
+      (boundary.seamFailureKind === "tonal" || boundary.seamFailureKind === "mixed") &&
+      boundary.toneMismatchScore > SEGMENT_TONE_MISMATCH_WARNING
+    ) {
+      warnings.push({
+        code: "tonal-mismatch",
+        message: `Boundary ${boundary.boundaryIndex} tonal mismatch score is ${boundary.toneMismatchScore.toFixed(
+          2
+        )}.`,
+        boundaryIndex: boundary.boundaryIndex,
+        value: boundary.toneMismatchScore,
+        threshold: SEGMENT_TONE_MISMATCH_WARNING
       });
     }
 
@@ -2712,6 +2871,88 @@ function computeSpectralDifferenceScore({
   const zeroCrossingDelta = Math.abs(nextZeroCrossingRate - previousZeroCrossingRate);
   const rmsContribution = rmsDeltaDb === null ? 0 : Math.min(10, rmsDeltaDb);
   return roundToTwoDecimals(zeroCrossingDelta * 100 + rmsContribution * 0.75);
+}
+
+function computeSpeakingRateWps(
+  wordCount: number | undefined,
+  durationSeconds: number | null
+): number | null {
+  if (
+    wordCount === undefined ||
+    durationSeconds === null ||
+    !Number.isFinite(durationSeconds) ||
+    durationSeconds <= 0
+  ) {
+    return null;
+  }
+
+  return roundToTwoDecimals(wordCount / durationSeconds);
+}
+
+function describeSeamFailure({
+  seamPassed,
+  seamFailureKind,
+  deltaLufs,
+  rmsDeltaDb,
+  gapDurationMs,
+  spectralDifferenceScore,
+  speakingRateDeltaWps,
+  toneMismatchScore,
+  speechCutoffRiskBefore,
+  speechCutoffRiskAfter
+}: {
+  seamPassed: boolean;
+  seamFailureKind: SegmentSeamFailureKind;
+  deltaLufs: number | null;
+  rmsDeltaDb: number | null;
+  gapDurationMs: number;
+  spectralDifferenceScore: number | null;
+  speakingRateDeltaWps: number | null;
+  toneMismatchScore: number;
+  speechCutoffRiskBefore: boolean;
+  speechCutoffRiskAfter: boolean;
+}): string {
+  if (seamPassed) {
+    return "passed";
+  }
+
+  const reasons: string[] = [];
+
+  if (deltaLufs !== null && deltaLufs > SEGMENT_NEAR_BOUNDARY_JUMP_WARNING_LU) {
+    reasons.push(`loudness-delta-${deltaLufs.toFixed(2)}LU`);
+  }
+
+  if (rmsDeltaDb !== null && rmsDeltaDb > SEGMENT_RMS_BOUNDARY_WARNING_DB) {
+    reasons.push(`rms-delta-${rmsDeltaDb.toFixed(2)}dB`);
+  }
+
+  if (gapDurationMs > SECTION_JOIN_PAUSE_MS) {
+    reasons.push(`gap-${gapDurationMs}ms`);
+  }
+
+  if (speechCutoffRiskBefore || speechCutoffRiskAfter) {
+    reasons.push("speech-cutoff-risk");
+  }
+
+  if (toneMismatchScore > SEGMENT_TONE_MISMATCH_WARNING) {
+    reasons.push(`tone-score-${toneMismatchScore.toFixed(2)}`);
+  }
+
+  if (
+    spectralDifferenceScore !== null &&
+    spectralDifferenceScore > SEGMENT_SPECTRAL_MISMATCH_WARNING
+  ) {
+    reasons.push(`spectral-proxy-${spectralDifferenceScore.toFixed(2)}`);
+  }
+
+  if (
+    speakingRateDeltaWps !== null &&
+    speakingRateDeltaWps > SEGMENT_SPEAKING_RATE_DELTA_WARNING_WPS
+  ) {
+    reasons.push(`speaking-rate-delta-${speakingRateDeltaWps.toFixed(2)}wps`);
+  }
+
+  return `${seamFailureKind}:${reasons.join(",") || "score-threshold"}`;
 }
 
 function classifyJoinPause(

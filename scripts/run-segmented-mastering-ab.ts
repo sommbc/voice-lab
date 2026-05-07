@@ -28,7 +28,14 @@ import {
   type SegmentDiagnosticsManifestSegment
 } from "../lib/audio";
 import { parseMistralAudioResponse, postMistralSpeech } from "../lib/mistral";
-import { chunkText, prepareTextForSpeech } from "../lib/text";
+import {
+  buildSegmentContinuityPrompt,
+  chunkText,
+  extractFirstSentences,
+  extractLastSentences,
+  prepareTextForSpeech,
+  type SegmentContinuityPrompt
+} from "../lib/text";
 
 loadEnvConfig(process.cwd());
 
@@ -37,6 +44,11 @@ const essayPath = path.resolve(
   process.argv[2] ?? "test/fixtures/long-form-essay.md"
 );
 const voiceId = process.env.MISTRAL_VOICE_ID?.trim() ?? "";
+const contextOverlapEnabled = readBooleanEnv(process.env.VOICEOVER_CONTEXT_OVERLAP, true);
+const toneSeamScoringEnabled = readBooleanEnv(
+  process.env.VOICEOVER_TONE_SEAM_SCORING,
+  true
+);
 
 void main();
 
@@ -78,10 +90,31 @@ async function main(): Promise<void> {
       const rawPath = path.join(workspacePath, `segment-${segmentId}-raw.wav`);
       const standardizedPath = path.join(workspacePath, `segment-${segmentId}-standardized.wav`);
       const leveledPath = path.join(workspacePath, `segment-${segmentId}-leveled.wav`);
+      const prompt = buildSegmentContinuityPrompt({
+        previousText: segments[index - 1]?.text,
+        targetText: segments[index].text,
+        nextText: segments[index + 1]?.text,
+        enabled: false,
+        instructionStrength: "standard"
+      });
+      const continuityContextPrompt = buildSegmentContinuityPrompt({
+        previousText: segments[index - 1]?.text,
+        targetText: segments[index].text,
+        nextText: segments[index + 1]?.text,
+        enabled: contextOverlapEnabled,
+        instructionStrength: "standard"
+      });
+      const spokenOverlapInput =
+        contextOverlapEnabled && continuityContextPrompt.previousContext
+          ? buildSpokenContextOverlapInput({
+              previousContext: continuityContextPrompt.previousContext,
+              targetText: segments[index].text
+            })
+          : null;
 
       console.log(`Requesting segment ${segmentNumber} of ${segments.length}...`);
       const response = await postMistralSpeech({
-        input: segments[index].text,
+        input: spokenOverlapInput?.input ?? prompt.input,
         voiceId,
         responseFormat: "wav",
         timeoutMs: 120_000
@@ -98,10 +131,105 @@ async function main(): Promise<void> {
 
       const rawBuffer = await parseMistralAudioResponse(response);
       await writeFile(rawPath, rawBuffer);
-      const rawMetrics = await measureSegmentAudioFile(rawPath);
+      let rawMetrics = await measureSegmentAudioFile(rawPath);
+      let finalRawPath = rawPath;
+      let finalPrompt: SegmentContinuityPrompt = spokenOverlapInput
+        ? {
+            ...continuityContextPrompt,
+            input: spokenOverlapInput.input,
+            nextContext: "",
+            contextOverlapUsed: true,
+            inputWordCount: spokenOverlapInput.inputWordCount
+          }
+        : prompt;
+      let contextLikelySpoken = false;
+      let contextFallbackUsed = false;
+      let contextAudioTrimmed = false;
+      let contextAudioTrimSeconds: number | null = null;
+
+      if (spokenOverlapInput && rawMetrics.durationSeconds !== null) {
+        const trimSeconds = estimateContextAudioTrimSeconds({
+          durationSeconds: rawMetrics.durationSeconds,
+          contextWordCount: spokenOverlapInput.contextWordCount,
+          targetWordCount: segments[index].wordCount
+        });
+        finalRawPath = path.join(workspacePath, `segment-${segmentId}-raw-context-trimmed.wav`);
+        await extractAudioClip({
+          inputPath: rawPath,
+          outputPath: finalRawPath,
+          startSeconds: trimSeconds,
+          durationSeconds: Math.max(0.5, rawMetrics.durationSeconds - trimSeconds)
+        });
+        rawMetrics = await measureSegmentAudioFile(finalRawPath);
+        contextAudioTrimmed = true;
+        contextAudioTrimSeconds = trimSeconds;
+        console.log(`  trimmed ${trimSeconds.toFixed(2)} s of spoken continuity context`);
+
+        if (isContextTrimLikelyBadTake(rawMetrics)) {
+          console.log("  context-trimmed take failed quality guard; regenerating target passage only");
+          finalPrompt = buildSegmentContinuityPrompt({
+            targetText: segments[index].text,
+            enabled: false
+          });
+          const fallbackResponse = await postMistralSpeech({
+            input: finalPrompt.input,
+            voiceId,
+            responseFormat: "wav",
+            timeoutMs: 120_000
+          });
+
+          if (!fallbackResponse.ok) {
+            const errorBody = await fallbackResponse.text();
+            console.error(
+              `Segment ${segmentNumber} target-only fallback failed: ${fallbackResponse.status} ${fallbackResponse.statusText}`
+            );
+            if (errorBody) {
+              console.error(errorBody);
+            }
+            process.exit(1);
+          }
+
+          finalRawPath = path.join(workspacePath, `segment-${segmentId}-raw-target-only.wav`);
+          const fallbackRawBuffer = await parseMistralAudioResponse(fallbackResponse);
+          await writeFile(finalRawPath, fallbackRawBuffer);
+          rawMetrics = await measureSegmentAudioFile(finalRawPath);
+          contextFallbackUsed = true;
+          contextAudioTrimmed = false;
+          contextAudioTrimSeconds = null;
+        }
+      } else if (contextLikelySpoken) {
+        console.log("  context likely spoken; regenerating target passage only");
+        finalPrompt = buildSegmentContinuityPrompt({
+          targetText: segments[index].text,
+          enabled: false
+        });
+        const fallbackResponse = await postMistralSpeech({
+          input: finalPrompt.input,
+          voiceId,
+          responseFormat: "wav",
+          timeoutMs: 120_000
+        });
+
+        if (!fallbackResponse.ok) {
+          const errorBody = await fallbackResponse.text();
+          console.error(
+            `Segment ${segmentNumber} target-only fallback failed: ${fallbackResponse.status} ${fallbackResponse.statusText}`
+          );
+          if (errorBody) {
+            console.error(errorBody);
+          }
+          process.exit(1);
+        }
+
+        finalRawPath = path.join(workspacePath, `segment-${segmentId}-raw-target-only.wav`);
+        const fallbackRawBuffer = await parseMistralAudioResponse(fallbackResponse);
+        await writeFile(finalRawPath, fallbackRawBuffer);
+        rawMetrics = await measureSegmentAudioFile(finalRawPath);
+        contextFallbackUsed = true;
+      }
 
       await standardizeSegmentAudioFile({
-        inputPath: rawPath,
+        inputPath: finalRawPath,
         outputPath: standardizedPath
       });
       const standardizedMetrics = await measureSegmentAudioFile(standardizedPath);
@@ -118,6 +246,16 @@ async function main(): Promise<void> {
         segmentIndex: segmentNumber,
         wordCount: segments[index].wordCount,
         generationAttempt: 1,
+        generationInputWordCount: finalPrompt.inputWordCount,
+        targetWordCount: finalPrompt.targetWordCount,
+        contextOverlapUsed: finalPrompt.contextOverlapUsed,
+        contextInstructionStrength: finalPrompt.instructionStrength,
+        previousContext: finalPrompt.previousContext,
+        nextContext: finalPrompt.nextContext,
+        contextLikelySpoken,
+        contextFallbackUsed,
+        contextAudioTrimmed,
+        contextAudioTrimSeconds,
         rawMetrics,
         standardizedMetrics,
         leveledMetrics,
@@ -144,14 +282,22 @@ async function main(): Promise<void> {
     );
     let boundaries = buildSegmentBoundaryDiagnostics(
       manifestSegments.map((segment) => segment.leveledMetrics),
-      joinPlan.map((join) => join.pauseMs / 1000)
+      joinPlan.map((join) => join.pauseMs / 1000),
+      undefined,
+      undefined,
+      {
+        wordCounts: segments.map((segment) => segment.wordCount),
+        toneSeamScoringEnabled
+      }
     );
+    hydrateScriptBoundaryContext(boundaries, segments, manifestSegments);
     boundaries = await applyScriptSeamAdjustments({
       workspacePath,
       leveledPaths,
       manifestSegments,
       boundaries,
-      joinPlan
+      joinPlan,
+      segments
     });
     const joinReadyPaths = await insertJoinGaps({
       workspacePath,
@@ -300,13 +446,15 @@ async function applyScriptSeamAdjustments({
   leveledPaths,
   manifestSegments,
   boundaries,
-  joinPlan
+  joinPlan,
+  segments
 }: {
   workspacePath: string;
   leveledPaths: string[];
   manifestSegments: SegmentDiagnosticsManifestSegment[];
   boundaries: SegmentBoundaryDiagnostic[];
   joinPlan: Array<{ pauseMs: number }>;
+  segments: Array<{ text: string; wordCount: number }>;
 }): Promise<SegmentBoundaryDiagnostic[]> {
   const adjustments = computeSegmentSeamAdjustments(boundaries, leveledPaths.length);
   const actionableAdjustments = adjustments.filter(
@@ -356,10 +504,18 @@ async function applyScriptSeamAdjustments({
     );
   }
 
-  return buildSegmentBoundaryDiagnostics(
+  const adjustedBoundaries = buildSegmentBoundaryDiagnostics(
     manifestSegments.map((segment) => segment.leveledMetrics),
-    joinPlan.map((join) => join.pauseMs / 1000)
+    joinPlan.map((join) => join.pauseMs / 1000),
+    undefined,
+    undefined,
+    {
+      wordCounts: segments.map((segment) => segment.wordCount),
+      toneSeamScoringEnabled
+    }
   );
+  hydrateScriptBoundaryContext(adjustedBoundaries, segments, manifestSegments);
+  return adjustedBoundaries;
 }
 
 async function mergeWithWavFallback({
@@ -438,11 +594,96 @@ function printBoundaries(boundaries: ReturnType<typeof buildSegmentBoundaryDiagn
       )}  before ${formatMetric(
         boundary.beforeLoudness,
         "LUFS"
-      )} after ${formatMetric(boundary.afterLoudness, "LUFS")}  clip ${
+      )} after ${formatMetric(boundary.afterLoudness, "LUFS")}  tone ${boundary.toneMismatchScore.toFixed(
+        2
+      )} ${boundary.seamFailureKind}  clip ${
         boundary.seamClipPath ?? "none"
       }`
     );
   }
+}
+
+function hydrateScriptBoundaryContext(
+  boundaries: SegmentBoundaryDiagnostic[],
+  segments: Array<{ text: string }>,
+  manifestSegments: SegmentDiagnosticsManifestSegment[]
+): void {
+  for (const boundary of boundaries) {
+    const previous = segments[boundary.previousSegmentIndex - 1];
+    const next = segments[boundary.nextSegmentIndex - 1];
+    const nextManifest = manifestSegments[boundary.nextSegmentIndex - 1];
+
+    boundary.previousContextTail = previous ? extractLastSentences(previous.text, 2) : null;
+    boundary.nextContextHead = next ? extractFirstSentences(next.text, 1) : null;
+    boundary.contextOverlapUsed = nextManifest?.contextOverlapUsed ?? false;
+  }
+}
+
+function buildSpokenContextOverlapInput({
+  previousContext,
+  targetText
+}: {
+  previousContext: string;
+  targetText: string;
+}): {
+  input: string;
+  inputWordCount: number;
+  contextWordCount: number;
+} {
+  const input = `${previousContext.trim()}\n\n${targetText.trim()}`.trim();
+
+  return {
+    input,
+    inputWordCount: countScriptWords(input),
+    contextWordCount: countScriptWords(previousContext)
+  };
+}
+
+function estimateContextAudioTrimSeconds({
+  durationSeconds,
+  contextWordCount,
+  targetWordCount
+}: {
+  durationSeconds: number;
+  contextWordCount: number;
+  targetWordCount: number;
+}): number {
+  const totalWords = Math.max(1, contextWordCount + targetWordCount);
+  const estimated = durationSeconds * (contextWordCount / totalWords);
+  return roundToThreeDecimals(
+    Math.min(Math.max(0, estimated + 0.08), Math.max(0, durationSeconds - 0.5))
+  );
+}
+
+function isContextTrimLikelyBadTake(
+  metrics: Awaited<ReturnType<typeof measureSegmentAudioFile>>
+): boolean {
+  if (metrics.integratedLoudness === null || metrics.truePeak === null) {
+    return false;
+  }
+
+  const desiredGainDb =
+    SEGMENT_LEVELING_SETTINGS.integratedLoudness - metrics.integratedLoudness;
+  const peakLimitedGainDb = SEGMENT_LEVELING_SETTINGS.truePeak - metrics.truePeak;
+  const gainShortfallDb = desiredGainDb - peakLimitedGainDb;
+
+  return gainShortfallDb > 4 || (metrics.internalDriftLufs ?? 0) > 8;
+}
+
+function countScriptWords(text: string): number {
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+function roundToThreeDecimals(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+function readBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined || value.trim() === "") {
+    return defaultValue;
+  }
+
+  return /^(1|true|yes|on)$/i.test(value);
 }
 
 function printFinalAnalysis(

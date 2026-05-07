@@ -24,6 +24,7 @@ import {
   computeSegmentLevelingGainDb,
   computeSegmentSeamAdjustments,
   computeSeamQualityScore,
+  computeToneMismatchScore,
   computeStaticMasteringGainDb,
   formatAudioTimestamp,
   getAdaptiveJoinPauseMs,
@@ -32,6 +33,7 @@ import {
   resolveMasteringStrategy,
   SEGMENT_LEVELING_SETTINGS,
   SEGMENT_STANDARDIZATION_FILTER,
+  SEGMENT_TONE_MISMATCH_WARNING,
   SPEECH_PREMASTER_FILTER,
   SPEECH_LEVELER_FILTER,
   SPEECH_LEVELER_PREMASTER_FILTER,
@@ -46,7 +48,11 @@ import {
   DEFAULT_HARD_MAX_WORDS,
   DEFAULT_TARGET_MAX_WORDS,
   DEFAULT_TARGET_MIN_WORDS,
+  buildSegmentContinuityPrompt,
   chunkText,
+  extractFirstSentences,
+  extractLastSentences,
+  repairChunkBoundary,
   prepareTextForSpeech
 } from "../lib/text";
 
@@ -103,6 +109,80 @@ test("chunking splits oversized paragraphs on sentence boundaries before the har
     );
     assert.match(segment.text, /\.$/, "segment should end at a sentence boundary");
   }
+});
+
+test("continuity prompts separate context from the target passage", () => {
+  const previous =
+    "The old work had a rhythm. It asked for patience. The narrator should carry that energy forward.";
+  const target =
+    "The next paragraph is the part that should be spoken in the final output.";
+  const next = "Then the essay turns toward the practical consequences.";
+  const prompt = buildSegmentContinuityPrompt({
+    previousText: previous,
+    targetText: target,
+    nextText: next,
+    enabled: true
+  });
+
+  assert.equal(
+    extractLastSentences(previous, 2),
+    "It asked for patience. The narrator should carry that energy forward."
+  );
+  assert.equal(
+    extractFirstSentences(next, 1),
+    "Then the essay turns toward the practical consequences."
+  );
+  assert.equal(prompt.contextOverlapUsed, true);
+  assert.equal(prompt.targetText, target);
+  assert.equal(prompt.instructionStrength, "standard");
+  assert.match(prompt.input, /Previous context for continuity only, do not read aloud:/);
+  assert.match(prompt.input, /Target passage to read aloud:/);
+  assert.match(prompt.input, /Next context for pacing only, do not read aloud:/);
+  assert.equal(prompt.input.split(target).length - 1, 1);
+  assert.ok(prompt.inputWordCount > prompt.targetWordCount);
+
+  const disabled = buildSegmentContinuityPrompt({
+    previousText: previous,
+    targetText: target,
+    nextText: next,
+    enabled: false
+  });
+  assert.equal(disabled.input, target);
+  assert.equal(disabled.contextOverlapUsed, false);
+  assert.equal(disabled.instructionStrength, "none");
+});
+
+test("boundary repair moves sensitive transitions away from stitch points", () => {
+  const previous = {
+    text: `${Array.from({ length: 228 }, (_, index) => `steady${index}`).join(" ")}. The problem is:`,
+    wordCount: 231
+  };
+  const next = {
+    text: `This is where the tone should not restart. ${Array.from(
+      { length: 40 },
+      (_unused, index) => `follow${index}`
+    ).join(" ")}.`,
+    wordCount: 49
+  };
+  const repair = repairChunkBoundary([previous, next], 1);
+
+  assert.equal(repair.applied, true);
+  assert.equal(repair.strategy, "merge");
+  assert.equal(repair.chunks.length, 1);
+  assert.ok(repair.chunks[0].wordCount <= DEFAULT_HARD_MAX_WORDS);
+
+  const neutral = repairChunkBoundary(
+    [
+      {
+        text: "The section ends cleanly with a complete thought that does not invite a reset.",
+        wordCount: 13
+      },
+      { text: "Another section begins cleanly too.", wordCount: 5 }
+    ],
+    1
+  );
+  assert.equal(neutral.applied, false);
+  assert.equal(neutral.reason, "boundary-not-sensitive");
 });
 
 test("cleanup strips markdown junk and preserves paragraph boundaries", async () => {
@@ -483,6 +563,66 @@ test("seam quality scoring and regeneration target selection catch bad patch poi
   assert.deepEqual(targets, [2]);
 });
 
+test("tonal seam scoring can fail a mechanically clean boundary", () => {
+  const toneScore = computeToneMismatchScore({
+    spectralDifferenceScore: 22,
+    speakingRateDeltaWps: 0.52
+  });
+  assert.ok(toneScore > SEGMENT_TONE_MISMATCH_WARNING);
+
+  const boundaries = buildSegmentBoundaryDiagnostics(
+    [
+      makeSegmentMetrics({
+        durationSeconds: 100,
+        firstWindowLoudness: -18.2,
+        lastWindowLoudness: -18.1,
+        lastTwoSecondZeroCrossingRate: 0.36
+      }),
+      makeSegmentMetrics({
+        durationSeconds: 74,
+        firstWindowLoudness: -18,
+        lastWindowLoudness: -18.1,
+        firstTwoSecondZeroCrossingRate: 0.12
+      })
+    ],
+    [0.22],
+    undefined,
+    undefined,
+    {
+      wordCounts: [230, 230],
+      toneSeamScoringEnabled: true
+    }
+  );
+  const targets = selectSeamRegenerationTargets(
+    boundaries,
+    [
+      makeSegmentMetrics({ durationSeconds: 100, firstWindowLoudness: -18.2, lastWindowLoudness: -18.1 }),
+      makeSegmentMetrics({ durationSeconds: 74, firstWindowLoudness: -18, lastWindowLoudness: -18.1 })
+    ]
+  );
+  const warnings = collectSegmentDiagnosticsWarnings({
+    boundaries,
+    segmentMetrics: [
+      makeSegmentMetrics({ durationSeconds: 100, firstWindowLoudness: -18.2, lastWindowLoudness: -18.1 }),
+      makeSegmentMetrics({ durationSeconds: 74, firstWindowLoudness: -18, lastWindowLoudness: -18.1 })
+    ],
+    finalMetrics: {
+      integratedLoudness: -16,
+      truePeak: -1.5,
+      maxVolume: null,
+      measurementMode: "loudnorm"
+    },
+    finalTruePeakTarget: -1.5
+  });
+
+  assert.equal(boundaries[0].deltaLufs, 0.1);
+  assert.equal(boundaries[0].rmsDeltaDb, 0.1);
+  assert.equal(boundaries[0].seamFailureKind, "tonal");
+  assert.equal(boundaries[0].seamPassed, false);
+  assert.deepEqual(targets, [2]);
+  assert.ok(warnings.some((warning) => warning.code === "tonal-mismatch"));
+});
+
 test("boundary-aware edge adjustments attenuate the louder side of a seam", () => {
   const boundaries = buildSegmentBoundaryDiagnostics(
     [
@@ -554,6 +694,16 @@ test("segmented diagnostics manifest keeps metrics and gain shape serializable",
         segmentIndex: 1,
         wordCount: 240,
         generationAttempt: 1,
+        generationInputWordCount: 276,
+        targetWordCount: 240,
+        contextOverlapUsed: true,
+        contextInstructionStrength: "standard",
+        previousContext: "Previous context sentence.",
+        nextContext: "Next context sentence.",
+        contextLikelySpoken: false,
+        contextFallbackUsed: false,
+        contextAudioTrimmed: true,
+        contextAudioTrimSeconds: 1.25,
         rawMetrics: metrics,
         standardizedMetrics: metrics,
         leveledMetrics: metrics,
@@ -576,6 +726,11 @@ test("segmented diagnostics manifest keeps metrics and gain shape serializable",
   assert.equal(serialized.version, 1);
   assert.equal(serialized.segments[0].wordCount, 240);
   assert.equal(serialized.segments[0].generationAttempt, 1);
+  assert.equal(serialized.segments[0].contextOverlapUsed, true);
+  assert.equal(serialized.segments[0].contextInstructionStrength, "standard");
+  assert.equal(serialized.segments[0].contextLikelySpoken, false);
+  assert.equal(serialized.segments[0].contextAudioTrimmed, true);
+  assert.equal(serialized.segments[0].contextAudioTrimSeconds, 1.25);
   assert.equal(serialized.segments[0].appliedGainDb, 1.25);
   assert.equal(serialized.segments[0].driftCorrectionDb, 3.5);
   assert.equal(serialized.segments[0].leveledMetrics.firstWindowLoudness, -18.2);
