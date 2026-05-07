@@ -258,293 +258,270 @@ export default function HomePage() {
     <main className="app-shell">
       <div className="page">
         <header className="hero">
-          <div className="hero-copy">
-            <p className="eyebrow">Private Tool</p>
-            <h1 className="hero-title">VOICEOVER</h1>
-            <p className="hero-subtitle">
-              Paste long-form text. Get one finished narration file.
-            </p>
-          </div>
-
-          <div className="hero-note">
-            <p className="hero-note-label">Private Workflow</p>
-            <h2 className="hero-note-title">A clean generation surface for serious narration runs.</h2>
-            <p className="hero-note-copy">
-              Voice selection, fallback behavior, and the input surface all stay on one page. The
-              output still arrives as one file.
-            </p>
+          <p className="eyebrow">SOMMBC Private Tool</p>
+          <div className="hero-main">
+            <h1 className="hero-title">Voiceover</h1>
+            <p className="hero-subtitle">Paste long-form text. Generate one finished narration file.</p>
           </div>
         </header>
 
         <form className="workspace" onSubmit={handleSubmit}>
-          <div className="workspace-grid">
-            <aside className="panel panel-rail">
-              <div className="panel-head">
-                <p className="panel-kicker">Controls</p>
-                <h2 className="panel-title">Generation setup</h2>
-                <p className="panel-copy">
-                  Configure the output, then decide how aggressive the narration path should be.
-                </p>
+          <section className="panel panel-editor">
+            <div className="panel-head panel-head-editor">
+              <div>
+                <p className="panel-kicker">Text Input</p>
+                <h2 className="panel-title">Source text</h2>
               </div>
+              <p className="panel-copy">Paste markdown or plain text. Cleanup still runs before narration.</p>
+            </div>
 
-              <section className="section">
-                <p className="section-heading">Output</p>
-                <div className="field-grid">
-                  <label className="field-label">
-                    <span className="field-name">File Name</span>
-                    <input
-                      className="input"
-                      name="title"
-                      placeholder="my-article"
-                      value={title}
-                      onChange={(event) => setTitle(event.target.value)}
-                    />
-                  </label>
+            <label className="field-label field-label-editor">
+              <span className="sr-only">Text</span>
+              <textarea
+                className="textarea"
+                name="text"
+                placeholder="Paste markdown or plain text."
+                value={text}
+                onChange={(event) => setText(event.target.value)}
+              />
+            </label>
+          </section>
 
-                  <label className="field-label">
-                    <span className="field-name">Voice</span>
-                    <div className="select-wrap">
-                      <select
-                        className="select"
-                        value={voiceId}
-                        onChange={(event) => handleVoiceChange(event.target.value)}
-                      >
-                        {VOICES.map((voice) => (
-                          <option key={voice.id} value={voice.id}>
-                            {voice.name}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </label>
+          <aside className="panel panel-rail">
+            <div className="panel-head">
+              <p className="panel-kicker">Controls</p>
+              <h2 className="panel-title">Generation setup</h2>
+              <p className="panel-copy">
+                Defaults are tuned for one Substack-ready MP3. Adjust only what this run needs.
+              </p>
+            </div>
 
-                  <div className="field-pair">
-                    <label className="field-label">
-                      <span className="field-name">Output Format</span>
-                      <div className="select-wrap">
-                        <select
-                          className="select"
-                          value={outputFormat}
-                          onChange={(event) => setOutputFormat(event.target.value as OutputFormat)}
-                        >
-                          <option value="mp3">MP3</option>
-                          <option value="wav">WAV</option>
-                        </select>
-                      </div>
-                    </label>
+            <section className="section">
+              <p className="section-heading">Output</p>
+              <div className="field-grid">
+                <label className="field-label">
+                  <span className="field-name">File Name</span>
+                  <input
+                    className="input"
+                    name="title"
+                    placeholder="my-article"
+                    value={title}
+                    onChange={(event) => setTitle(event.target.value)}
+                  />
+                </label>
 
-                    <label className="field-label">
-                      <span className="field-name">Volume Preset</span>
-                      <div className="select-wrap">
-                        <select
-                          className="select"
-                          disabled={!normalizationEnabled}
-                          value={volumeBoost}
-                          onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
-                        >
-                          <option value="normal">Normal / Substack</option>
-                          <option value="louder">Louder</option>
-                          <option value="very-loud">Very Loud / Emergency</option>
-                        </select>
-                      </div>
-                    </label>
+                <label className="field-label">
+                  <span className="field-name">Voice</span>
+                  <div className="select-wrap">
+                    <select
+                      className="select"
+                      value={voiceId}
+                      onChange={(event) => handleVoiceChange(event.target.value)}
+                    >
+                      {VOICES.map((voice) => (
+                        <option key={voice.id} value={voice.id}>
+                          {voice.name}
+                        </option>
+                      ))}
+                    </select>
                   </div>
-                </div>
-              </section>
+                </label>
 
-              <section className="section">
-                <p className="section-heading">Narration Path</p>
-                <div className="toggle-list">
-                  <label className="toggle">
-                    <input
-                      checked={continuousRead}
-                      className="toggle-input"
-                      onChange={(event) => {
-                        setContinuousRead(event.target.checked);
-                        if (event.target.checked) {
-                          setForceSegmentedMode(false);
-                        }
-                      }}
-                      type="checkbox"
-                    />
-                    <span className="toggle-copy">
-                      <span className="toggle-text">Continuous Read</span>
-                      <span className="toggle-note">
-                        Default on. Sends the cleaned document in one Mistral request, then
-                        masters the final file.
-                      </span>
+                <label className="field-label">
+                  <span className="field-name">Output Format</span>
+                  <div className="select-wrap">
+                    <select
+                      className="select"
+                      value={outputFormat}
+                      onChange={(event) => setOutputFormat(event.target.value as OutputFormat)}
+                    >
+                      <option value="mp3">MP3</option>
+                      <option value="wav">WAV</option>
+                    </select>
+                  </div>
+                </label>
+
+                <label className="field-label">
+                  <span className="field-name">Volume Preset</span>
+                  <div className="select-wrap">
+                    <select
+                      className="select"
+                      disabled={!normalizationEnabled}
+                      value={volumeBoost}
+                      onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
+                    >
+                      <option value="normal">Normal / Substack</option>
+                      <option value="louder">Louder</option>
+                      <option value="very-loud">Very Loud / Emergency</option>
+                    </select>
+                  </div>
+                </label>
+              </div>
+            </section>
+
+            <section className="section">
+              <p className="section-heading">Narration Path</p>
+              <div className="toggle-list">
+                <label className="toggle">
+                  <input
+                    checked={continuousRead}
+                    className="toggle-input"
+                    onChange={(event) => {
+                      setContinuousRead(event.target.checked);
+                      if (event.target.checked) {
+                        setForceSegmentedMode(false);
+                      }
+                    }}
+                    type="checkbox"
+                  />
+                  <span className="toggle-copy">
+                    <span className="toggle-text">Continuous Read</span>
+                    <span className="toggle-note">
+                      Default on. Reads the cleaned document as one continuous pass, then masters
+                      the final file.
                     </span>
-                  </label>
-
-                  <label className="toggle">
-                    <input
-                      checked={fallbackToSegmented}
-                      className="toggle-input"
-                      disabled={!continuousRead || forceSegmentedMode}
-                      onChange={(event) => setFallbackToSegmented(event.target.checked)}
-                      type="checkbox"
-                    />
-                    <span className="toggle-copy">
-                      <span className="toggle-text">Fallback to segmented mode if needed</span>
-                      <span className="toggle-note">
-                        {!continuousRead || forceSegmentedMode
-                          ? "Continuous Read is off, so segmented generation runs directly."
-                          : "If continuous read fails, retry section by section and still return one file."}
-                      </span>
-                    </span>
-                  </label>
-                </div>
-              </section>
-
-              <details className="advanced-panel">
-                <summary className="advanced-summary">
-                  <span className="advanced-summary-copy">
-                    <span className="advanced-summary-title">Advanced</span>
-                    <span className="advanced-summary-note">Secondary processing controls</span>
                   </span>
-                  <span aria-hidden="true" className="advanced-summary-icon" />
-                </summary>
+                </label>
 
-                <div className="advanced-body toggle-list">
+                <label className="toggle">
+                  <input
+                    checked={fallbackToSegmented}
+                    className="toggle-input"
+                    disabled={!continuousRead || forceSegmentedMode}
+                    onChange={(event) => setFallbackToSegmented(event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span className="toggle-copy">
+                    <span className="toggle-text">Fallback to segmented mode if needed</span>
+                    <span className="toggle-note">
+                      {!continuousRead || forceSegmentedMode
+                        ? "Continuous Read is off, so segmented generation runs directly."
+                        : "If continuous read fails, retry section by section and still return one file."}
+                    </span>
+                  </span>
+                </label>
+              </div>
+            </section>
+
+            <details className="advanced-panel">
+              <summary className="advanced-summary">
+                <span className="advanced-summary-copy">
+                  <span className="advanced-summary-title">Advanced</span>
+                  <span className="advanced-summary-note">Secondary processing controls</span>
+                </span>
+                <span aria-hidden="true" className="advanced-summary-icon" />
+              </summary>
+
+              <div className="advanced-body toggle-list">
+                <label className="toggle">
+                  <input
+                    checked={forceSegmentedMode}
+                    className="toggle-input"
+                    onChange={(event) => {
+                      setForceSegmentedMode(event.target.checked);
+                      if (event.target.checked) {
+                        setContinuousRead(false);
+                      }
+                    }}
+                    type="checkbox"
+                  />
+                  <span className="toggle-copy">
+                    <span className="toggle-text">Force segmented mode</span>
+                    <span className="toggle-note">
+                      Skip continuous read and generate section by section from the start.
+                    </span>
+                  </span>
+                </label>
+
+                <label className="toggle">
+                  <input
+                    checked={normalizationEnabled}
+                    className="toggle-input"
+                    onChange={(event) => setNormalizationEnabled(event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span className="toggle-copy">
+                    <span className="toggle-text">Audio normalization</span>
+                    <span className="toggle-note">Apply final mastering before delivery.</span>
+                  </span>
+                </label>
+
+                {segmentedControlsActive && (
                   <label className="toggle">
                     <input
-                      checked={forceSegmentedMode}
+                      checked={smoothJoins}
                       className="toggle-input"
-                      onChange={(event) => {
-                        setForceSegmentedMode(event.target.checked);
-                        if (event.target.checked) {
-                          setContinuousRead(false);
-                        }
-                      }}
+                      disabled={!segmentedControlsActive}
+                      onChange={(event) => setSmoothJoins(event.target.checked)}
                       type="checkbox"
                     />
                     <span className="toggle-copy">
-                      <span className="toggle-text">Force segmented mode</span>
+                      <span className="toggle-text">Smooth joins</span>
                       <span className="toggle-note">
-                        Skip continuous read and generate section by section from the start.
+                        Only used during segmented generation to soften section boundaries.
                       </span>
                     </span>
                   </label>
-
-                  <label className="toggle">
-                    <input
-                      checked={normalizationEnabled}
-                      className="toggle-input"
-                      onChange={(event) => setNormalizationEnabled(event.target.checked)}
-                      type="checkbox"
-                    />
-                    <span className="toggle-copy">
-                      <span className="toggle-text">Audio normalization</span>
-                      <span className="toggle-note">
-                        Apply final mastering before delivery.
-                      </span>
-                    </span>
-                  </label>
-
-                  {segmentedControlsActive && (
-                    <label className="toggle">
-                      <input
-                        checked={smoothJoins}
-                        className="toggle-input"
-                        disabled={!segmentedControlsActive}
-                        onChange={(event) => setSmoothJoins(event.target.checked)}
-                        type="checkbox"
-                      />
-                      <span className="toggle-copy">
-                        <span className="toggle-text">Smooth joins</span>
-                        <span className="toggle-note">
-                          Only used during segmented generation to soften section boundaries.
-                        </span>
-                      </span>
-                    </label>
-                  )}
-                </div>
-              </details>
-            </aside>
-
-            <section className="panel panel-editor">
-              <div className="panel-head panel-head-editor">
-                <div>
-                  <p className="panel-kicker">Text Input</p>
-                  <h2 className="panel-title">Source text</h2>
-                </div>
-                <p className="panel-copy">
-                  Paste markdown or plain text. Cleanup still runs before narration.
-                </p>
+                )}
               </div>
+            </details>
+          </aside>
 
-              <label className="field-label field-label-editor">
-                <span className="sr-only">Text</span>
-                <textarea
-                  className="textarea"
-                  name="text"
-                  placeholder="Paste markdown or plain text."
-                  value={text}
-                  onChange={(event) => setText(event.target.value)}
-                />
-              </label>
-            </section>
-          </div>
+          <section className="action-card">
+            <div className="action-copy">
+              <p className="action-label">Run</p>
+              <h2 className="action-title">Generate narration</h2>
+              <p className="action-note">Downloads automatically when the finished file is ready.</p>
+            </div>
 
-          <div className="workspace-footer">
-            <section className="action-card">
-              <div className="action-copy">
-                <p className="action-label">Run</p>
-                <h2 className="action-title">Generate the final narration file</h2>
-                <p className="action-note">
-                  Generation starts immediately and downloads the finished file when it is ready.
-                </p>
+            <div className="actions actions-primary">
+              <button className="btn-primary" disabled={isGenerating} type="submit">
+                {isGenerating ? "Generating..." : "Generate"}
+              </button>
+            </div>
+          </section>
+
+          <section className="feedback-stack">
+            {showStatus && (
+              <div aria-live="polite" className="feedback-card status-box" role="status">
+                <div className="status-label">Status</div>
+                <div className="status-message">{statusMessage}</div>
+                {statusDetail && <div className="status-detail">{statusDetail}</div>}
               </div>
+            )}
 
-              <div className="actions actions-primary">
-                <button className="btn-primary" disabled={isGenerating} type="submit">
-                  {isGenerating ? "Generating..." : "Generate"}
-                </button>
+            {errorMessage && (
+              <div className="feedback-card error-box" role="alert">
+                <div className="status-label">Error</div>
+                <div className="error-message">{errorMessage}</div>
               </div>
-            </section>
+            )}
 
-            <section className="feedback-stack">
-              {showStatus && (
-                <div aria-live="polite" className="feedback-card status-box" role="status">
-                  <div className="status-label">Status</div>
-                  <div className="status-message">{statusMessage}</div>
-                  {statusDetail && <div className="status-detail">{statusDetail}</div>}
+            {downloadUrl && (
+              <div aria-live="polite" className="feedback-card output-box">
+                <div className="status-label">Result</div>
+                <div className="output-file">{downloadFilename}</div>
+                <audio className="audio-player" controls preload="metadata" src={downloadUrl} />
+                <div className="output-actions">
+                  <a className="btn-secondary" href={downloadUrl} download={downloadFilename}>
+                    Download
+                  </a>
+                  <button className="btn-secondary" type="button" onClick={handleReset}>
+                    New Narration
+                  </button>
                 </div>
-              )}
+              </div>
+            )}
 
-              {errorMessage && (
-                <div className="feedback-card error-box" role="alert">
-                  <div className="status-label">Error</div>
-                  <div className="error-message">{errorMessage}</div>
+            {showFeedbackPlaceholder && (
+              <div className="feedback-card placeholder-box">
+                <div className="status-label">Session</div>
+                <div className="status-message">
+                  Progress, errors, and the finished file appear here during generation.
                 </div>
-              )}
-
-              {downloadUrl && (
-                <div className="feedback-card output-box">
-                  <div className="status-label">Result</div>
-                  <div className="output-file">{downloadFilename}</div>
-                  <audio className="audio-player" controls preload="metadata" src={downloadUrl} />
-                  <div className="output-actions">
-                    <a className="btn-secondary" href={downloadUrl} download={downloadFilename}>
-                      Download
-                    </a>
-                    <button className="btn-secondary" type="button" onClick={handleReset}>
-                      New Narration
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {showFeedbackPlaceholder && (
-                <div className="feedback-card placeholder-box">
-                  <div className="status-label">Session</div>
-                  <div className="status-message">
-                    Progress, errors, and the finished file appear here during generation.
-                  </div>
-                </div>
-              )}
-            </section>
-          </div>
+              </div>
+            )}
+          </section>
         </form>
       </div>
     </main>
