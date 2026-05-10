@@ -6,6 +6,8 @@ Voice Lab uses VoxCPM2 through a separate authenticated FastAPI service in `serv
 
 CUDA GPU is strongly recommended and usually required for practical long-form generation. CPU and Mac-local tests may be useful for wiring checks but should not be treated as the real workflow.
 
+Target Python version: `3.11`. The default model is `openbmb/VoxCPM2`. The service pins `voxcpm==2.0.2` in `services/voxcpm/requirements.txt`.
+
 ## Local CUDA Setup
 
 ```bash
@@ -14,8 +16,11 @@ uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 uv pip install -r services/voxcpm/requirements.txt
+npm run check:voxcpm
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
+
+The runtime check prints Python version, service imports, Torch/CUDA availability, CUDA device count and device names, `VOXCPM_MODEL`, and `VOXCPM_DEVICE`. It does not print bearer tokens, transcripts, audio paths, or base64 audio.
 
 ## Docker
 
@@ -51,8 +56,18 @@ ssh -N -L 8809:127.0.0.1:8809 root@<gpu-host>
 Health check:
 
 ```bash
-curl -H "Authorization: Bearer $VOXCPM_API_KEY" http://127.0.0.1:8809/health
+VOXCPM_API_KEY="replace-me" npm run check:voxcpm:health
 ```
+
+The health check expects unauthenticated `/health` to return `401` and authenticated `/health` to return `200`. It does not load VoxCPM2, does not require CUDA, and does not run generation.
+
+## Runtime Behavior
+
+- `/health` verifies service/auth wiring and reports whether the model is already loaded.
+- The VoxCPM2 model loads lazily on the first `/generate` request.
+- First generation may take time while model weights load.
+- The Python service returns WAV audio.
+- The Next app writes WAV intermediates, merges/levels them, and masters the final MP3.
 
 ## Reference Workflow
 

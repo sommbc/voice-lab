@@ -4,15 +4,14 @@ import os
 import secrets
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-import numpy as np
-import soundfile as sf
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 
 DEFAULT_MODEL = "openbmb/VoxCPM2"
+FALLBACK_SAMPLE_RATE = 48000
 
 
 class GenerateRequest(BaseModel):
@@ -114,7 +113,7 @@ def generate(payload: GenerateRequest) -> Response:
 
         wav = model.generate(**generate_kwargs)
 
-    audio = wav_to_bytes(wav)
+    audio = wav_to_bytes(wav, model=model)
     return Response(content=audio, media_type="audio/wav")
 
 
@@ -137,14 +136,59 @@ def write_data_uri(data_uri: Optional[str], temp_dir: str, filename: str) -> Opt
     return str(path)
 
 
-def wav_to_bytes(wav) -> bytes:
-    if isinstance(wav, tuple) and len(wav) == 2:
-        sample_rate, samples = wav
-    else:
-        sample_rate = 16000
-        samples = wav
+def wav_to_bytes(wav: Any, model: Any = None) -> bytes:
+    import numpy as np
+    import soundfile as sf
 
+    samples, sample_rate = resolve_generated_audio(wav, model=model)
     samples_array = np.asarray(samples)
     buffer = io.BytesIO()
     sf.write(buffer, samples_array, sample_rate, format="WAV", subtype="PCM_16")
     return buffer.getvalue()
+
+
+def resolve_generated_audio(wav: Any, model: Any = None) -> tuple[Any, int]:
+    samples = wav
+
+    if isinstance(wav, tuple) and len(wav) == 2:
+        sample_rate, samples = wav
+        resolved_sample_rate = coerce_sample_rate(sample_rate)
+        if resolved_sample_rate:
+            return samples, resolved_sample_rate
+
+    model_sample_rate = resolve_model_sample_rate(model)
+    if model_sample_rate:
+        return samples, model_sample_rate
+
+    # VoxCPM2 documentation lists 48 kHz output. Prefer model metadata whenever available.
+    return samples, FALLBACK_SAMPLE_RATE
+
+
+def resolve_model_sample_rate(model: Any) -> Optional[int]:
+    if model is None:
+        return None
+
+    for attribute_path in (("tts_model", "sample_rate"), ("sample_rate",)):
+        value = model
+        for attribute in attribute_path:
+            try:
+                value = getattr(value, attribute)
+            except Exception:
+                value = None
+                break
+
+        sample_rate = coerce_sample_rate(value)
+        if sample_rate:
+            return sample_rate
+
+    return None
+
+
+def coerce_sample_rate(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)) and value > 0:
+        return int(value)
+
+    return None

@@ -26,6 +26,7 @@ Voice Lab is a local-first, open-source app for VoxCPM2 voice cloning: record or
 - Node.js `>=20.9.0`
 - npm
 - ffmpeg, from `ffmpeg-static` or available on `PATH`
+- Python `3.11` for the VoxCPM2 service
 - A running VoxCPM2 service, locally or on a private GPU endpoint
 - CUDA GPU strongly recommended for real generation work
 
@@ -84,6 +85,7 @@ Open [http://localhost:3000](http://localhost:3000). The app stores private arti
 ## Running The VoxCPM2 Service
 
 The native wrapper lives in `services/voxcpm/server.py` and exposes authenticated `/health` and `/generate` endpoints.
+The default model is `openbmb/VoxCPM2`. The service loads the model lazily on the first `/generate` request, not at `/health` startup, so the first generation can take time while weights load.
 
 ```bash
 uv python install 3.11
@@ -91,8 +93,11 @@ uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 uv pip install -r services/voxcpm/requirements.txt
+npm run check:voxcpm
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
+
+`services/voxcpm/requirements.txt` pins `voxcpm==2.0.2` so the service does not float across VoxCPM API changes. Install PyTorch separately from the CUDA wheel index before installing the service requirements.
 
 Docker:
 
@@ -115,8 +120,17 @@ ssh -N -L 8809:127.0.0.1:8809 root@<gpu-host>
 Health check:
 
 ```bash
+VOXCPM_API_KEY="replace-me" npm run check:voxcpm:health
+```
+
+Equivalent manual checks:
+
+```bash
+curl -i http://127.0.0.1:8809/health
 curl -H "Authorization: Bearer $VOXCPM_API_KEY" http://127.0.0.1:8809/health
 ```
+
+Unauthenticated `/health` should return `401`. Authenticated `/health` should return `200` and does not load the VoxCPM2 model.
 
 Do not expose the service without authentication. Prefer localhost, SSH tunnels, private networks, or authenticated HTTPS.
 
@@ -138,6 +152,7 @@ The transcript should match the audio. Background noise, clipping, compression, 
 5. Listen to the result before publishing or sharing.
 
 Longer text is chunked for VoxCPM2, generated as WAV sections, leveled, merged, mastered, and returned as one MP3.
+The Python service returns WAV audio to the Next app. The Next app writes WAV intermediates and produces the final mastered MP3.
 
 ## Storage And Privacy
 
@@ -168,6 +183,9 @@ npm test
 npm run typecheck
 npm run build
 npm run check
+npm run test:voxcpm
+npm run check:voxcpm
+npm run check:voxcpm:health
 npm run clean
 npm run analyze-audio -- ./path/to/file.mp3
 ```
