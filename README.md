@@ -72,6 +72,30 @@ See [docs/screenshots.md](docs/screenshots.md).
 
 Keep the Python virtual environment outside the repository. A repo-root `.venv` can interfere with the Next/Turbopack build.
 
+## Run Locally With One Command
+
+```bash
+npm run local
+```
+
+The local runner verifies Node/npm, installs missing npm dependencies, creates or reuses the Python 3.11 environment at `~/.venvs/voice-lab-voxcpm`, installs missing VoxCPM2 service dependencies, creates `.env.local` with safe local defaults when needed, starts the FastAPI VoxCPM2 service on port `8809`, waits for authenticated `/health`, starts Next on port `3000`, and prints:
+
+```text
+http://localhost:3000
+```
+
+On Apple Silicon, the runner installs normal PyTorch wheels, sets `VOXCPM_DEVICE=mps`, and sets `VOXCPM_OPTIMIZE=false`. If PyTorch does not report MPS availability, it warns and leaves the selected device unchanged.
+
+On CUDA Linux, the runner reads `nvidia-smi`, chooses the matching PyTorch CUDA wheel index when it can safely detect the CUDA version, sets `VOXCPM_DEVICE=cuda`, and sets `VOXCPM_OPTIMIZE=true`. If it cannot safely detect the wheel, it stops with the exact PyTorch index action to take. Linux without CUDA falls back to `VOXCPM_DEVICE=cpu` with a warning for wiring checks only.
+
+The runner does not log `VOXCPM_API_KEY`, does not put `.venv` in the repo, and does not run generation. Stop both local processes with `Ctrl+C`.
+
+To perform setup and runtime checks without starting the servers:
+
+```bash
+npm run local:check
+```
+
 ## Quick Start
 
 ```bash
