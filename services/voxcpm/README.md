@@ -2,24 +2,47 @@
 
 Native FastAPI wrapper for `openbmb/VoxCPM2`. The Next.js app talks to this service over authenticated HTTP only; it does not import Torch or VoxCPM.
 
-CUDA GPU is strongly recommended and usually required for practical generation speed.
+## Status
+
+The service wrapper, auth, health check, and non-generation tests are in place. Live generation still depends on the local Python/PyTorch/device setup. CUDA is expected to be fastest. Apple Silicon MPS may work but still needs validation for long-form workloads.
+
 Target Python version: `3.11`. The service defaults to `openbmb/VoxCPM2` and pins `voxcpm==2.0.2` through `requirements.txt`.
 
 The service does not load the model at startup or during `/health`. Model load happens on the first `/generate` request and may take time. The service returns WAV audio; the Next.js app owns WAV intermediates and final MP3 mastering.
+
+Keep the Python virtual environment outside the repository. A repo-root `.venv` can interfere with the Next/Turbopack build.
+
+## Apple Silicon Validation Setup
+
+```bash
+uv python install 3.11
+uv venv "$HOME/.venvs/voice-lab-voxcpm" --python 3.11
+source "$HOME/.venvs/voice-lab-voxcpm/bin/activate"
+uv pip install torch torchaudio
+uv pip install -r services/voxcpm/requirements.txt
+VOXCPM_DEVICE=mps npm run check:voxcpm
+VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=mps uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
+```
+
+Treat this as a validation path until short and long-form generation are proven on Apple Silicon.
 
 ## Local CUDA Setup
 
 ```bash
 uv python install 3.11
-uv venv .venv --python 3.11
-source .venv/bin/activate
+uv venv "$HOME/.venvs/voice-lab-voxcpm" --python 3.11
+source "$HOME/.venvs/voice-lab-voxcpm/bin/activate"
 uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 uv pip install -r services/voxcpm/requirements.txt
-npm run check:voxcpm
+VOXCPM_DEVICE=cuda npm run check:voxcpm
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
 
 `npm run check:voxcpm` prints Python version, core imports, Torch/CUDA availability, CUDA device count and names, `VOXCPM_MODEL`, and `VOXCPM_DEVICE`. It never prints `VOXCPM_API_KEY`, transcripts, audio paths, or base64 audio.
+
+## Hugging Face Cache
+
+The Python runtime may download/cache `openbmb/VoxCPM2` through Hugging Face tooling. Set `HF_TOKEN` only when needed for model access or rate limits. If you set `HF_HOME` or `HF_HUB_CACHE`, keep them outside this repository.
 
 ## Docker
 
@@ -48,7 +71,7 @@ VOXCPM_HEALTH_URL=http://127.0.0.1:8809/health
 VOXCPM_API_KEY=replace-me
 ```
 
-Health check:
+## Health Check
 
 ```bash
 VOXCPM_API_KEY="replace-me" npm run check:voxcpm:health

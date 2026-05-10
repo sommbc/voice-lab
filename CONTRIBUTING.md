@@ -1,8 +1,8 @@
 # Contributing
 
-Voice Lab is intended to stay useful as a local-first VoxCPM2 voice cloning app, not a pile of speech experiments.
+Voice Lab is intended to stay focused: local-first VoxCPM2 voice cloning for long-form narration and mastered MP3 export.
 
-## Development
+## Setup
 
 ```bash
 npm install
@@ -10,29 +10,54 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Before opening a pull request:
+The Next app can run without the Python service, but generation requires a private VoxCPM2 service and `VOXCPM_ENABLED=true`.
+
+For service setup, see [docs/voxcpm.md](docs/voxcpm.md).
+
+## Checks
+
+Run the relevant checks before opening a pull request:
 
 ```bash
 npm test
-npm run typecheck
+npx tsc --noEmit
 npm run build
+npm run check
+npm run test:voxcpm
+python3 -m py_compile services/voxcpm/server.py
+python3 -m py_compile services/voxcpm/check_runtime.py
+python3 -m py_compile services/voxcpm/check_health.py
 git diff --check
 ```
 
-`npm run check` runs the same test, typecheck, and build sequence.
+`npm run check:voxcpm` verifies imports and hardware visibility when Python dependencies are installed. It does not run generation. Do not claim runtime support from import checks alone.
 
-## Expectations
+## Branches And Pull Requests
 
-- Keep the public product focused on VoxCPM2 voice cloning to mastered MP3 narration.
-- Do not commit generated audio, reference clips, exact transcripts, local runs, or debug artifacts.
+- Keep pull requests narrow and explain the behavior being changed.
+- Include the checks you ran and the exact result.
+- Update README or docs when setup, environment variables, runtime behavior, or workflow changes.
+- Do not mix product changes with unrelated repo cleanup.
+- Do not add generated screenshots, audio, transcripts, run manifests, model caches, or build output.
+
+## Coding Style
+
+- Reuse existing TypeScript and Python patterns before adding helpers.
 - Keep the Python model runtime outside the Next app.
 - Keep bearer tokens server-side.
-- Do not claim perfect cloning or seamless long-form quality without reproducible evidence.
-- Prefer narrow changes over broad rewrites unless the architecture clearly needs it.
-- Update README or docs when behavior, setup, environment variables, or the workflow changes.
+- Prefer explicit validation and safe error messages over leaking private paths, transcripts, payloads, or tokens.
+- Avoid provider switching, hosted inference integrations, speech-to-text, or public deployment assumptions unless the project scope changes explicitly.
 
-## Issues And Pull Requests
+## Runtime Issue Reports
 
-For bugs, include the VoxCPM2 endpoint mode, Node version, operating system, relevant env var names without values, and the smallest input that reproduces the issue.
+For VoxCPM2 runtime issues, include:
 
-For audio-quality issues, include objective diagnostics when possible: generation mode, segment count, mastering preset, and whether the issue appears before or after final mastering.
+- Operating system and hardware.
+- Python version.
+- PyTorch version and whether CUDA or MPS is detected.
+- `VOXCPM_DEVICE`, `VOXCPM_MODEL`, and endpoint mode, without secret values.
+- The output of `npm run check:voxcpm` with secrets and private paths removed if needed.
+- Whether `/health` passes with `npm run check:voxcpm:health`.
+- Whether the failure happened before model load, during generation, or during final audio processing.
+
+For audio-quality issues, include objective diagnostics when possible: segment count, mastering preset, whether the issue appears in WAV intermediates or only in the final MP3, and a non-private reproduction if available.

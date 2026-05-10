@@ -1,26 +1,46 @@
 # Architecture
 
-Voice Lab is split between a local Next.js app, shared TypeScript audio/text utilities, private filesystem storage, and a separate VoxCPM2 FastAPI service.
+Voice Lab is split between a local Next.js app, shared TypeScript audio/text utilities, private filesystem storage, and a separate authenticated VoxCPM2 FastAPI service.
 
-## Runtime Boundaries
+## Runtime Diagram
 
-- The Next.js app owns the UI, request validation, reference upload handling, text cleanup, chunk planning, audio processing, and private local storage.
-- VoxCPM2 runs outside Next as an authenticated Python service. The Next app calls it over HTTP and does not import Torch, VoxCPM, or Python packages.
-- ffmpeg work happens in Node through `lib/audio.ts`, using `ffmpeg-static` when available and a system ffmpeg fallback otherwise.
-- Secrets and private artifacts stay server-side or in `VOICE_LAB_DATA_DIR`.
+```text
+Browser
+  -> Next.js UI
+  -> Next.js API routes
+  -> FastAPI VoxCPM2 service
+  -> VoxCPM2 model runtime
+  -> WAV section output
+  -> Node/ffmpeg standardize, level, merge, master
+  -> MP3 response
+
+Storage:
+  VOICE_LAB_DATA_DIR, outside the repository
+```
+
+There is no hosted speech inference in the default architecture. The Next app calls only the configured private VoxCPM2 endpoint.
+
+## Boundaries
+
+- Browser: captures or uploads reference audio, captures exact transcript text, submits long-form source text, and receives the final MP3.
+- Next.js API: validates requests, loads saved reference metadata, cleans and chunks text, calls VoxCPM2, writes WAV intermediates, masters MP3 output, and returns progress events.
+- FastAPI VoxCPM2 service: owns Python, PyTorch, VoxCPM, model loading, and WAV generation.
+- Filesystem storage: stores references, transcripts, run workspaces, WAV intermediates, final MP3s, and sanitized manifests under `VOICE_LAB_DATA_DIR`.
+
+The Next app never imports Torch, VoxCPM, or Python packages.
 
 ## Important Paths
 
-- `app/page.tsx`: single workflow UI for reference voice, source text, generation settings, and MP3 download.
+- `app/page.tsx`: single workflow UI for reference voice, source text, generation settings, progress, and MP3 download.
 - `app/api/generate/route.ts`: VoxCPM2 long-form generation, WAV intermediates, merging, mastering, and response streaming.
 - `app/api/voice-references/route.ts`: reference audio/transcript upload route.
-- `lib/voxcpm.ts`: VoxCPM2 HTTP client, payload builder, and env parsing.
+- `lib/voxcpm.ts`: VoxCPM2 HTTP client, payload builder, and environment parsing.
 - `lib/voxcpm-generation.ts`: chunk sizing and prompt plan logic.
 - `lib/storage.ts`: private storage root and path safety helpers.
-- `lib/voice-reference-store.ts`: reference metadata, transcript validation, and upload normalization.
+- `lib/voice-reference-store.ts`: reference metadata, transcript validation, upload normalization, and run workspace creation.
 - `lib/text.ts`: source cleanup, paragraph preservation, and segmentation.
 - `lib/audio.ts`: mastering, measurement, seam diagnostics, merging, and audio utility functions.
-- `services/voxcpm/`: authenticated VoxCPM2 service.
+- `services/voxcpm/`: authenticated VoxCPM2 service and runtime checks.
 
 ## Generation Flow
 
@@ -29,15 +49,15 @@ Voice Lab is split between a local Next.js app, shared TypeScript audio/text uti
 3. Build a VoxCPM2 prompt plan from the reference transcript and previous generated sections.
 4. Call the authenticated VoxCPM2 service for each section.
 5. Store raw WAV output, standardize it, level it, merge sections, and master the final file.
-6. Persist a sanitized manifest with hashes, filenames, metrics, and run metadata.
+6. Persist a sanitized manifest with hashes, filenames, metrics, settings, and run metadata.
 7. Return one MP3 to the browser.
 
 ## Storage Model
 
-`VOICE_LAB_DATA_DIR` defaults to `~/.voice-lab`. Storage helpers resolve paths under that root and reject path traversal. Manifests should store filenames, hashes, metrics, and run IDs, not raw transcript text or private absolute paths.
+`VOICE_LAB_DATA_DIR` defaults to `~/.voice-lab`. Storage helpers resolve paths under that root and reject path traversal. Manifests should store filenames, hashes, metrics, settings, and run IDs, not raw transcript text, source text, base64 audio, bearer tokens, or private absolute paths.
 
-The repo ignores local fallback folders such as `runs/`, `voice-references/`, `.voice-lab/`, `output/`, and common audio extensions.
+The repository ignores local fallback folders such as `runs/`, `voice-references/`, `.voice-lab/`, `output/`, common audio extensions, temp folders, and model-cache folders.
 
 ## Security Model
 
-The VoxCPM2 service requires bearer auth for `/health` and `/generate`. Bind it to localhost, a private network, an SSH tunnel, or authenticated HTTPS. Do not log full audio payloads, bearer tokens, reference transcripts, or generated text.
+The VoxCPM2 service requires bearer auth for `/health` and `/generate`. Bind it to localhost, a private network, an SSH tunnel, or authenticated HTTPS. Do not log full audio payloads, bearer tokens, reference transcripts, generated text, or private paths.

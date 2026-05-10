@@ -1,4 +1,5 @@
 node_modules
+.venv
 .next
 .vercel
 AGENTS.md
@@ -21,6 +22,12 @@ tsconfig.tsbuildinfo
 /voice-references/
 /debug-artifacts/
 /tmp/
+/hf-home/
+/hf-cache/
+/.hf-home/
+/.hf-cache/
+/model-cache/
+/models/
 *.wav
 *.mp3
 *.m4a

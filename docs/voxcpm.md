@@ -1,28 +1,74 @@
-# VoxCPM2
+# VoxCPM2 Runtime
 
 Voice Lab uses VoxCPM2 through a separate authenticated FastAPI service in `services/voxcpm/`. The Next.js app never imports Torch or VoxCPM directly.
 
-## Hardware
+## Current Runtime Status
 
-CUDA GPU is strongly recommended and usually required for practical long-form generation. CPU and Mac-local tests may be useful for wiring checks but should not be treated as the real workflow.
+- Default model: `openbmb/VoxCPM2`.
+- Python target: `3.11`.
+- VoxCPM package pin: `voxcpm==2.0.2` in `services/voxcpm/requirements.txt`.
+- CUDA is expected to be the fastest practical path.
+- Apple Silicon MPS may work, but long-form workloads still need validation.
+- Live VoxCPM2 generation is not yet fully proven across hardware targets.
 
-Target Python version: `3.11`. The default model is `openbmb/VoxCPM2`. The service pins `voxcpm==2.0.2` in `services/voxcpm/requirements.txt`.
+Do not treat import checks or `/health` checks as proof that generation quality, speed, or long-form stability is validated.
 
-## Local CUDA Setup
+Keep the Python virtual environment outside the repository. A repo-root `.venv` can interfere with the Next/Turbopack build.
+
+## Hugging Face Model Cache
+
+VoxCPM2 weights are downloaded through the Python runtime and Hugging Face cache. Voice Lab does not use hosted Hugging Face inference.
+
+Optional environment variables:
+
+```bash
+HF_TOKEN=
+HF_HOME=
+HF_HUB_CACHE=
+```
+
+Use `HF_TOKEN` only when needed for model access or rate limits. Keep `HF_HOME` and `HF_HUB_CACHE` outside this repository so model weights are never staged by git.
+
+## Apple Silicon Setup
+
+This path is for validation. Apple Silicon MPS support is not yet proven for long-form workloads.
 
 ```bash
 uv python install 3.11
-uv venv .venv --python 3.11
-source .venv/bin/activate
+uv venv "$HOME/.venvs/voice-lab-voxcpm" --python 3.11
+source "$HOME/.venvs/voice-lab-voxcpm/bin/activate"
+uv pip install torch torchaudio
+uv pip install -r services/voxcpm/requirements.txt
+VOXCPM_DEVICE=mps npm run check:voxcpm
+VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=mps uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
+```
+
+Expected validation work:
+
+- Confirm PyTorch reports MPS availability.
+- Confirm the service imports and starts.
+- Confirm `/health` auth behavior.
+- Run one short private generation.
+- Run one long-form multi-section generation.
+- Listen to the final MP3 and inspect intermediate WAV behavior before making quality claims.
+
+## CUDA/Linux Setup
+
+CUDA is the expected fastest setup for practical generation.
+
+```bash
+uv python install 3.11
+uv venv "$HOME/.venvs/voice-lab-voxcpm" --python 3.11
+source "$HOME/.venvs/voice-lab-voxcpm/bin/activate"
 uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 uv pip install -r services/voxcpm/requirements.txt
-npm run check:voxcpm
+VOXCPM_DEVICE=cuda npm run check:voxcpm
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
 
 The runtime check prints Python version, service imports, Torch/CUDA availability, CUDA device count and device names, `VOXCPM_MODEL`, and `VOXCPM_DEVICE`. It does not print bearer tokens, transcripts, audio paths, or base64 audio.
 
-## Docker
+## Docker CUDA
 
 ```bash
 docker build -f services/voxcpm/Dockerfile -t voice-lab-voxcpm2:cuda .
@@ -53,13 +99,30 @@ Run the service on a private GPU host, RunPod instance, or equivalent machine, t
 ssh -N -L 8809:127.0.0.1:8809 root@<gpu-host>
 ```
 
-Health check:
+Point the Next app at `http://127.0.0.1:8809`.
+
+## Health Checks
 
 ```bash
 VOXCPM_API_KEY="replace-me" npm run check:voxcpm:health
 ```
 
-The health check expects unauthenticated `/health` to return `401` and authenticated `/health` to return `200`. It does not load VoxCPM2, does not require CUDA, and does not run generation.
+Expected result:
+
+```text
+unauthenticated /health: 401
+authenticated /health: 200
+health check: ok
+```
+
+Manual equivalent:
+
+```bash
+curl -i http://127.0.0.1:8809/health
+curl -i -H "Authorization: Bearer $VOXCPM_API_KEY" http://127.0.0.1:8809/health
+```
+
+The health check verifies service/auth wiring. It does not load VoxCPM2, does not require CUDA, and does not run generation.
 
 ## Runtime Behavior
 
@@ -83,9 +146,12 @@ The exact transcript matters. Mismatched words, background noise, clipping, and 
 - Do not expose the service without authentication.
 - Prefer localhost, SSH tunnels, private networks, or authenticated HTTPS.
 - Use a strong `VOXCPM_API_KEY`.
-- Do not log base64 audio payloads or transcripts.
+- Do not log base64 audio payloads, transcripts, source text, or bearer tokens.
 - Keep reference audio and generated runs in `VOICE_LAB_DATA_DIR`, outside the repo.
 
-## Limitations
+## Known Unverified Items
 
-Voice Lab does not claim perfect cloning or seamless long-form continuity. Listen to final output before publishing.
+- End-to-end CUDA generation speed and quality.
+- End-to-end Apple Silicon MPS generation behavior.
+- Long-form multi-section stability on both hardware paths.
+- Denoiser behavior with `VOXCPM_LOAD_DENOISER=true`.

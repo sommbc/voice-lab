@@ -13,7 +13,7 @@
     "check": "npm test && npm run typecheck && npm run build",
     "check:voxcpm": "python3 services/voxcpm/check_runtime.py",
     "check:voxcpm:health": "python3 services/voxcpm/check_health.py",
-    "clean": "rm -rf .next .vercel tsconfig.tsbuildinfo output storage .voice-lab runs voice-references debug-artifacts tmp && find . -name .DS_Store -type f -delete",
+    "clean": "rm -rf .next .vercel .venv tsconfig.tsbuildinfo output storage .voice-lab runs voice-references debug-artifacts tmp hf-home hf-cache .hf-home .hf-cache model-cache models && find . -name .DS_Store -type f -delete && find . -type d -name __pycache__ -prune -exec rm -rf {} +",
     "analyze-audio": "tsx scripts/analyze-audio.ts"
   },
   "engines": {
