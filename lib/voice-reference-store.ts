@@ -35,7 +35,7 @@ export type VoiceReferenceClientMetadata = {
   transcriptCharacters: number;
 };
 
-export type VoiceoverRunWorkspace = {
+export type VoiceLabRunWorkspace = {
   runId: string;
   runDirectoryPath: string;
   segmentsDirectoryPath: string;
@@ -43,9 +43,9 @@ export type VoiceoverRunWorkspace = {
   manifestPath: string;
 };
 
-export function resolveVoiceoverDataDir(): string {
-  const configured = process.env.VOICEOVER_DATA_DIR?.trim();
-  return configured ? path.resolve(configured) : path.join(homedir(), ".voiceover");
+export function resolveVoiceLabDataDir(): string {
+  const configured = process.env.VOICE_LAB_DATA_DIR?.trim();
+  return configured ? path.resolve(configured) : path.join(homedir(), ".voice-lab");
 }
 
 export function validateReferenceTranscript(transcript: string): string {
@@ -65,7 +65,7 @@ export function validateReferenceTranscript(transcript: string): string {
 export async function saveVoiceReference({
   sourceAudioPath,
   transcript,
-  dataDir = resolveVoiceoverDataDir()
+  dataDir = resolveVoiceLabDataDir()
 }: {
   sourceAudioPath: string;
   transcript: string;
@@ -115,7 +115,7 @@ export async function saveVoiceReference({
 }
 
 export async function loadVoiceReference(
-  dataDir = resolveVoiceoverDataDir()
+  dataDir = resolveVoiceLabDataDir()
 ): Promise<VoiceReference | null> {
   const paths = getVoiceReferencePaths(dataDir);
 
@@ -143,9 +143,9 @@ export async function loadVoiceReference(
   }
 }
 
-export async function createVoiceoverRunWorkspace(
-  dataDir = resolveVoiceoverDataDir()
-): Promise<VoiceoverRunWorkspace> {
+export async function createVoiceLabRunWorkspace(
+  dataDir = resolveVoiceLabDataDir()
+): Promise<VoiceLabRunWorkspace> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const runId = `${timestamp}-${randomUUID().slice(0, 8)}`;
   const runDirectoryPath = path.join(dataDir, "runs", runId);
@@ -165,7 +165,7 @@ export async function createVoiceoverRunWorkspace(
 }
 
 export async function createUploadTempDirectory(
-  dataDir = resolveVoiceoverDataDir()
+  dataDir = resolveVoiceLabDataDir()
 ): Promise<string> {
   const tempRoot = path.join(dataDir, "tmp");
   await mkdir(tempRoot, { recursive: true });

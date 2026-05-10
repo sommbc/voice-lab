@@ -16,7 +16,7 @@ const VOICES = [
 ];
 
 const DEFAULT_VOICE_ID = "4482a650-b0e9-46d5-aa72-b3fbdb43fb20";
-const VOICE_STORAGE_KEY = "voiceover-selected-voice-id";
+const VOICE_STORAGE_KEY = "voice-lab-selected-voice-id";
 const DEFAULT_VOLUME_BOOST = "normal";
 
 type OutputFormat = "mp3" | "wav";
@@ -446,7 +446,7 @@ export default function HomePage() {
         <header className="hero">
           <p className="eyebrow">SOMMBC Private Tool</p>
           <div className="hero-main">
-            <h1 className="hero-title">Voiceover</h1>
+            <h1 className="hero-title">Voice Lab</h1>
             <p className="hero-subtitle">Paste long-form text. Generate one finished narration file.</p>
           </div>
         </header>

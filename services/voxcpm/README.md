@@ -16,13 +16,13 @@ VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:ap
 ## Docker / RunPod
 
 ```bash
-docker build -f services/voxcpm/Dockerfile -t voiceover-voxcpm2:cuda .
+docker build -f services/voxcpm/Dockerfile -t voice-lab-voxcpm2:cuda .
 docker run --gpus all --rm \
   -p 127.0.0.1:8809:8809 \
   -e VOXCPM_API_KEY="$VOXCPM_API_KEY" \
   -e VOXCPM_MODEL="openbmb/VoxCPM2" \
   -e VOXCPM_DEVICE="cuda" \
-  voiceover-voxcpm2:cuda
+  voice-lab-voxcpm2:cuda
 ```
 
 RunPod/private endpoint pattern:

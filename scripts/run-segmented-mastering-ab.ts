@@ -55,12 +55,12 @@ const essayPath = path.resolve(
   process.argv[2] ?? "test/fixtures/long-form-essay.md"
 );
 const voiceId = process.env.MISTRAL_VOICE_ID?.trim() ?? "";
-const contextOverlapEnabled = readBooleanEnv(process.env.VOICEOVER_CONTEXT_OVERLAP, true);
+const contextOverlapEnabled = readBooleanEnv(process.env.VOICE_LAB_CONTEXT_OVERLAP, true);
 const toneSeamScoringEnabled = readBooleanEnv(
-  process.env.VOICEOVER_TONE_SEAM_SCORING,
+  process.env.VOICE_LAB_TONE_SEAM_SCORING,
   true
 );
-const takeCount = resolveMultiTakeCount(process.env.VOICEOVER_MULTI_TAKE_COUNT);
+const takeCount = resolveMultiTakeCount(process.env.VOICE_LAB_MULTI_TAKE_COUNT);
 
 type ScriptProcessedSegment = {
   rawSegmentPath: string;
@@ -98,7 +98,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const workspacePath = await mkdtemp(path.join(tmpdir(), "voiceover-segmented-ab-"));
+  const workspacePath = await mkdtemp(path.join(tmpdir(), "voice-lab-segmented-ab-"));
   let leveledPaths: string[] = [];
   let manifestSegments: SegmentDiagnosticsManifestSegment[] = [];
   let multiTakeOptimization: MultiTakeOptimizationManifest;
@@ -257,7 +257,7 @@ async function main(): Promise<void> {
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     console.log(`Manifest: ${manifestPath}`);
   } finally {
-    const keepWorkspace = /^(1|true|yes|on)$/i.test(process.env.VOICEOVER_KEEP_AB_TMP ?? "");
+    const keepWorkspace = /^(1|true|yes|on)$/i.test(process.env.VOICE_LAB_KEEP_AB_TMP ?? "");
 
     if (keepWorkspace) {
       console.log(`Keeping workspace: ${workspacePath}`);

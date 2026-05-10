@@ -10,7 +10,7 @@ const plusJakarta = Plus_Jakarta_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "Voiceover",
+  title: "Voice Lab",
   description: "Private narration workspace for long-form voice generation.",
 };
 

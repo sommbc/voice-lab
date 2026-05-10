@@ -25,7 +25,7 @@ class GenerateRequest(BaseModel):
     denoise: bool = False
 
 
-app = FastAPI(title="Voiceover VoxCPM2 Service")
+app = FastAPI(title="Voice Lab VoxCPM2 Service")
 _model = None
 _denoiser_loaded = False
 
@@ -88,7 +88,7 @@ def health() -> dict[str, object]:
 def generate(payload: GenerateRequest) -> Response:
     model = get_model(load_denoiser=payload.denoise)
 
-    with tempfile.TemporaryDirectory(prefix="voiceover-voxcpm-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="voice-lab-voxcpm-") as temp_dir:
         reference_path = write_data_uri(payload.reference_audio, temp_dir, "reference.wav")
         prompt_path = write_data_uri(payload.prompt_audio, temp_dir, "prompt.wav")
 

@@ -352,7 +352,7 @@ export function repairChunkBoundary(
   };
 }
 
-export function slugifyFilename(input: string, fallback = "voiceover"): string {
+export function slugifyFilename(input: string, fallback = "voice-lab"): string {
   const normalized = input
     .normalize("NFKD")
     .replace(/[^\w\s-]/g, "")

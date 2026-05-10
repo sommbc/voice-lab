@@ -13,7 +13,7 @@ tsconfig.tsbuildinfo
 .DS_Store
 /output/
 /storage/
-/.voiceover/
+/.voice-lab/
 /runs/
 /voice-references/
 *.wav

@@ -1035,7 +1035,7 @@ test("segmented route no longer falls back to MP3 intermediates while merging", 
   const routeSource = await readFile(path.join(__dirname, "../app/api/generate/route.ts"), "utf8");
 
   assert.match(routeSource, /merged-reencoded\.wav/);
-  assert.match(routeSource, /VOICEOVER_MULTI_TAKE_COUNT/);
+  assert.match(routeSource, /VOICE_LAB_MULTI_TAKE_COUNT/);
   assert.match(routeSource, /multiTakeOptimization/);
   assert.doesNotMatch(routeSource, /fallbackFormat\s*=\s*outputFormat\s*===\s*"mp3"/);
   assert.doesNotMatch(routeSource, /merged-reencoded\.\$\{getFileExtension\(fallbackFormat\)\}/);
@@ -1047,8 +1047,8 @@ ffmpeg version 7.0.2-static johnvansickle.com
 built with gcc 8
 configuration: --enable-gpl
 libavutil      59.  8.100 / 59.  8.100
-[concat @ 0x123] Impossible to open '/tmp/voiceover/segment-001.wav'
-/tmp/voiceover/concat.txt: Invalid data found when processing input
+[concat @ 0x123] Impossible to open '/tmp/voice-lab/segment-001.wav'
+/tmp/voice-lab/concat.txt: Invalid data found when processing input
 Conversion failed!
   `);
 

@@ -41,7 +41,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const workspacePath = await mkdtemp(path.join(tmpdir(), "voiceover-ab-"));
+  const workspacePath = await mkdtemp(path.join(tmpdir(), "voice-lab-ab-"));
   const rawPath = path.join(workspacePath, "raw-mistral-output.wav");
   const staticPath = path.join(workspacePath, "current-static-master.mp3");
   const speechLevelerPath = path.join(workspacePath, "speech-leveler.mp3");
@@ -104,7 +104,7 @@ async function main(): Promise<void> {
     printAnalysis("Current static mastering", staticPath, analyses[1]);
     printAnalysis("Speech-leveler", speechLevelerPath, analyses[2]);
   } finally {
-    const keepWorkspace = /^(1|true|yes|on)$/i.test(process.env.VOICEOVER_KEEP_AB_TMP ?? "");
+    const keepWorkspace = /^(1|true|yes|on)$/i.test(process.env.VOICE_LAB_KEEP_AB_TMP ?? "");
 
     if (keepWorkspace) {
       console.log(`Keeping workspace: ${workspacePath}`);

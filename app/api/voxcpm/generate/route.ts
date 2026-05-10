@@ -34,9 +34,9 @@ import {
   hashPrivateText
 } from "@/lib/voxcpm-generation";
 import {
-  createVoiceoverRunWorkspace,
+  createVoiceLabRunWorkspace,
   loadVoiceReference,
-  type VoiceoverRunWorkspace
+  type VoiceLabRunWorkspace
 } from "@/lib/voice-reference-store";
 
 export const dynamic = "force-dynamic";
@@ -198,7 +198,7 @@ async function runVoxcpmGeneration({
       throw new Error("No narration segments were created after cleaning.");
     }
 
-    const runWorkspace = await createVoiceoverRunWorkspace();
+    const runWorkspace = await createVoiceLabRunWorkspace();
     const isLongForm = segments.length > 1;
     const promptPlan = createVoxcpmSegmentPromptPlan({
       segments,
@@ -305,7 +305,7 @@ async function runVoxcpmGeneration({
       runWorkspace,
       sendEvent
     });
-    const filename = `${slugifyFilename(title, "voxcpm-voiceover")}.${getFileExtension(outputFormat)}`;
+    const filename = `${slugifyFilename(title, "voxcpm-voice-lab")}.${getFileExtension(outputFormat)}`;
     const deliverPath = path.join(runWorkspace.finalDirectoryPath, filename);
     const finalizedOutput = await finalizeVoxcpmOutput({
       assembledPath,
@@ -379,7 +379,7 @@ async function assembleSegments({
   sendEvent
 }: {
   processedSegments: ProcessedVoxcpmSegment[];
-  runWorkspace: VoiceoverRunWorkspace;
+  runWorkspace: VoiceLabRunWorkspace;
   sendEvent: (event: StreamEvent) => void;
 }): Promise<string> {
   if (processedSegments.length === 1) {
@@ -453,7 +453,7 @@ async function finalizeVoxcpmOutput({
       outputPath: deliverPath,
       outputFormat,
       volumeBoost,
-      strategy: resolveMasteringStrategy(process.env.VOICEOVER_MASTERING_STRATEGY)
+      strategy: resolveMasteringStrategy(process.env.VOICE_LAB_MASTERING_STRATEGY)
     });
 
     return {
@@ -497,7 +497,7 @@ async function persistSanitizedManifest({
   normalizationFallbackUsed,
   masteringResult
 }: {
-  runWorkspace: VoiceoverRunWorkspace;
+  runWorkspace: VoiceLabRunWorkspace;
   filename: string;
   cloneMode: VoxcpmCloneMode;
   outputFormat: OutputFormat;

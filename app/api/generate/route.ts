@@ -239,10 +239,10 @@ async function runGeneration({
 }): Promise<void> {
   const encoder = new TextEncoder();
   let tempDirectoryPath = "";
-  const debugAudioEnabled = readBooleanEnv(process.env.VOICEOVER_DEBUG_AUDIO);
-  const masteringStrategy = resolveMasteringStrategy(process.env.VOICEOVER_MASTERING_STRATEGY);
+  const debugAudioEnabled = readBooleanEnv(process.env.VOICE_LAB_DEBUG_AUDIO);
+  const masteringStrategy = resolveMasteringStrategy(process.env.VOICE_LAB_MASTERING_STRATEGY);
   const debugArtifactDirectoryPath = debugAudioEnabled
-    ? await mkdtemp(path.join(tmpdir(), "voiceover-debug-"))
+    ? await mkdtemp(path.join(tmpdir(), "voice-lab-debug-"))
     : "";
 
   const sendEvent = (event: StreamEvent) => {
@@ -276,7 +276,7 @@ async function runGeneration({
       throw new Error("The cleaned text is empty. Paste longer plain-language content.");
     }
 
-    const filename = `${slugifyFilename(title, "voiceover")}.${getFileExtension(outputFormat)}`;
+    const filename = `${slugifyFilename(title, "voice-lab")}.${getFileExtension(outputFormat)}`;
 
     if (forceSegmentedMode || !continuousRead) {
       const segmentedResult = await generateSegmentedSpeech({
@@ -823,7 +823,7 @@ async function generateSinglePassResult({
     };
   }
 
-  const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
+  const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voice-lab-"));
   const sourcePath = path.join(tempDirectoryPath, `single-pass-source.${getFileExtension(sourceFormat)}`);
 
   await writeFile(sourcePath, audioBuffer);
@@ -984,27 +984,27 @@ async function generateSegmentedSpeech({
     message: preparationMessage
   });
 
-  const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voiceover-"));
+  const tempDirectoryPath = await mkdtemp(path.join(tmpdir(), "voice-lab-"));
   let processedSegments: ProcessedSegment[] = [];
   let joinPlan = buildSegmentJoinPlan(
     segments.map((segment) => segment.text),
     smoothJoins
   );
   const seamRegenerationEnabled =
-    process.env.VOICEOVER_REGENERATE_BAD_SEAMS?.trim().toLowerCase() !== "false";
+    process.env.VOICE_LAB_REGENERATE_BAD_SEAMS?.trim().toLowerCase() !== "false";
   const contextOverlapEnabled = readBooleanEnv(
-    process.env.VOICEOVER_CONTEXT_OVERLAP,
+    process.env.VOICE_LAB_CONTEXT_OVERLAP,
     true
   );
   const toneSeamScoringEnabled = readBooleanEnv(
-    process.env.VOICEOVER_TONE_SEAM_SCORING,
+    process.env.VOICE_LAB_TONE_SEAM_SCORING,
     true
   );
   const seamRetryCount = readPositiveIntegerEnv(
-    process.env.VOICEOVER_SEAM_RETRIES,
+    process.env.VOICE_LAB_SEAM_RETRIES,
     DEFAULT_SEAM_RETRY_COUNT
   );
-  const multiTakeCount = resolveMultiTakeCount(process.env.VOICEOVER_MULTI_TAKE_COUNT);
+  const multiTakeCount = resolveMultiTakeCount(process.env.VOICE_LAB_MULTI_TAKE_COUNT);
   let multiTakeOptimization: MultiTakeOptimizationManifest | null = null;
 
   try {

@@ -1,4 +1,4 @@
-# Voiceover
+# Voice Lab
 
 Private tool for converting pasted long-form text into one narration file. Mistral Voxtral remains the default provider. VoxCPM2 is available as an opt-in local/CUDA voice-cloning provider that saves Brandon reference material outside the repo and exports final MP3 files through the existing mastering path.
 
@@ -10,7 +10,7 @@ Private tool for converting pasted long-form text into one narration file. Mistr
 - The default delivery preset is Substack-ready MP3: Normal volume, `-16 LUFS` integrated loudness, `-1.5 dBTP` true peak, 24 kHz mono WAV intermediates, and `192k` MP3 export.
 - Advanced controls can force segmented generation directly when needed.
 - VoxCPM2 runs as a separate authenticated FastAPI service. The Next.js app calls it over HTTP only and never imports Torch or VoxCPM.
-- VoxCPM2 reference audio, exact transcript, run WAVs, final MP3s, and manifests live under `VOICEOVER_DATA_DIR` outside the repo, defaulting to `/Users/bcarneiro/.voiceover`.
+- VoxCPM2 reference audio, exact transcript, run WAVs, final MP3s, and manifests live under `VOICE_LAB_DATA_DIR` outside the repo, defaulting to `/Users/bcarneiro/.voice-lab`.
 
 ## Running locally
 
@@ -36,13 +36,13 @@ npm run segmented-ab -- ./path/to/long-form-essay.md
 ```
 MISTRAL_API_KEY
 MISTRAL_VOICE_ID
-VOICEOVER_DATA_DIR
-VOICEOVER_DEBUG_AUDIO
-VOICEOVER_MASTERING_STRATEGY
-VOICEOVER_CONTEXT_OVERLAP
-VOICEOVER_TONE_SEAM_SCORING
-VOICEOVER_SEAM_RETRIES
-VOICEOVER_MULTI_TAKE_COUNT
+VOICE_LAB_DATA_DIR
+VOICE_LAB_DEBUG_AUDIO
+VOICE_LAB_MASTERING_STRATEGY
+VOICE_LAB_CONTEXT_OVERLAP
+VOICE_LAB_TONE_SEAM_SCORING
+VOICE_LAB_SEAM_RETRIES
+VOICE_LAB_MULTI_TAKE_COUNT
 VOXCPM_ENABLED
 VOXCPM_ENDPOINT_URL
 VOXCPM_HEALTH_URL
@@ -60,14 +60,14 @@ VOXCPM_DENOISE_REFERENCE
 
 Optional server-only audio diagnostics:
 
-- `VOICEOVER_DEBUG_AUDIO=true` keeps raw, standardized, leveled, merged pre-master, final, seam-clip, and manifest debug artifacts under `/tmp` and logs file references server-side only.
-- `VOICEOVER_REGENERATE_BAD_SEAMS=false` disables the default bounded bad-seam retry pass for segmented generation.
-- `VOICEOVER_CONTEXT_OVERLAP=false` disables the default continuity prompt context used in segmented generation.
-- `VOICEOVER_TONE_SEAM_SCORING=false` disables the default prosody/tone seam proxy scoring.
-- `VOICEOVER_SEAM_RETRIES=2` controls how many bounded regeneration passes are attempted for failed seams.
-- `VOICEOVER_MULTI_TAKE_COUNT=1` is the default segmented path. Set `2` or `3` for expensive multi-take seam optimization; values above `5` are clamped.
-- `VOICEOVER_MASTERING_STRATEGY=static` keeps the current static chain as the default.
-- `VOICEOVER_MASTERING_STRATEGY=speech-leveler` enables the speech-leveler mastering experiment.
+- `VOICE_LAB_DEBUG_AUDIO=true` keeps raw, standardized, leveled, merged pre-master, final, seam-clip, and manifest debug artifacts under `/tmp` and logs file references server-side only.
+- `VOICE_LAB_REGENERATE_BAD_SEAMS=false` disables the default bounded bad-seam retry pass for segmented generation.
+- `VOICE_LAB_CONTEXT_OVERLAP=false` disables the default continuity prompt context used in segmented generation.
+- `VOICE_LAB_TONE_SEAM_SCORING=false` disables the default prosody/tone seam proxy scoring.
+- `VOICE_LAB_SEAM_RETRIES=2` controls how many bounded regeneration passes are attempted for failed seams.
+- `VOICE_LAB_MULTI_TAKE_COUNT=1` is the default segmented path. Set `2` or `3` for expensive multi-take seam optimization; values above `5` are clamped.
+- `VOICE_LAB_MASTERING_STRATEGY=static` keeps the current static chain as the default.
+- `VOICE_LAB_MASTERING_STRATEGY=speech-leveler` enables the speech-leveler mastering experiment.
 
 ## VoxCPM2 service
 
@@ -87,13 +87,13 @@ VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:ap
 Docker / RunPod:
 
 ```
-docker build -f services/voxcpm/Dockerfile -t voiceover-voxcpm2:cuda .
+docker build -f services/voxcpm/Dockerfile -t voice-lab-voxcpm2:cuda .
 docker run --gpus all --rm \
   -p 127.0.0.1:8809:8809 \
   -e VOXCPM_API_KEY="$VOXCPM_API_KEY" \
   -e VOXCPM_MODEL="openbmb/VoxCPM2" \
   -e VOXCPM_DEVICE="cuda" \
-  voiceover-voxcpm2:cuda
+  voice-lab-voxcpm2:cuda
 ```
 
 RunPod/private endpoint:
@@ -112,4 +112,4 @@ Never expose the VoxCPM2 service as an unauthenticated public endpoint. Bind loc
 
 ## Private artifact rules
 
-Do not commit reference WAVs, transcripts, generated MP3/WAV files, or manifests containing transcript text or unsanitized private paths. Repo fallback artifact paths are ignored, but the intended storage location is still `VOICEOVER_DATA_DIR` outside the repo.
+Do not commit reference WAVs, transcripts, generated MP3/WAV files, or manifests containing transcript text or unsanitized private paths. Repo fallback artifact paths are ignored, but the intended storage location is still `VOICE_LAB_DATA_DIR` outside the repo.
