@@ -9,7 +9,7 @@ import {
   masterAudioFile,
   type AudioLoudnessTimeline
 } from "../lib/audio";
-import { parseMistralAudioResponse, postMistralSpeech } from "../lib/mistral";
+import { parseMistralAudioResponse, postMistralSpeech } from "../lib/providers/mistral";
 import { prepareTextForSpeech } from "../lib/text";
 
 loadEnvConfig(process.cwd());

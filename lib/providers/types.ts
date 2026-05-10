@@ -1,3 +1,7 @@
+export type SpeechProviderId = "mistral" | "voxcpm";
+
+export type ProviderHealthState = "disabled" | "configured" | "missing-configuration";
+
 export type VoxcpmCloneMode = "reference" | "ultimate";
 
 export type VoxcpmEndpointMode = "native-wrapper" | "vllm-omni";

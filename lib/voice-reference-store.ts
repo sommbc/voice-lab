@@ -1,10 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import { transcodeAudioFile } from "./audio";
+import {
+  DEFAULT_VOICE_REFERENCE_ID,
+  getVoiceLabRunStoragePaths,
+  getVoiceReferenceStoragePaths,
+  resolveUploadTempDirectoryPath,
+  resolveVoiceLabDataDir
+} from "./storage";
 
-const DEFAULT_REFERENCE_ID = "brandon";
+export { resolveVoiceLabDataDir };
 
 export type VoiceReferenceMetadata = {
   id: string;
@@ -43,11 +49,6 @@ export type VoiceLabRunWorkspace = {
   manifestPath: string;
 };
 
-export function resolveVoiceLabDataDir(): string {
-  const configured = process.env.VOICE_LAB_DATA_DIR?.trim();
-  return configured ? path.resolve(configured) : path.join(homedir(), ".voice-lab");
-}
-
 export function validateReferenceTranscript(transcript: string): string {
   const cleaned = transcript.replace(/\s+/g, " ").trim();
 
@@ -72,7 +73,7 @@ export async function saveVoiceReference({
   dataDir?: string;
 }): Promise<VoiceReference> {
   const cleanedTranscript = validateReferenceTranscript(transcript);
-  const paths = getVoiceReferencePaths(dataDir);
+  const paths = getVoiceReferenceStoragePaths({ dataDir });
   const tempPath = path.join(paths.directoryPath, `reference-${randomUUID()}.wav`);
 
   await mkdir(paths.directoryPath, { recursive: true });
@@ -94,7 +95,7 @@ export async function saveVoiceReference({
   ]);
   const transcriptBuffer = Buffer.from(cleanedTranscript, "utf8");
   const metadata: VoiceReferenceMetadata = {
-    id: DEFAULT_REFERENCE_ID,
+    id: DEFAULT_VOICE_REFERENCE_ID,
     updatedAt: new Date().toISOString(),
     referenceFilename: path.basename(paths.referenceAudioPath),
     transcriptFilename: path.basename(paths.transcriptPath),
@@ -117,7 +118,7 @@ export async function saveVoiceReference({
 export async function loadVoiceReference(
   dataDir = resolveVoiceLabDataDir()
 ): Promise<VoiceReference | null> {
-  const paths = getVoiceReferencePaths(dataDir);
+  const paths = getVoiceReferenceStoragePaths({ dataDir });
 
   try {
     const [metadataRaw, transcriptRaw] = await Promise.all([
@@ -148,28 +149,24 @@ export async function createVoiceLabRunWorkspace(
 ): Promise<VoiceLabRunWorkspace> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const runId = `${timestamp}-${randomUUID().slice(0, 8)}`;
-  const runDirectoryPath = path.join(dataDir, "runs", runId);
-  const segmentsDirectoryPath = path.join(runDirectoryPath, "segments");
-  const finalDirectoryPath = path.join(runDirectoryPath, "final");
+  const paths = getVoiceLabRunStoragePaths({ dataDir, runId });
 
-  await mkdir(segmentsDirectoryPath, { recursive: true });
-  await mkdir(finalDirectoryPath, { recursive: true });
+  await mkdir(paths.segmentsDirectoryPath, { recursive: true });
+  await mkdir(paths.finalDirectoryPath, { recursive: true });
 
   return {
     runId,
-    runDirectoryPath,
-    segmentsDirectoryPath,
-    finalDirectoryPath,
-    manifestPath: path.join(runDirectoryPath, "manifest.json")
+    ...paths
   };
 }
 
 export async function createUploadTempDirectory(
   dataDir = resolveVoiceLabDataDir()
 ): Promise<string> {
-  const tempRoot = path.join(dataDir, "tmp");
-  await mkdir(tempRoot, { recursive: true });
-  const directoryPath = path.join(tempRoot, `upload-${randomUUID()}`);
+  const directoryPath = resolveUploadTempDirectoryPath({
+    dataDir,
+    directoryName: `upload-${randomUUID()}`
+  });
   await mkdir(directoryPath, { recursive: true });
   return directoryPath;
 }
@@ -194,22 +191,6 @@ export function toClientVoiceReferenceMetadata(
     transcriptSha256: metadata.transcriptSha256,
     audioBytes: metadata.audioBytes,
     transcriptCharacters: metadata.transcriptCharacters
-  };
-}
-
-function getVoiceReferencePaths(dataDir: string): {
-  directoryPath: string;
-  referenceAudioPath: string;
-  transcriptPath: string;
-  metadataPath: string;
-} {
-  const directoryPath = path.join(dataDir, "references", DEFAULT_REFERENCE_ID);
-
-  return {
-    directoryPath,
-    referenceAudioPath: path.join(directoryPath, "reference.wav"),
-    transcriptPath: path.join(directoryPath, "transcript.txt"),
-    metadataPath: path.join(directoryPath, "metadata.json")
   };
 }
 

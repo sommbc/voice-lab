@@ -257,6 +257,12 @@ summary:focus-visible {
   border-top: 0;
 }
 
+.section-note {
+  color: var(--ash);
+  font-size: 0.8rem;
+  line-height: 1.58;
+}
+
 .field-grid,
 .field-pair,
 .toggle-list {

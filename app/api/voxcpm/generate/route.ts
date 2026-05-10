@@ -177,7 +177,7 @@ async function runVoxcpmGeneration({
     const reference = await loadVoiceReference();
 
     if (!reference) {
-      throw new Error("Save Brandon reference audio and exact transcript before using VoxCPM2.");
+      throw new Error("Save reference audio and its exact transcript before using VoxCPM2.");
     }
 
     sendEvent({

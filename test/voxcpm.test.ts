@@ -3,6 +3,12 @@ import test from "node:test";
 import { buildVoxcpmRequestPayload } from "../lib/providers/voxcpm";
 import type { VoxcpmRequestPayload } from "../lib/providers/types";
 import {
+  DEFAULT_VOICE_REFERENCE_ID,
+  getVoiceReferenceStoragePaths,
+  resolveStoragePath,
+  sanitizeStorageId
+} from "../lib/storage";
+import {
   toClientVoiceReferenceMetadata,
   validateReferenceTranscript,
   type VoiceReferenceMetadata
@@ -39,14 +45,14 @@ test("reference transcript validation requires real exact transcript text", () =
   assert.throws(() => validateReferenceTranscript(""), /Reference transcript is required/);
   assert.throws(() => validateReferenceTranscript("too short"), /too short/);
   assert.equal(
-    validateReferenceTranscript("  This is the exact transcript for the Brandon reference clip.  "),
-    "This is the exact transcript for the Brandon reference clip."
+    validateReferenceTranscript("  This is the exact transcript for the reference voice clip.  "),
+    "This is the exact transcript for the reference voice clip."
   );
 });
 
 test("voice reference client metadata stays sanitized", () => {
   const metadata: VoiceReferenceMetadata = {
-    id: "brandon",
+    id: DEFAULT_VOICE_REFERENCE_ID,
     updatedAt: "2026-05-10T00:00:00.000Z",
     referenceFilename: "reference.wav",
     transcriptFilename: "transcript.txt",
@@ -72,14 +78,14 @@ test("VoxCPM long-form prompt plan uses previous generated chunk transcript afte
   ];
   const plan = createVoxcpmSegmentPromptPlan({
     segments,
-    referenceTranscript: "This is Brandon's exact reference transcript for cloning.",
+    referenceTranscript: "This is the exact reference transcript for provider testing.",
     cloneMode: "reference",
     forceFirstPrompt: true
   });
 
   assert.equal(VOXCPM_CHUNK_OPTIONS.hardMaxWords, 170);
   assert.equal(plan[0].promptSource, "reference");
-  assert.equal(plan[0].promptText, "This is Brandon's exact reference transcript for cloning.");
+  assert.equal(plan[0].promptText, "This is the exact reference transcript for provider testing.");
   assert.equal(plan[1].promptSource, "previous-segment");
   assert.equal(plan[1].promptText, "First generated chunk text.");
   assert.equal(plan[2].promptSource, "previous-segment");
@@ -89,7 +95,7 @@ test("VoxCPM long-form prompt plan uses previous generated chunk transcript afte
 test("VoxCPM short reference clone can omit prompt transcript", () => {
   const plan = createVoxcpmSegmentPromptPlan({
     segments: [{ text: "Short cloned generation.", wordCount: 3 }],
-    referenceTranscript: "This is Brandon's exact reference transcript for cloning.",
+    referenceTranscript: "This is the exact reference transcript for provider testing.",
     cloneMode: "reference",
     forceFirstPrompt: false
   });
@@ -97,4 +103,17 @@ test("VoxCPM short reference clone can omit prompt transcript", () => {
   assert.equal(plan.length, 1);
   assert.equal(plan[0].promptSource, "none");
   assert.equal(plan[0].promptText, null);
+});
+
+test("storage helpers keep reference paths inside the configured data directory", () => {
+  const root = "/tmp/voice-lab-test-storage";
+  const paths = getVoiceReferenceStoragePaths({
+    dataDir: root,
+    referenceId: "../Reference Voice"
+  });
+
+  assert.equal(paths.directoryPath, "/tmp/voice-lab-test-storage/references/reference-voice");
+  assert.equal(paths.referenceAudioPath.endsWith("/reference.wav"), true);
+  assert.equal(sanitizeStorageId(" Reference Voice! ", "fallback"), "reference-voice");
+  assert.throws(() => resolveStoragePath(root, "../outside.wav"), /escapes/);
 });

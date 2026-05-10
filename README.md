@@ -1,81 +1,119 @@
 # Voice Lab
 
-Private tool for converting pasted long-form text into one narration file. Mistral Voxtral remains the default provider. VoxCPM2 is available as an opt-in local/CUDA voice-cloning provider that saves Brandon reference material outside the repo and exports final MP3 files through the existing mastering path.
+Voice Lab is an open-source speech lab for long-form voice generation, TTS provider experimentation, voice-cloning workflows, segmented generation diagnostics, seam scoring, mastering, and podcast-ready MP3 export. It is built as a local-first Next.js app with server-side provider calls and a separate optional VoxCPM2 service for GPU-backed reference-voice experiments.
 
-## Current behavior
+No screenshots are included yet. The app ships with a dark editorial default theme that can be replaced by downstream projects.
 
-- Continuous Read is the default path for long-form essays.
-- The app cleans the full document, sends one Mistral TTS request first, then applies final mastering to the completed file before delivery.
-- If the full-document request fails for a chunking-worthy reason, the app falls back to deterministic segmented generation: smaller Mistral-safe chunks, continuity context for each TTS request, WAV standardization, per-segment static loudness leveling, bounded fade-down correction, adaptive join pauses, mechanical and tonal seam scoring, selective bad-seam regeneration, optional multi-take seam optimization, boundary repair when a seam still sounds like a new take, boundary-aware edge matching, WAV merge, publishability verdicting, and gentle final mastering.
-- The default delivery preset is Substack-ready MP3: Normal volume, `-16 LUFS` integrated loudness, `-1.5 dBTP` true peak, 24 kHz mono WAV intermediates, and `192k` MP3 export.
-- Advanced controls can force segmented generation directly when needed.
-- VoxCPM2 runs as a separate authenticated FastAPI service. The Next.js app calls it over HTTP only and never imports Torch or VoxCPM.
-- VoxCPM2 reference audio, exact transcript, run WAVs, final MP3s, and manifests live under `VOICE_LAB_DATA_DIR` outside the repo, defaulting to `/Users/bcarneiro/.voice-lab`.
+## Features
 
-## Running locally
+- Mistral Voxtral TTS generation with continuous-read first and segmented fallback modes.
+- VoxCPM2 reference-voice workflow through an authenticated FastAPI sidecar service.
+- Long-form text cleanup, markdown stripping, URL removal, and speech-friendly normalization.
+- Deterministic segmentation for provider limits and retryable generation failures.
+- Seam diagnostics, acoustic scoring, bounded regeneration, multi-take selection, and debug manifests for segmented output.
+- Final mastering to normal, louder, or very-loud presets with MP3 or WAV export where supported.
+- Local private storage for reference audio, transcripts, run WAVs, final files, and manifests.
+- Audio analysis and mastering comparison scripts for provider and pipeline testing.
 
+## Honest Limitations
+
+- Voice Lab does not guarantee perfect voice cloning.
+- Provider APIs can impose text length, latency, rate, model, voice, and quality limits.
+- Continuous long-form narration is not seamless with every provider or every voice.
+- VoxCPM2 is experimental for long-form narration and needs a suitable GPU for real work.
+- Seam scores are diagnostics, not a substitute for listening to final audio.
+- The app returns generated audio to the browser as base64 in the response stream, so keep deployments private unless you harden the delivery path.
+
+## Architecture
+
+```text
+Next.js app
+  app/page.tsx                  local UI
+  app/api/generate              Mistral continuous/segmented generation
+  app/api/voxcpm/generate       VoxCPM2 reference-voice generation
+  app/api/voice-references      reference audio/transcript storage
+
+Shared TypeScript libraries
+  lib/providers                 provider clients and provider types
+  lib/audio.ts                  ffmpeg, mastering, seam diagnostics
+  lib/text.ts                   text cleanup and segmentation
+  lib/storage.ts                private local storage path handling
+  lib/voice-reference-store.ts  reference metadata and upload handling
+
+Optional Python service
+  services/voxcpm/server.py     authenticated FastAPI wrapper for VoxCPM2
 ```
+
+Provider secrets are read only on the server. The Next app does not import Torch, VoxCPM, or other Python/GPU dependencies.
+
+More detail:
+
+- [docs/architecture.md](docs/architecture.md)
+- [docs/providers.md](docs/providers.md)
+- [docs/mistral.md](docs/mistral.md)
+- [docs/voxcpm.md](docs/voxcpm.md)
+
+## Quick Start
+
+Requirements:
+
+- Node.js `>=20.9.0`
+- npm
+- ffmpeg, either from `ffmpeg-static` or available on `PATH`
+- A Mistral API key for Voxtral TTS
+- Optional: CUDA GPU environment for VoxCPM2
+
+```bash
 npm install
+cp .env.example .env
 npm run dev
 ```
 
-Requires Node.js 18+. The server uses `ffmpeg` for narration normalization and multi-segment merges; it will use the bundled binary when available and fall back to a system `ffmpeg` on PATH.
+Open [http://localhost:3000](http://localhost:3000).
 
-## Tests
+## Environment Variables
 
-```
-npm test
-npx tsc --noEmit
-npm run build
-npm run analyze-audio -- ./path/to/file.mp3
-npm run segmented-ab -- ./path/to/long-form-essay.md
-```
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `MISTRAL_API_KEY` | For Mistral | none | Server-only Mistral API key. |
+| `MISTRAL_VOICE_ID` | For Mistral default voice | none | Server-side default voice ID. The UI can override per run. |
+| `VOICE_LAB_DATA_DIR` | No | `~/.voice-lab` | Private local storage root for references and VoxCPM run artifacts. Keep outside the repo. |
+| `VOICE_LAB_DEBUG_AUDIO` | No | `false` | Keeps segmented debug artifacts under a temporary debug directory and logs that path server-side. |
+| `VOICE_LAB_MASTERING_STRATEGY` | No | `static` | `static` or `speech-leveler`. |
+| `VOICE_LAB_CONTEXT_OVERLAP` | No | `true` | Adds neighboring text context for segmented Mistral prompts. |
+| `VOICE_LAB_TONE_SEAM_SCORING` | No | `true` | Enables prosody/tone proxy scoring in seam diagnostics. |
+| `VOICE_LAB_SEAM_RETRIES` | No | `2` | Bounded retry count for failed segmented seams. |
+| `VOICE_LAB_MULTI_TAKE_COUNT` | No | `1` | Number of segmented takes considered during multi-take optimization. Values above `5` are clamped. |
+| `VOXCPM_ENABLED` | For VoxCPM2 | `false` | Must be `true` for the Next app to call the VoxCPM2 service. |
+| `VOXCPM_ENDPOINT_URL` | For VoxCPM2 | `http://127.0.0.1:8809/generate` | Authenticated VoxCPM2 generate endpoint. |
+| `VOXCPM_HEALTH_URL` | For VoxCPM2 | `http://127.0.0.1:8809/health` | Authenticated VoxCPM2 health endpoint for operators. |
+| `VOXCPM_API_KEY` | For VoxCPM2 | none | Shared bearer token between Next and the VoxCPM2 service. |
+| `VOXCPM_ENDPOINT_MODE` | No | `native-wrapper` | `native-wrapper` or `vllm-omni`. |
+| `VOXCPM_MODEL` | No | `openbmb/VoxCPM2` | Model identifier used by the service or compatible endpoint. |
+| `VOXCPM_TIMEOUT_MS` | No | `300000` | Request timeout for VoxCPM2 generation. |
+| `VOXCPM_CFG_VALUE` | No | `2.0` | VoxCPM2 CFG value. |
+| `VOXCPM_INFERENCE_TIMESTEPS` | No | `10` | VoxCPM2 inference steps. |
+| `VOXCPM_NORMALIZE_TEXT` | No | `true` | Requests provider-side text normalization. |
+| `VOXCPM_DENOISE_REFERENCE` | No | `false` | Requests denoising when the service was started with denoiser support. |
 
-## Environment variables
+## Provider Setup
 
-```
-MISTRAL_API_KEY
-MISTRAL_VOICE_ID
-VOICE_LAB_DATA_DIR
-VOICE_LAB_DEBUG_AUDIO
-VOICE_LAB_MASTERING_STRATEGY
-VOICE_LAB_CONTEXT_OVERLAP
-VOICE_LAB_TONE_SEAM_SCORING
-VOICE_LAB_SEAM_RETRIES
-VOICE_LAB_MULTI_TAKE_COUNT
-VOXCPM_ENABLED
-VOXCPM_ENDPOINT_URL
-VOXCPM_HEALTH_URL
-VOXCPM_API_KEY
-VOXCPM_ENDPOINT_MODE
-VOXCPM_MODEL
-VOXCPM_TIMEOUT_MS
-VOXCPM_CFG_VALUE
-VOXCPM_INFERENCE_TIMESTEPS
-VOXCPM_NORMALIZE_TEXT
-VOXCPM_DENOISE_REFERENCE
-```
+### Mistral Voxtral
 
-`MISTRAL_API_KEY` and `MISTRAL_VOICE_ID` are required.
+1. Create a Mistral API key.
+2. Set `MISTRAL_API_KEY` in `.env`.
+3. Set `MISTRAL_VOICE_ID` to the voice you want as the server default, or leave it blank and enter a voice ID in the UI for each run.
+4. Run `npm run dev`.
 
-Optional server-only audio diagnostics:
+The Mistral route first attempts a full-document request. If the provider rejects or times out for a chunking-worthy reason, Voice Lab can fall back to segmented generation and return one mastered file.
 
-- `VOICE_LAB_DEBUG_AUDIO=true` keeps raw, standardized, leveled, merged pre-master, final, seam-clip, and manifest debug artifacts under `/tmp` and logs file references server-side only.
-- `VOICE_LAB_REGENERATE_BAD_SEAMS=false` disables the default bounded bad-seam retry pass for segmented generation.
-- `VOICE_LAB_CONTEXT_OVERLAP=false` disables the default continuity prompt context used in segmented generation.
-- `VOICE_LAB_TONE_SEAM_SCORING=false` disables the default prosody/tone seam proxy scoring.
-- `VOICE_LAB_SEAM_RETRIES=2` controls how many bounded regeneration passes are attempted for failed seams.
-- `VOICE_LAB_MULTI_TAKE_COUNT=1` is the default segmented path. Set `2` or `3` for expensive multi-take seam optimization; values above `5` are clamped.
-- `VOICE_LAB_MASTERING_STRATEGY=static` keeps the current static chain as the default.
-- `VOICE_LAB_MASTERING_STRATEGY=speech-leveler` enables the speech-leveler mastering experiment.
+See [docs/mistral.md](docs/mistral.md).
 
-## VoxCPM2 service
+### VoxCPM2
 
-VoxCPM2 v1 uses `services/voxcpm/server.py` as the native FastAPI service. Use CUDA for real work; local Mac MPS is only a smoke-test path.
+VoxCPM2 runs outside Next as a separate authenticated service. GPU is strongly recommended and usually required for practical generation speed.
 
-CUDA setup:
-
-```
+```bash
 uv python install 3.11
 uv venv .venv --python 3.11
 source .venv/bin/activate
@@ -84,32 +122,89 @@ uv pip install -r services/voxcpm/requirements.txt
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
 
-Docker / RunPod:
+Then set in `.env`:
 
-```
-docker build -f services/voxcpm/Dockerfile -t voice-lab-voxcpm2:cuda .
-docker run --gpus all --rm \
-  -p 127.0.0.1:8809:8809 \
-  -e VOXCPM_API_KEY="$VOXCPM_API_KEY" \
-  -e VOXCPM_MODEL="openbmb/VoxCPM2" \
-  -e VOXCPM_DEVICE="cuda" \
-  voice-lab-voxcpm2:cuda
-```
-
-RunPod/private endpoint:
-
-```
-ssh -N -L 8809:127.0.0.1:8809 root@<runpod-host>
+```bash
+VOXCPM_ENABLED=true
+VOXCPM_ENDPOINT_URL=http://127.0.0.1:8809/generate
+VOXCPM_HEALTH_URL=http://127.0.0.1:8809/health
+VOXCPM_API_KEY=replace-me
 ```
 
 Health check:
 
-```
+```bash
 curl -H "Authorization: Bearer $VOXCPM_API_KEY" http://127.0.0.1:8809/health
 ```
 
-Never expose the VoxCPM2 service as an unauthenticated public endpoint. Bind locally, use an SSH tunnel/private network, or place authenticated HTTPS in front of it.
+See [docs/voxcpm.md](docs/voxcpm.md).
 
-## Private artifact rules
+## Generating Audio
 
-Do not commit reference WAVs, transcripts, generated MP3/WAV files, or manifests containing transcript text or unsanitized private paths. Repo fallback artifact paths are ignored, but the intended storage location is still `VOICE_LAB_DATA_DIR` outside the repo.
+1. Paste markdown or plain text into the source text area.
+2. Choose `Mistral Voxtral` or `VoxCPM2 reference voice`.
+3. For Mistral, optionally enter a voice ID. If blank, the server uses `MISTRAL_VOICE_ID`.
+4. For VoxCPM2, save reference audio with the exact spoken transcript before generation.
+5. Choose output format and mastering preset.
+6. Select advanced segmented controls only when you need to bypass continuous-read behavior.
+7. Generate. The browser downloads the final file when the run completes.
+
+## Debug Artifacts
+
+Set `VOICE_LAB_DEBUG_AUDIO=true` to retain server-side debug artifacts for segmented runs. Debug output can include raw segments, standardized WAVs, leveled WAVs, seam clips, pre-master audio, final mastered output, and a diagnostics manifest.
+
+Reference audio, transcripts, generated WAVs/MP3s, and manifests may contain private material. Keep `VOICE_LAB_DATA_DIR` outside the repo and do not commit generated artifacts.
+
+## Scripts
+
+```bash
+npm run dev
+npm test
+npm run typecheck
+npm run build
+npm run check
+npm run clean
+npm run analyze-audio -- ./path/to/file.mp3
+npm run mastering-ab -- ./path/to/source.md
+npm run segmented-ab -- ./path/to/source.md
+```
+
+`npm run check` runs tests, TypeScript, and production build. There is no lint script until a real lint configuration exists.
+
+## Tests
+
+Tests use Node's built-in test runner through `tsx`.
+
+```bash
+npm test
+npx tsc --noEmit
+npm run build
+git diff --check
+```
+
+Coverage currently focuses on text cleanup, segmentation, mastering argument generation, provider payloads, storage path safety, reference metadata sanitization, and VoxCPM prompt planning.
+
+## Security And Privacy
+
+- `.env` and local env variants are ignored.
+- `.env.example` contains placeholders only.
+- Provider API keys are server-only.
+- VoxCPM2 requires bearer-token auth and should be bound to localhost, an SSH tunnel, a private network, or authenticated HTTPS.
+- Reference audio, exact transcripts, generated audio, and manifests are private by default.
+- Generated outputs and common audio files are ignored by git.
+- Do not deploy this publicly without revisiting authentication, upload limits, retention policy, and response streaming.
+- Do not log API keys, bearer tokens, full base64 audio payloads, or private transcript content.
+
+## Roadmap
+
+- Provider registry and capability reporting.
+- Optional authenticated project workspace mode.
+- More provider adapters for TTS and voice conversion experiments.
+- Better run browser for local artifacts without exposing private paths.
+- STT and podcast transcript workflows.
+- More seam diagnostics and listening-review tooling.
+- CI once the public repository has its GitHub workflow policy settled.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

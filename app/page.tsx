@@ -2,20 +2,6 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 
-const VOICES = [
-  { name: "Brandon", id: "4482a650-b0e9-46d5-aa72-b3fbdb43fb20" },
-  { name: "Paul — Neutral", id: "c69964a6-ab8b-4f8a-9465-ec0925096ec8" },
-  { name: "Paul — Confident", id: "98559b22-62b5-4a64-a7cd-fc78ca41faa8" },
-  { name: "Paul — Cheerful", id: "01d985cd-5e0c-4457-bfd8-80ba31a5bc03" },
-  { name: "Oliver — Neutral", id: "e3596645-b1af-469e-b857-f18ddedc7652" },
-  { name: "Oliver — Confident", id: "8169ab87-bc99-4669-a5ec-6855860ace24" },
-  { name: "Oliver — Curious", id: "390c8a2b-60a6-4882-8437-c49a8bd33b63" },
-  { name: "Jane — Neutral", id: "82c99ee6-f932-423f-a4a3-d403c8914b8d" },
-  { name: "Jane — Confident", id: "cbe96cf0-85ec-4a10-accb-0b35c93b6dfd" },
-  { name: "Jane — Curious", id: "5de47977-6e47-4266-a938-3bc1d76b4676" }
-];
-
-const DEFAULT_VOICE_ID = "4482a650-b0e9-46d5-aa72-b3fbdb43fb20";
 const VOICE_STORAGE_KEY = "voice-lab-selected-voice-id";
 const DEFAULT_VOLUME_BOOST = "normal";
 
@@ -78,7 +64,7 @@ export default function HomePage() {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
   const [provider, setProvider] = useState<Provider>("mistral");
-  const [voiceId, setVoiceId] = useState(DEFAULT_VOICE_ID);
+  const [voiceId, setVoiceId] = useState("");
   const [voxcpmCloneMode, setVoxcpmCloneMode] = useState<VoxcpmCloneMode>("ultimate");
   const [referenceTranscript, setReferenceTranscript] = useState("");
   const [referenceAudioFile, setReferenceAudioFile] = useState<File | null>(null);
@@ -111,13 +97,8 @@ export default function HomePage() {
 
   useEffect(() => {
     const stored = localStorage.getItem(VOICE_STORAGE_KEY);
-    if (stored && VOICES.some((voice) => voice.id === stored)) {
-      setVoiceId(stored);
-      return;
-    }
-
     if (stored) {
-      localStorage.setItem(VOICE_STORAGE_KEY, DEFAULT_VOICE_ID);
+      setVoiceId(stored);
     }
   }, []);
 
@@ -142,7 +123,11 @@ export default function HomePage() {
 
   function handleVoiceChange(id: string) {
     setVoiceId(id);
-    localStorage.setItem(VOICE_STORAGE_KEY, id);
+    if (id.trim()) {
+      localStorage.setItem(VOICE_STORAGE_KEY, id.trim());
+    } else {
+      localStorage.removeItem(VOICE_STORAGE_KEY);
+    }
   }
 
   async function loadSavedVoiceReference() {
@@ -252,7 +237,7 @@ export default function HomePage() {
         const type = recorder.mimeType || "audio/webm";
         const blob = new Blob(recordedChunksRef.current, { type });
         const extension = type.includes("webm") ? "webm" : type.includes("ogg") ? "ogg" : "wav";
-        const file = new File([blob], `brandon-reference.${extension}`, { type });
+        const file = new File([blob], `voice-reference.${extension}`, { type });
         setReferenceAudioFile(file);
         setReferenceAudioName(file.name);
         setReferenceStatusMessage("Recording ready");
@@ -307,7 +292,7 @@ export default function HomePage() {
     }
 
     if (voxcpmSelected && !voiceReference) {
-      setErrorMessage("Save Brandon reference audio and transcript before using VoxCPM2.");
+      setErrorMessage("Save reference audio and its exact transcript before using VoxCPM2.");
       return;
     }
 
@@ -444,10 +429,12 @@ export default function HomePage() {
     <main className="app-shell">
       <div className="page">
         <header className="hero">
-          <p className="eyebrow">SOMMBC Private Tool</p>
+          <p className="eyebrow">Open speech lab</p>
           <div className="hero-main">
             <h1 className="hero-title">Voice Lab</h1>
-            <p className="hero-subtitle">Paste long-form text. Generate one finished narration file.</p>
+            <p className="hero-subtitle">
+              Experiment with long-form TTS, reference voices, seam diagnostics, mastering, and MP3 export.
+            </p>
           </div>
         </header>
 
@@ -478,7 +465,7 @@ export default function HomePage() {
               <p className="panel-kicker">Controls</p>
               <h2 className="panel-title">Generation setup</h2>
               <p className="panel-copy">
-                Defaults are tuned for one Substack-ready MP3. Adjust only what this run needs.
+                Defaults are tuned for one podcast-ready MP3. Adjust only what this run needs.
               </p>
             </div>
 
@@ -505,27 +492,21 @@ export default function HomePage() {
                       onChange={(event) => setProvider(event.target.value as Provider)}
                     >
                       <option value="mistral">Mistral Voxtral</option>
-                      <option value="voxcpm">VoxCPM2 Clone</option>
+                      <option value="voxcpm">VoxCPM2 reference voice</option>
                     </select>
                   </div>
                 </label>
 
                 {!voxcpmSelected && (
                 <label className="field-label">
-                  <span className="field-name">Voice</span>
-                  <div className="select-wrap">
-                    <select
-                      className="select"
-                      value={voiceId}
-                      onChange={(event) => handleVoiceChange(event.target.value)}
-                    >
-                      {VOICES.map((voice) => (
-                        <option key={voice.id} value={voice.id}>
-                          {voice.name}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                  <span className="field-name">Mistral Voice ID</span>
+                  <input
+                    className="input"
+                    name="voiceId"
+                    placeholder="Uses MISTRAL_VOICE_ID when blank"
+                    value={voiceId}
+                    onChange={(event) => handleVoiceChange(event.target.value)}
+                  />
                 </label>
                 )}
 
@@ -553,9 +534,9 @@ export default function HomePage() {
                       value={volumeBoost}
                       onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
                     >
-                      <option value="normal">Normal / Substack</option>
+                      <option value="normal">Normal / podcast MP3</option>
                       <option value="louder">Louder</option>
-                      <option value="very-loud">Very Loud / Emergency</option>
+                      <option value="very-loud">Very Loud</option>
                     </select>
                   </div>
                 </label>
@@ -565,9 +546,12 @@ export default function HomePage() {
             {voxcpmSelected && (
               <section className="section">
                 <p className="section-heading">VoxCPM2 Reference</p>
+                <p className="section-note">
+                  Use a clean reference clip with the exact spoken transcript. Voice similarity and long-form continuity vary by model and hardware.
+                </p>
                 <div className="toggle-list">
                   <label className="field-label">
-                    <span className="field-name">Clone Mode</span>
+                    <span className="field-name">Reference Mode</span>
                     <div className="select-wrap">
                       <select
                         className="select"
@@ -576,8 +560,8 @@ export default function HomePage() {
                           setVoxcpmCloneMode(event.target.value as VoxcpmCloneMode)
                         }
                       >
-                        <option value="ultimate">Ultimate clone</option>
-                        <option value="reference">Reference clone</option>
+                        <option value="ultimate">Reference plus prompt text</option>
+                        <option value="reference">Reference audio only</option>
                       </select>
                     </div>
                   </label>

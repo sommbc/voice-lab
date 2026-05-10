@@ -272,7 +272,7 @@ test("audio command helpers expose the mastering path and correction gain hook",
   assert.ok(mergeReencodeArgs.includes("192k"));
 });
 
-test("default narration delivery is Substack-ready normal MP3", async () => {
+test("default narration delivery is podcast-ready normal MP3 without private voice defaults", async () => {
   assert.equal(DEFAULT_OUTPUT_FORMAT, "mp3");
   assert.equal(DEFAULT_VOLUME_BOOST, "normal");
   assert.equal(VOLUME_BOOST_SETTINGS.normal.integratedLoudness, -16);
@@ -292,14 +292,9 @@ test("default narration delivery is Substack-ready normal MP3", async () => {
 
   const pageSource = await readFile(path.join(__dirname, "../app/page.tsx"), "utf8");
   assert.match(pageSource, /const DEFAULT_VOLUME_BOOST = "normal"/);
-  assert.match(pageSource, /Normal \/ Substack/);
-  assert.ok(
-    pageSource.includes('{ name: "Brandon", id: "4482a650-b0e9-46d5-aa72-b3fbdb43fb20" }')
-  );
-  assert.ok(
-    pageSource.includes('const DEFAULT_VOICE_ID = "4482a650-b0e9-46d5-aa72-b3fbdb43fb20"')
-  );
-  assert.match(pageSource, /localStorage\.setItem\(VOICE_STORAGE_KEY, DEFAULT_VOICE_ID\)/);
+  assert.match(pageSource, /Normal \/ podcast MP3/);
+  assert.match(pageSource, /Uses MISTRAL_VOICE_ID when blank/);
+  assert.doesNotMatch(pageSource, /DEFAULT_VOICE_ID/);
 });
 
 test("linear mastering filter embeds the measured loudness stats and requests linear mode", () => {

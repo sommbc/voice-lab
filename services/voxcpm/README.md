@@ -1,6 +1,8 @@
-# VoxCPM2 Service
+# Voice Lab VoxCPM2 Service
 
-Native FastAPI wrapper for `openbmb/VoxCPM2`. The Next.js app talks to this service over HTTP only; it does not import Torch or VoxCPM.
+Native FastAPI wrapper for `openbmb/VoxCPM2`. The Next.js app talks to this service over authenticated HTTP only; it does not import Torch or VoxCPM.
+
+CUDA GPU is strongly recommended and usually required for practical generation speed.
 
 ## Local CUDA Setup
 
@@ -13,7 +15,7 @@ uv pip install -r services/voxcpm/requirements.txt
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
 
-## Docker / RunPod
+## Docker
 
 ```bash
 docker build -f services/voxcpm/Dockerfile -t voice-lab-voxcpm2:cuda .
@@ -25,10 +27,10 @@ docker run --gpus all --rm \
   voice-lab-voxcpm2:cuda
 ```
 
-RunPod/private endpoint pattern:
+## Remote GPU Pattern
 
 ```bash
-ssh -N -L 8809:127.0.0.1:8809 root@<runpod-host>
+ssh -N -L 8809:127.0.0.1:8809 root@<gpu-host>
 ```
 
 Point the Next app at the tunnel:
@@ -46,4 +48,4 @@ Health check:
 curl -H "Authorization: Bearer $VOXCPM_API_KEY" http://127.0.0.1:8809/health
 ```
 
-Do not expose this service as an unauthenticated public endpoint. Bind it to localhost, use an SSH tunnel/private network, or put authenticated HTTPS in front of it.
+Do not expose this service as an unauthenticated public endpoint. Bind it to localhost, use an SSH tunnel or private network, or put authenticated HTTPS in front of it.

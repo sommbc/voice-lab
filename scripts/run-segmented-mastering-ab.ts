@@ -38,7 +38,7 @@ import {
   type SegmentDiagnosticsManifestSegment,
   type SegmentJoinPlan
 } from "../lib/audio";
-import { parseMistralAudioResponse, postMistralSpeech } from "../lib/mistral";
+import { parseMistralAudioResponse, postMistralSpeech } from "../lib/providers/mistral";
 import {
   buildSegmentContinuityPrompt,
   chunkText,

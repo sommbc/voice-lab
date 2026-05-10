@@ -1,7 +1,10 @@
 node_modules
 .next
 .vercel
+AGENTS.md
 .env
+.env.*
+!.env.example
 .env.local
 .env.development.local
 .env.production.local
@@ -16,5 +19,12 @@ tsconfig.tsbuildinfo
 /.voice-lab/
 /runs/
 /voice-references/
+/debug-artifacts/
+/tmp/
 *.wav
 *.mp3
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.webm

@@ -51,7 +51,11 @@ import {
   type MultiTakePathSelection,
   type VolumeBoost
 } from "@/lib/audio";
-import { parseMistralAudioResponse, postMistralSpeech } from "@/lib/mistral";
+import {
+  parseMistralAudioResponse,
+  postMistralSpeech,
+  resolveMistralProviderConfig
+} from "@/lib/providers/mistral";
 import {
   buildSegmentContinuityPrompt,
   chunkText,
@@ -164,10 +168,7 @@ export async function POST(request: Request): Promise<Response> {
 
   const title = typeof payload.title === "string" ? payload.title : "";
   const text = typeof payload.text === "string" ? payload.text : "";
-  const voiceId =
-    typeof payload.voiceId === "string" && payload.voiceId.trim()
-      ? payload.voiceId.trim()
-      : (process.env.MISTRAL_VOICE_ID ?? "");
+  const voiceId = typeof payload.voiceId === "string" ? payload.voiceId.trim() : "";
   const forceSegmentedMode = payload.forceSegmentedMode === true;
   const continuousRead = forceSegmentedMode ? false : payload.continuousRead !== false;
   const fallbackToSegmented = payload.fallbackToSegmented !== false;
@@ -262,7 +263,10 @@ async function runGeneration({
       throw new Error("Paste some text before generating audio.");
     }
 
-    validateEnvironment(voiceId);
+    const providerConfig = resolveMistralProviderConfig();
+    const resolvedVoiceId = voiceId || providerConfig.defaultVoiceId;
+
+    validateEnvironment(resolvedVoiceId);
 
     sendEvent({
       type: "progress",
@@ -281,7 +285,7 @@ async function runGeneration({
     if (forceSegmentedMode || !continuousRead) {
       const segmentedResult = await generateSegmentedSpeech({
         paragraphs: preparedText.paragraphs,
-        voiceId,
+        voiceId: resolvedVoiceId,
         outputFormat,
         normalizationEnabled,
         volumeBoost,
@@ -317,7 +321,7 @@ async function runGeneration({
     try {
       const singlePassResult = await generateSinglePassResult({
         input: preparedText.cleanedText,
-        voiceId,
+        voiceId: resolvedVoiceId,
         outputFormat,
         normalizationEnabled,
         volumeBoost,
@@ -364,7 +368,7 @@ async function runGeneration({
 
     const fallbackResult = await generateSegmentedSpeech({
       paragraphs: preparedText.paragraphs,
-      voiceId,
+      voiceId: resolvedVoiceId,
       outputFormat,
       normalizationEnabled,
       volumeBoost,
@@ -418,10 +422,6 @@ async function runGeneration({
 }
 
 function validateEnvironment(voiceId: string): void {
-  if (!process.env.MISTRAL_API_KEY) {
-    throw new Error("Missing required env var: MISTRAL_API_KEY");
-  }
-
   if (!voiceId) {
     throw new Error("Missing voice ID. Pick a saved voice or set MISTRAL_VOICE_ID server-side.");
   }

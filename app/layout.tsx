@@ -11,7 +11,8 @@ const plusJakarta = Plus_Jakarta_Sans({
 
 export const metadata: Metadata = {
   title: "Voice Lab",
-  description: "Private narration workspace for long-form voice generation.",
+  description:
+    "Open-source speech lab for long-form voice generation, provider testing, seam diagnostics, mastering, and MP3 export.",
 };
 
 export default function RootLayout({

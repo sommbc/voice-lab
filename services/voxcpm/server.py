@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import secrets
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -36,7 +37,7 @@ def require_auth(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=503, detail="VOXCPM_API_KEY is not configured.")
 
     expected = f"Bearer {api_key}"
-    if authorization != expected:
+    if authorization is None or not secrets.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Unauthorized.")
 
 
