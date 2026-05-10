@@ -49,6 +49,7 @@ import {
   selectBestAcousticTrimSearchCandidate,
   selectSeamRegenerationTargets,
   selectBestMultiTakePath,
+  sanitizeFfmpegArgumentsForLog,
   summarizeFfmpegStderr,
   type SegmentAudioMetrics,
   type SegmentDiagnosticsManifest,
@@ -1053,6 +1054,19 @@ Conversion failed!
   assert.doesNotMatch(summary, /ffmpeg version/i);
   assert.match(summary, /Impossible to open/);
   assert.match(summary, /Invalid data found/);
+});
+
+test("ffmpeg command logging redacts private paths", () => {
+  const sanitized = sanitizeFfmpegArgumentsForLog([
+    "-i",
+    "/tmp/voice-lab/reference.mp3",
+    "/Users/brandon/private/reference.wav"
+  ]);
+  const serialized = JSON.stringify(sanitized);
+
+  assert.equal(serialized.includes("/tmp/voice-lab"), false);
+  assert.equal(serialized.includes("/Users/brandon/private"), false);
+  assert.deepEqual(sanitized, ["-i", "[path:reference.mp3]", "[path:reference.wav]"]);
 });
 
 test("ebur128 parser exposes summary metrics, a timestamped short-term view, and largest jumps", () => {

@@ -674,7 +674,8 @@ export async function transcodeAudioFile({
   masteringCorrectionDb = 0,
   trimSilence = false,
   sampleRate,
-  channels
+  channels,
+  validateInputContainer = true
 }: {
   inputPath: string;
   outputPath: string;
@@ -686,8 +687,13 @@ export async function transcodeAudioFile({
   trimSilence?: boolean;
   sampleRate?: number;
   channels?: number;
+  validateInputContainer?: boolean;
 }): Promise<void> {
-  await assertAudioFileReady(inputPath);
+  if (validateInputContainer) {
+    await assertAudioFileReady(inputPath);
+  } else {
+    await assertAudioFileExists(inputPath);
+  }
 
   await runFfmpeg(
     buildTranscodeArgs({
@@ -3407,6 +3413,19 @@ export function summarizeFfmpegStderr(stderr: string): string {
   return truncate(selectedLines.join(" | "), 400);
 }
 
+export function sanitizeFfmpegArgumentsForLog(argumentsList: string[]): string[] {
+  return argumentsList.map((argument) => {
+    if (path.isAbsolute(argument)) {
+      return `[path:${path.basename(argument)}]`;
+    }
+
+    return argument.replace(
+      /(?:\/Users|\/private\/var|\/var|\/tmp)\/[^\s'"]+/g,
+      "[private-path]"
+    );
+  });
+}
+
 async function runFfmpeg(
   argumentsList: string[],
   { stage }: { stage: AudioProcessingStage }
@@ -3428,8 +3447,8 @@ async function runFfmpegAndCapture(
     "[ffmpeg] starting",
     JSON.stringify({
       stage,
-      executable: ffmpegExecutable,
-      args: argumentsList
+      executable: path.basename(ffmpegExecutable),
+      args: sanitizeFfmpegArgumentsForLog(argumentsList)
     })
   );
 
@@ -3546,7 +3565,7 @@ async function canStartFfmpeg(executable: string): Promise<boolean> {
   });
 }
 
-async function assertAudioFileReady(filePath: string): Promise<void> {
+async function assertAudioFileExists(filePath: string): Promise<void> {
   const fileStats = await stat(filePath);
 
   if (!fileStats.isFile()) {
@@ -3556,6 +3575,10 @@ async function assertAudioFileReady(filePath: string): Promise<void> {
   if (fileStats.size === 0) {
     throw new Error(`Audio file is empty: ${path.basename(filePath)}`);
   }
+}
+
+async function assertAudioFileReady(filePath: string): Promise<void> {
+  await assertAudioFileExists(filePath);
 
   const handle = await open(filePath, "r");
 
@@ -3570,7 +3593,9 @@ async function assertAudioFileReady(filePath: string): Promise<void> {
         header.subarray(8, 12).toString("ascii") === "WAVE";
 
       if (!isWave) {
-        throw new Error(`Audio file is not a valid WAV: ${path.basename(filePath)}`);
+        throw new Error(
+          `Could not read this audio file: ${path.basename(filePath)}. Try MP3, M4A, WAV, WebM, or OGG.`
+        );
       }
     }
 
@@ -3580,7 +3605,9 @@ async function assertAudioFileReady(filePath: string): Promise<void> {
         bytesRead >= 2 && header[0] === 0xff && (header[1] & 0xe0) === 0xe0;
 
       if (!startsWithId3 && !startsWithFrameSync) {
-        throw new Error(`Audio file is not a valid MP3: ${path.basename(filePath)}`);
+        throw new Error(
+          `Could not read this audio file: ${path.basename(filePath)}. Try MP3, M4A, WAV, WebM, or OGG.`
+        );
       }
     }
   } finally {

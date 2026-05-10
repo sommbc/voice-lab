@@ -134,12 +134,25 @@ The health check verifies service/auth wiring. It does not load VoxCPM2, does no
 
 ## Reference Workflow
 
-1. Record or upload a clean reference clip.
-2. Paste the exact words spoken in that clip.
-3. Save the reference in the UI.
-4. Generate target narration.
+1. Create the reference once.
+2. Record in the browser or upload a clean 45-90 second reference clip.
+3. Paste the exact words spoken in that clip.
+4. Save the reference in the UI and confirm it shows as ready.
+5. Generate target narration without touching the reference panel again.
 
-The exact transcript matters. Mismatched words, background noise, clipping, and inconsistent microphone distance can degrade the result.
+Supported reference uploads include MP3, M4A, MP4 audio, WAV, WebM, OGG, and FLAC. The Next app uses ffmpeg to decode/probe the input and writes a reusable canonical mono 48 kHz PCM WAV at `VOICE_LAB_DATA_DIR/references/default/reference.wav`.
+
+Direct local setup is also supported:
+
+```bash
+mkdir -p ~/.voice-lab/references/default
+cp ~/Desktop/my-voice.mp3 ~/.voice-lab/references/default/reference.mp3
+cp ~/Desktop/my-transcript.txt ~/.voice-lab/references/default/transcript.txt
+npm run reference:prepare
+npm run local
+```
+
+The exact transcript matters. Mismatched words, background noise, clipping, and inconsistent microphone distance can degrade the result. Reference audio, transcripts, and metadata belong in `VOICE_LAB_DATA_DIR`, not in the repository.
 
 ## Security
 

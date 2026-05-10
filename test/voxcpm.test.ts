@@ -91,12 +91,18 @@ test("voice reference client metadata stays sanitized", () => {
   const metadata: VoiceReferenceMetadata = {
     id: DEFAULT_VOICE_REFERENCE_ID,
     updatedAt: "2026-05-10T00:00:00.000Z",
+    originalFilename: "reference-source.webm",
+    originalMimeType: "audio/webm",
+    originalByteSize: 900,
+    savedCanonicalFilename: "reference.wav",
     referenceFilename: "reference.wav",
     transcriptFilename: "transcript.txt",
     audioSha256: "a".repeat(64),
     transcriptSha256: "b".repeat(64),
     audioBytes: 1000,
-    transcriptCharacters: 80
+    transcriptCharacters: 80,
+    canonicalSampleRate: 48000,
+    canonicalChannels: 1
   };
   const clientMetadata = toClientVoiceReferenceMetadata(metadata);
   const serialized = JSON.stringify(clientMetadata);

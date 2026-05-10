@@ -3,7 +3,11 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { canGenerateMp3, canSaveVoiceReference } from "../app/page";
+import {
+  canGenerateMp3,
+  canSaveVoiceReference,
+  getRecordingExtensionForMimeType
+} from "../app/page";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -46,8 +50,19 @@ test("reference voice copy presents saved reference as reusable", async () => {
   const pageSource = await readFile(path.join(__dirname, "../app/page.tsx"), "utf8");
 
   assert.match(pageSource, /Saved voice reference ready/);
-  assert.match(pageSource, /Voice Lab will reuse this reference for every generation/);
-  assert.match(pageSource, /Replace it only when you want to update your voice sample/);
-  assert.match(pageSource, /Create this once/);
+  assert.match(pageSource, /Voice Lab reuses this for every MP3/);
+  assert.match(pageSource, /Replace only if you want a better sample/);
+  assert.match(
+    pageSource,
+    /Create this once\. Upload MP3, M4A, WAV, WebM, OGG, or record in the browser/
+  );
   assert.doesNotMatch(pageSource, /record\/upload a voice file every time/i);
+});
+
+test("browser recording filename extension follows the actual mime type", () => {
+  assert.equal(getRecordingExtensionForMimeType("audio/webm;codecs=opus"), "webm");
+  assert.equal(getRecordingExtensionForMimeType("audio/mp4"), "m4a");
+  assert.equal(getRecordingExtensionForMimeType("audio/m4a"), "m4a");
+  assert.equal(getRecordingExtensionForMimeType("audio/ogg"), "ogg");
+  assert.equal(getRecordingExtensionForMimeType("audio/wav"), "wav");
 });

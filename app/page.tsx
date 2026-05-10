@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 
 const DEFAULT_VOLUME_BOOST = "normal";
+const REFERENCE_AUDIO_ACCEPT = ".wav,.mp3,.m4a,.mp4,.webm,.ogg,.flac,audio/*";
 
 type OutputFormat = "mp3";
 type VolumeBoost = "normal" | "louder" | "very-loud";
@@ -104,6 +105,10 @@ export default function HomePage() {
       });
 
       if (!response.ok) {
+        const fallback = await readErrorResponse(response);
+        setReferenceErrorMessage(fallback);
+        setVoiceReference(null);
+        setIsReplacingReference(true);
         return;
       }
 
@@ -127,7 +132,9 @@ export default function HomePage() {
     }
 
     setReferenceAudioFile(file);
-    setReferenceAudioName(file.name || "recorded-reference.wav");
+    setReferenceAudioName(
+      file.name || `reference-upload.${getRecordingExtensionForMimeType(file.type)}`
+    );
   }
 
   async function handleSaveReference() {
@@ -206,7 +213,7 @@ export default function HomePage() {
       recorder.onstop = () => {
         const type = recorder.mimeType || "audio/webm";
         const blob = new Blob(recordedChunksRef.current, { type });
-        const extension = type.includes("webm") ? "webm" : type.includes("ogg") ? "ogg" : "wav";
+        const extension = getRecordingExtensionForMimeType(type);
         const file = new File([blob], `voice-reference.${extension}`, { type });
         setReferenceAudioFile(file);
         setReferenceAudioName(file.name);
@@ -444,7 +451,9 @@ export default function HomePage() {
               <p className="panel-kicker">Workflow</p>
               <h2 className="panel-title">Reference voice</h2>
               <p className="panel-copy">
-                Create this once. Use 45-90 seconds of clean speech. Paste the exact words spoken. Voice Lab reuses the saved reference for future MP3s.
+                {voiceReference
+                  ? "Saved voice reference ready. Voice Lab reuses this for every MP3. Replace only if you want a better sample."
+                  : "Create this once. Upload MP3, M4A, WAV, WebM, OGG, or record in the browser. Paste the exact transcript. Voice Lab will convert and save a reusable reference."}
               </p>
             </div>
 
@@ -455,8 +464,8 @@ export default function HomePage() {
                   <div className="reference-ready">
                     <div className="reference-ready-copy">
                       <div className="reference-ready-title">Saved voice reference ready</div>
-                      <p>Voice Lab will reuse this reference for every generation.</p>
-                      <p>Replace it only when you want to update your voice sample.</p>
+                      <p>Voice Lab reuses this for every MP3.</p>
+                      <p>Replace only if you want a better sample.</p>
                     </div>
                     <dl className="reference-meta" aria-label="Saved voice reference details">
                       <div>
@@ -479,7 +488,7 @@ export default function HomePage() {
                   </div>
                 ) : (
                   <div className="reference-status">
-                    First-time setup: record or upload 45-90 seconds of clean speech, paste the exact transcript, then save it once.
+                    Create this once. Upload MP3, M4A, WAV, WebM, OGG, or record in the browser. Paste the exact transcript. Voice Lab will convert and save a reusable reference.
                   </div>
                 )}
 
@@ -522,7 +531,7 @@ export default function HomePage() {
                       <label className="btn-secondary btn-compact file-button">
                         Upload
                         <input
-                          accept="audio/*"
+                          accept={REFERENCE_AUDIO_ACCEPT}
                           className="file-input"
                           type="file"
                           onChange={(event) =>
@@ -793,6 +802,25 @@ export function canGenerateMp3({
   isGenerating?: boolean;
 }): boolean {
   return hasSavedReference && sourceText.trim().length > 0 && !isGenerating;
+}
+
+export function getRecordingExtensionForMimeType(mimeType: string): string {
+  const normalized = mimeType.toLowerCase().split(";")[0].trim();
+
+  switch (normalized) {
+    case "audio/webm":
+      return "webm";
+    case "audio/mp4":
+    case "audio/m4a":
+      return "m4a";
+    case "audio/ogg":
+      return "ogg";
+    case "audio/wav":
+    case "audio/x-wav":
+      return "wav";
+    default:
+      return "webm";
+  }
 }
 
 function formatReferenceDate(value: string): string {

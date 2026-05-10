@@ -224,13 +224,33 @@ Open [http://localhost:3000](http://localhost:3000). The app stores private arti
 ## Voice Reference Workflow
 
 1. Create the reference once.
-2. Record or upload 45-90 seconds of clean speech.
+2. Record in the browser or upload 45-90 seconds of clean speech.
 3. Paste the exact words spoken in that clip. The transcript must match the audio.
-4. Save the reference and confirm the UI shows it as ready.
+4. Save the reference and confirm the UI shows `Saved voice reference ready`.
 5. Reuse the saved reference for future MP3 generations.
 6. Replace the reference only when you have a better voice sample.
 
-The transcript should match the audio. Background noise, clipping, compression, mismatched words, or shifting microphone distance can reduce voice similarity.
+Reference setup accepts MP3, M4A, MP4 audio, WAV, WebM, OGG, and FLAC. Voice Lab probes the uploaded audio with ffmpeg, converts it internally to mono 48 kHz PCM WAV, and stores the reusable canonical file at `VOICE_LAB_DATA_DIR/references/default/reference.wav`.
+
+The private reference folder defaults to `~/.voice-lab/references/default/` and stays outside the repo. It contains:
+
+- `reference.wav`
+- `transcript.txt`
+- `metadata.json`
+
+Direct local folder workflow:
+
+```bash
+mkdir -p ~/.voice-lab/references/default
+cp ~/Desktop/my-voice.mp3 ~/.voice-lab/references/default/reference.mp3
+cp ~/Desktop/my-transcript.txt ~/.voice-lab/references/default/transcript.txt
+npm run reference:prepare
+npm run local
+```
+
+`npm run reference:prepare` looks in `VOICE_LAB_DATA_DIR/references/default/`, finds `transcript.txt` plus `reference.wav`, `reference.mp3`, `reference.m4a`, `reference.webm`, `reference.ogg`, or `reference.flac`, converts to canonical `reference.wav` when needed, and writes sanitized metadata. It never prints transcript contents.
+
+The transcript should match the audio exactly. Background noise, clipping, compression, mismatched words, or shifting microphone distance can reduce voice similarity.
 
 ## Generating MP3 Narration
 
@@ -246,6 +266,7 @@ Longer text is chunked for VoxCPM2, generated as WAV sections, leveled, merged, 
 
 ```bash
 npm test
+npm run reference:prepare
 npx tsc --noEmit
 npm run build
 npm run check

@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   createUploadTempDirectory,
+  formatVoiceReferenceSaveError,
   loadVoiceReference,
   removePrivateTempDirectory,
   saveVoiceReference,
@@ -12,11 +13,21 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET(): Promise<Response> {
-  const reference = await loadVoiceReference();
+  try {
+    const reference = await loadVoiceReference();
 
-  return Response.json({
-    reference: reference ? toClientVoiceReferenceMetadata(reference.metadata) : null
-  });
+    return Response.json({
+      reference: reference ? toClientVoiceReferenceMetadata(reference.metadata) : null
+    });
+  } catch (error) {
+    return Response.json(
+      {
+        reference: null,
+        error: formatVoiceReferenceSaveError(error)
+      },
+      { status: 400 }
+    );
+  }
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -48,7 +59,10 @@ export async function POST(request: Request): Promise<Response> {
 
     const reference = await saveVoiceReference({
       sourceAudioPath: uploadPath,
-      transcript
+      transcript,
+      originalFilename: audio.name || path.basename(uploadPath),
+      originalMimeType: audio.type || "application/octet-stream",
+      originalByteSize: audio.size
     });
 
     return Response.json({
@@ -57,9 +71,7 @@ export async function POST(request: Request): Promise<Response> {
   } catch (error) {
     return Response.json(
       {
-        error: sanitizeReferenceError(
-          error instanceof Error ? error.message : "Reference audio could not be saved."
-        )
+        error: sanitizeReferenceError(formatVoiceReferenceSaveError(error, audio.name))
       },
       { status: 400 }
     );
@@ -74,13 +86,21 @@ function getUploadExtension(file: File): string {
   const lowerName = file.name.toLowerCase();
   const nameExtension = path.extname(lowerName);
 
-  if ([".wav", ".mp3", ".m4a", ".aac", ".webm", ".ogg", ".flac"].includes(nameExtension)) {
+  if (
+    [".wav", ".mp3", ".m4a", ".mp4", ".aac", ".webm", ".ogg", ".flac"].includes(
+      nameExtension
+    )
+  ) {
     return nameExtension;
   }
 
   switch (file.type) {
     case "audio/mpeg":
       return ".mp3";
+    case "audio/mp4":
+    case "audio/m4a":
+    case "video/mp4":
+      return ".m4a";
     case "audio/webm":
       return ".webm";
     case "audio/ogg":

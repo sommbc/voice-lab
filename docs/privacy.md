@@ -8,6 +8,7 @@ By default, private artifacts live under `~/.voice-lab`, or under `VOICE_LAB_DAT
 
 - reference audio
 - exact reference transcripts
+- reference metadata with filenames, hashes, byte counts, and timestamps
 - generated WAV sections
 - final MP3 files
 - run manifests
@@ -30,6 +31,8 @@ This is why the service must be trusted, private, and authenticated.
 ## Manifest Rules
 
 Run manifests should contain hashes, filenames, metrics, run IDs, settings, and timestamps. They should not contain raw source text, exact transcripts, base64 audio, bearer tokens, or private absolute paths.
+
+Reference metadata follows the same rule: it stores original filename, original MIME type, byte size, canonical filename, hashes, character count, and update time, but not transcript contents or base64 audio.
 
 ## Hugging Face Cache Boundary
 
