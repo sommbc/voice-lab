@@ -21,6 +21,8 @@ const DEFAULT_VOLUME_BOOST = "normal";
 
 type OutputFormat = "mp3" | "wav";
 type VolumeBoost = "normal" | "louder" | "very-loud";
+type Provider = "mistral" | "voxcpm";
+type VoxcpmCloneMode = "reference" | "ultimate";
 type ProgressStage =
   | "cleaning"
   | "segmenting"
@@ -32,6 +34,18 @@ type ProgressStage =
   | "final-normalization"
   | "done";
 type GenerationStrategy = "continuous-read" | "segmented-fallback" | "segmented-only";
+type CompleteStrategy = GenerationStrategy | "voxcpm-short" | "voxcpm-long-form";
+
+type VoiceReferenceMetadata = {
+  id: string;
+  updatedAt: string;
+  referenceFilename: string;
+  transcriptFilename: string;
+  audioSha256: string;
+  transcriptSha256: string;
+  audioBytes: number;
+  transcriptCharacters: number;
+};
 
 type ProgressEvent = {
   type: "progress";
@@ -54,7 +68,7 @@ type CompleteEvent = {
   outputFormat: OutputFormat;
   normalizationApplied: boolean;
   normalizationFallbackUsed: boolean;
-  strategy: GenerationStrategy;
+  strategy: CompleteStrategy;
   totalSegments: number;
 };
 
@@ -63,7 +77,17 @@ type StreamEvent = ProgressEvent | ErrorEvent | CompleteEvent;
 export default function HomePage() {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
+  const [provider, setProvider] = useState<Provider>("mistral");
   const [voiceId, setVoiceId] = useState(DEFAULT_VOICE_ID);
+  const [voxcpmCloneMode, setVoxcpmCloneMode] = useState<VoxcpmCloneMode>("ultimate");
+  const [referenceTranscript, setReferenceTranscript] = useState("");
+  const [referenceAudioFile, setReferenceAudioFile] = useState<File | null>(null);
+  const [referenceAudioName, setReferenceAudioName] = useState("");
+  const [voiceReference, setVoiceReference] = useState<VoiceReferenceMetadata | null>(null);
+  const [referenceStatusMessage, setReferenceStatusMessage] = useState("");
+  const [referenceErrorMessage, setReferenceErrorMessage] = useState("");
+  const [isSavingReference, setIsSavingReference] = useState(false);
+  const [isRecordingReference, setIsRecordingReference] = useState(false);
   const [continuousRead, setContinuousRead] = useState(true);
   const [fallbackToSegmented, setFallbackToSegmented] = useState(true);
   const [forceSegmentedMode, setForceSegmentedMode] = useState(false);
@@ -78,8 +102,12 @@ export default function HomePage() {
   const [downloadUrl, setDownloadUrl] = useState("");
   const [downloadFilename, setDownloadFilename] = useState("");
   const downloadUrlRef = useRef<string>("");
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<BlobPart[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
 
   const segmentedControlsActive = forceSegmentedMode || !continuousRead || fallbackToSegmented;
+  const voxcpmSelected = provider === "voxcpm";
 
   useEffect(() => {
     const stored = localStorage.getItem(VOICE_STORAGE_KEY);
@@ -94,16 +122,157 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
+    void loadSavedVoiceReference();
+  }, []);
+
+  useEffect(() => {
+    if (voxcpmSelected && outputFormat !== "mp3") {
+      setOutputFormat("mp3");
+    }
+  }, [outputFormat, voxcpmSelected]);
+
+  useEffect(() => {
     return () => {
       if (downloadUrlRef.current) {
         URL.revokeObjectURL(downloadUrlRef.current);
       }
+      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
 
   function handleVoiceChange(id: string) {
     setVoiceId(id);
     localStorage.setItem(VOICE_STORAGE_KEY, id);
+  }
+
+  async function loadSavedVoiceReference() {
+    try {
+      const response = await fetch("/api/voice-references", {
+        method: "GET",
+        cache: "no-store"
+      });
+
+      if (!response.ok) {
+        return;
+      }
+
+      const data = (await response.json()) as { reference?: VoiceReferenceMetadata | null };
+      setVoiceReference(data.reference ?? null);
+    } catch {
+      setVoiceReference(null);
+    }
+  }
+
+  async function handleReferenceUpload(file: File | null) {
+    setReferenceErrorMessage("");
+    setReferenceStatusMessage("");
+
+    if (!file) {
+      setReferenceAudioFile(null);
+      setReferenceAudioName("");
+      return;
+    }
+
+    setReferenceAudioFile(file);
+    setReferenceAudioName(file.name || "recorded-reference.wav");
+  }
+
+  async function handleSaveReference() {
+    if (!referenceAudioFile) {
+      setReferenceErrorMessage("Record or upload reference audio first.");
+      return;
+    }
+
+    if (!referenceTranscript.trim()) {
+      setReferenceErrorMessage("Enter the exact transcript for the reference audio.");
+      return;
+    }
+
+    setIsSavingReference(true);
+    setReferenceErrorMessage("");
+    setReferenceStatusMessage("Saving reference");
+
+    try {
+      const formData = new FormData();
+      formData.append("audio", referenceAudioFile);
+      formData.append("transcript", referenceTranscript);
+
+      const response = await fetch("/api/voice-references", {
+        method: "POST",
+        body: formData
+      });
+
+      if (!response.ok) {
+        const fallback = await readErrorResponse(response);
+        throw new Error(fallback);
+      }
+
+      const data = (await response.json()) as { reference: VoiceReferenceMetadata };
+      setVoiceReference(data.reference);
+      setReferenceStatusMessage("Reference saved");
+      setReferenceAudioFile(null);
+      setReferenceAudioName("");
+    } catch (error) {
+      setReferenceStatusMessage("");
+      setReferenceErrorMessage(
+        sanitizeErrorMessage(error instanceof Error ? error.message : "Reference save failed.")
+      );
+    } finally {
+      setIsSavingReference(false);
+    }
+  }
+
+  async function handleToggleRecording() {
+    if (isRecordingReference) {
+      mediaRecorderRef.current?.stop();
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setReferenceErrorMessage("Browser microphone recording is not available.");
+      return;
+    }
+
+    setReferenceErrorMessage("");
+    setReferenceStatusMessage("Recording reference");
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      recordingStreamRef.current = stream;
+      recordedChunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordedChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const type = recorder.mimeType || "audio/webm";
+        const blob = new Blob(recordedChunksRef.current, { type });
+        const extension = type.includes("webm") ? "webm" : type.includes("ogg") ? "ogg" : "wav";
+        const file = new File([blob], `brandon-reference.${extension}`, { type });
+        setReferenceAudioFile(file);
+        setReferenceAudioName(file.name);
+        setReferenceStatusMessage("Recording ready");
+        setIsRecordingReference(false);
+        recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+        recordingStreamRef.current = null;
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setIsRecordingReference(true);
+    } catch (error) {
+      setReferenceStatusMessage("");
+      setReferenceErrorMessage(
+        sanitizeErrorMessage(error instanceof Error ? error.message : "Microphone access failed.")
+      );
+      setIsRecordingReference(false);
+      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+      recordingStreamRef.current = null;
+    }
   }
 
   function handleReset() {
@@ -114,6 +283,7 @@ export default function HomePage() {
 
     setTitle("");
     setText("");
+    setProvider("mistral");
     setContinuousRead(true);
     setFallbackToSegmented(true);
     setForceSegmentedMode(false);
@@ -136,6 +306,11 @@ export default function HomePage() {
       return;
     }
 
+    if (voxcpmSelected && !voiceReference) {
+      setErrorMessage("Save Brandon reference audio and transcript before using VoxCPM2.");
+      return;
+    }
+
     if (downloadUrlRef.current) {
       URL.revokeObjectURL(downloadUrlRef.current);
       downloadUrlRef.current = "";
@@ -149,23 +324,34 @@ export default function HomePage() {
     setStatusMessage("Starting");
 
     try {
-      const response = await fetch("/api/generate", {
+      const response = await fetch(voxcpmSelected ? "/api/voxcpm/generate" : "/api/generate", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          title,
-          text,
-          voiceId,
-          continuousRead,
-          fallbackToSegmented,
-          forceSegmentedMode,
-          normalizationEnabled,
-          volumeBoost,
-          smoothJoins,
-          outputFormat
-        })
+        body: JSON.stringify(
+          voxcpmSelected
+            ? {
+                title,
+                text,
+                cloneMode: voxcpmCloneMode,
+                normalizationEnabled,
+                volumeBoost,
+                outputFormat: "mp3"
+              }
+            : {
+                title,
+                text,
+                voiceId,
+                continuousRead,
+                fallbackToSegmented,
+                forceSegmentedMode,
+                normalizationEnabled,
+                volumeBoost,
+                smoothJoins,
+                outputFormat
+              }
+        )
       });
 
       if (!response.ok) {
@@ -311,6 +497,21 @@ export default function HomePage() {
                 </label>
 
                 <label className="field-label">
+                  <span className="field-name">Provider</span>
+                  <div className="select-wrap">
+                    <select
+                      className="select"
+                      value={provider}
+                      onChange={(event) => setProvider(event.target.value as Provider)}
+                    >
+                      <option value="mistral">Mistral Voxtral</option>
+                      <option value="voxcpm">VoxCPM2 Clone</option>
+                    </select>
+                  </div>
+                </label>
+
+                {!voxcpmSelected && (
+                <label className="field-label">
                   <span className="field-name">Voice</span>
                   <div className="select-wrap">
                     <select
@@ -326,13 +527,15 @@ export default function HomePage() {
                     </select>
                   </div>
                 </label>
+                )}
 
                 <label className="field-label">
                   <span className="field-name">Output Format</span>
                   <div className="select-wrap">
                     <select
                       className="select"
-                      value={outputFormat}
+                      disabled={voxcpmSelected}
+                      value={voxcpmSelected ? "mp3" : outputFormat}
                       onChange={(event) => setOutputFormat(event.target.value as OutputFormat)}
                     >
                       <option value="mp3">MP3</option>
@@ -359,6 +562,86 @@ export default function HomePage() {
               </div>
             </section>
 
+            {voxcpmSelected && (
+              <section className="section">
+                <p className="section-heading">VoxCPM2 Reference</p>
+                <div className="toggle-list">
+                  <label className="field-label">
+                    <span className="field-name">Clone Mode</span>
+                    <div className="select-wrap">
+                      <select
+                        className="select"
+                        value={voxcpmCloneMode}
+                        onChange={(event) =>
+                          setVoxcpmCloneMode(event.target.value as VoxcpmCloneMode)
+                        }
+                      >
+                        <option value="ultimate">Ultimate clone</option>
+                        <option value="reference">Reference clone</option>
+                      </select>
+                    </div>
+                  </label>
+
+                  <div className="reference-actions">
+                    <button
+                      className="btn-secondary btn-compact"
+                      disabled={isSavingReference}
+                      type="button"
+                      onClick={handleToggleRecording}
+                    >
+                      {isRecordingReference ? "Stop Recording" : "Record"}
+                    </button>
+                    <label className="btn-secondary btn-compact file-button">
+                      Upload
+                      <input
+                        accept="audio/*"
+                        className="file-input"
+                        type="file"
+                        onChange={(event) =>
+                          void handleReferenceUpload(event.target.files?.[0] ?? null)
+                        }
+                      />
+                    </label>
+                  </div>
+
+                  {(referenceAudioName || voiceReference) && (
+                    <div className="reference-status">
+                      {referenceAudioName
+                        ? `Selected: ${referenceAudioName}`
+                        : `Saved: ${voiceReference?.referenceFilename ?? "reference.wav"}`}
+                    </div>
+                  )}
+
+                  <label className="field-label">
+                    <span className="field-name">Exact Transcript</span>
+                    <textarea
+                      className="textarea textarea-compact"
+                      placeholder="Paste the exact words spoken in the reference audio."
+                      value={referenceTranscript}
+                      onChange={(event) => setReferenceTranscript(event.target.value)}
+                    />
+                  </label>
+
+                  <button
+                    className="btn-secondary"
+                    disabled={isSavingReference || isRecordingReference}
+                    type="button"
+                    onClick={handleSaveReference}
+                  >
+                    {isSavingReference ? "Saving..." : "Save Reference"}
+                  </button>
+
+                  {referenceStatusMessage && (
+                    <div className="reference-status">{referenceStatusMessage}</div>
+                  )}
+                  {referenceErrorMessage && (
+                    <div className="reference-error">{referenceErrorMessage}</div>
+                  )}
+                </div>
+              </section>
+            )}
+
+            {!voxcpmSelected && (
             <section className="section">
               <p className="section-heading">Narration Path</p>
               <div className="toggle-list">
@@ -402,7 +685,9 @@ export default function HomePage() {
                 </label>
               </div>
             </section>
+            )}
 
+            {!voxcpmSelected && (
             <details className="advanced-panel">
               <summary className="advanced-summary">
                 <span className="advanced-summary-copy">
@@ -465,6 +750,7 @@ export default function HomePage() {
                 )}
               </div>
             </details>
+            )}
           </aside>
 
           <section className="action-card">
@@ -475,7 +761,11 @@ export default function HomePage() {
             </div>
 
             <div className="actions actions-primary">
-              <button className="btn-primary" disabled={isGenerating} type="submit">
+              <button
+                className="btn-primary"
+                disabled={isGenerating || (voxcpmSelected && !voiceReference)}
+                type="submit"
+              >
                 {isGenerating ? "Generating..." : "Generate"}
               </button>
             </div>
@@ -531,6 +821,10 @@ export default function HomePage() {
 function buildCompletionDetail(event: CompleteEvent): string {
   const strategyLabel = (() => {
     switch (event.strategy) {
+      case "voxcpm-long-form":
+        return `VoxCPM2 long-form, ${event.totalSegments} sections`;
+      case "voxcpm-short":
+        return "VoxCPM2 clone";
       case "segmented-fallback":
         return `Segmented fallback, ${event.totalSegments} sections`;
       case "segmented-only":

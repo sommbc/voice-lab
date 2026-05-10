@@ -571,6 +571,53 @@ summary:focus-visible {
   color: var(--rose);
 }
 
+.btn-compact {
+  min-height: 44px;
+  padding: 10px 14px;
+}
+
+.reference-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.file-button {
+  position: relative;
+  overflow: hidden;
+}
+
+.file-input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.textarea-compact {
+  min-height: 8.5rem;
+  padding: 14px;
+  font-size: 0.9rem;
+  line-height: 1.58;
+}
+
+.reference-status,
+.reference-error {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--black);
+  padding: 11px 12px;
+  color: var(--ash);
+  font-size: 0.82rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.reference-error {
+  border-color: var(--rose);
+  color: var(--bone);
+}
+
 .feedback-card {
   padding: 20px 22px;
   display: grid;
