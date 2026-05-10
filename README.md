@@ -2,10 +2,6 @@
 
 Voice Lab is a local-first VoxCPM2 voice cloning app for long-form narration and mastered MP3 export.
 
-Repository description suggestion: `Local-first VoxCPM2 voice cloning app for long-form narration and mastered MP3 export.`
-
-Suggested GitHub topics: `tts`, `voice-cloning`, `voxcpm2`, `nextjs`, `fastapi`, `local-first`, `speech`, `mp3`
-
 ## Project Status
 
 Voice Lab is an early release. The Next.js app, FastAPI service wrapper, storage layer, audio pipeline, and non-generation checks are built. Live VoxCPM2 generation depends on your local Python, PyTorch, model cache, and device setup.
