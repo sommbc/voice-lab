@@ -410,7 +410,7 @@ export type MultiTakePathSelection = {
 
 export type PublishabilityVerdict = {
   publishable: boolean;
-  reason: "passed" | "provider_take_reset";
+  reason: "passed" | "take_reset";
   killCriteriaFailures: string[];
   thresholds: {
     seamScoreWarning: number;
@@ -501,7 +501,7 @@ const LOUDNESS_MEASUREMENT_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=
 const EBUR128_ANALYSIS_FILTER = "ebur128=peak=true:framelog=verbose";
 const MIN_VALID_SHORT_TERM_LUFS = -70;
 const PACKAGED_FFMPEG_EXECUTABLE = path.join(
-  process.cwd(),
+  /*turbopackIgnore: true*/ process.cwd(),
   "node_modules",
   "ffmpeg-static",
   `ffmpeg${process.platform === "win32" ? ".exe" : ""}`
@@ -3159,7 +3159,7 @@ export function evaluateSegmentedPublishability({
 
   return {
     publishable: failures.length === 0,
-    reason: failures.length === 0 ? "passed" : "provider_take_reset",
+    reason: failures.length === 0 ? "passed" : "take_reset",
     killCriteriaFailures: failures,
     thresholds: {
       seamScoreWarning: SEGMENT_SEAM_SCORE_WARNING,

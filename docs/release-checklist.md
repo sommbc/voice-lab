@@ -8,7 +8,11 @@ Use this before publishing or tagging a public release.
 - `.env`, local storage, generated audio, debug artifacts, `.next`, `.vercel`, `.DS_Store`, and `tsconfig.tsbuildinfo` are absent from the commit.
 - `.env.example` contains placeholders only.
 - No private absolute paths, personal voice IDs, private transcripts, or generated audio fixtures are tracked.
-- README and docs describe current behavior honestly.
+- README and docs describe only the current VoxCPM2 workflow.
+
+## Residue Checks
+
+Search the repo for old hosted-service names, private domains, personal identifiers, private paths, generated audio, generated manifests, and local build output. Expected result: no public-surface matches, except ignore rules for local artifact folders.
 
 ## Verification
 
@@ -16,26 +20,22 @@ Use this before publishing or tagging a public release.
 npm test
 npx tsc --noEmit
 npm run build
-git diff --check
-```
-
-If scripts change, also run:
-
-```bash
 npm run check
+git diff --check
+python3 -m py_compile services/voxcpm/server.py
 ```
+
+If the VoxCPM2 service can start without loading the full model, also verify authenticated `/health` succeeds and unauthenticated `/health` returns `401`.
 
 ## Security
 
-- Provider keys are server-only.
 - VoxCPM2 requires bearer auth.
+- The service is bound to localhost, a private network, an SSH tunnel, or authenticated HTTPS.
 - Public deployments have an explicit auth and retention plan.
-- Debug artifacts are disabled by default.
 - Generated manifests do not contain raw transcript text or private paths.
 
 ## Manual Audio Review
 
-- Test at least one short Mistral run.
-- Test one forced segmented Mistral run when credentials are available.
-- Test one VoxCPM2 run only in a private GPU environment.
-- Listen to joins and final mastered MP3 before presenting quality claims.
+- Test one short VoxCPM2 reference generation in a private GPU environment.
+- Test one long-form VoxCPM2 run with multiple sections.
+- Listen to joins and final mastered MP3 before making quality claims.

@@ -1,12 +1,12 @@
 # Contributing
 
-Voice Lab is intended to stay useful as a local-first speech lab, not a pile of provider demos.
+Voice Lab is intended to stay useful as a local-first VoxCPM2 voice cloning app, not a pile of speech experiments.
 
 ## Development
 
 ```bash
 npm install
-cp .env.example .env
+cp .env.example .env.local
 npm run dev
 ```
 
@@ -23,15 +23,16 @@ git diff --check
 
 ## Expectations
 
-- Keep provider secrets server-side.
+- Keep the public product focused on VoxCPM2 voice cloning to mastered MP3 narration.
 - Do not commit generated audio, reference clips, exact transcripts, local runs, or debug artifacts.
-- Keep provider adapters small and test payload construction without network calls.
+- Keep the Python model runtime outside the Next app.
+- Keep bearer tokens server-side.
 - Do not claim perfect cloning or seamless long-form quality without reproducible evidence.
 - Prefer narrow changes over broad rewrites unless the architecture clearly needs it.
-- Update README or docs when behavior, setup, environment variables, or provider support changes.
+- Update README or docs when behavior, setup, environment variables, or the workflow changes.
 
 ## Issues And Pull Requests
 
-For bugs, include the provider, model or endpoint mode, Node version, operating system, relevant env var names without values, and the smallest input that reproduces the issue.
+For bugs, include the VoxCPM2 endpoint mode, Node version, operating system, relevant env var names without values, and the smallest input that reproduces the issue.
 
-For audio-quality issues, include objective diagnostics when possible: provider, generation mode, segment count, mastering preset, and whether the issue appears before or after final mastering.
+For audio-quality issues, include objective diagnostics when possible: generation mode, segment count, mastering preset, and whether the issue appears before or after final mastering.

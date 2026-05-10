@@ -1,7 +1,7 @@
 {
   "name": "voice-lab",
   "version": "0.1.0",
-  "description": "Open-source speech lab for long-form TTS, provider testing, seam diagnostics, mastering, and MP3 export.",
+  "description": "Local-first VoxCPM2 voice cloning app for long-form narration and mastered MP3 export.",
   "license": "MIT",
   "scripts": {
     "dev": "next dev",
@@ -11,9 +11,7 @@
     "test": "tsx --test test/**/*.test.ts",
     "check": "npm test && npm run typecheck && npm run build",
     "clean": "rm -rf .next .vercel tsconfig.tsbuildinfo output storage .voice-lab runs voice-references debug-artifacts tmp && find . -name .DS_Store -type f -delete",
-    "analyze-audio": "tsx scripts/analyze-audio.ts",
-    "mastering-ab": "tsx scripts/run-mastering-ab.ts",
-    "segmented-ab": "tsx scripts/run-segmented-mastering-ab.ts"
+    "analyze-audio": "tsx scripts/analyze-audio.ts"
   },
   "engines": {
     "node": ">=20.9.0"

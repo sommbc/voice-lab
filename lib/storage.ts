@@ -20,7 +20,9 @@ export type VoiceLabRunStoragePaths = {
 
 export function resolveVoiceLabDataDir(): string {
   const configured = process.env.VOICE_LAB_DATA_DIR?.trim();
-  return configured ? path.resolve(configured) : path.join(homedir(), DEFAULT_VOICE_LAB_DATA_DIR_NAME);
+  return configured
+    ? path.resolve(/*turbopackIgnore: true*/ configured)
+    : path.join(homedir(), DEFAULT_VOICE_LAB_DATA_DIR_NAME);
 }
 
 export function getVoiceReferenceStoragePaths({

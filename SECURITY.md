@@ -1,6 +1,6 @@
 # Security Policy
 
-Voice Lab is local-first software that handles sensitive inputs: API keys, reference audio, exact transcripts, generated speech, and debug artifacts.
+Voice Lab is local-first software that handles sensitive inputs: bearer tokens, reference audio, exact transcripts, generated speech, and run artifacts.
 
 ## Supported Versions
 
@@ -12,12 +12,12 @@ Open a private security advisory on GitHub when available. If advisories are not
 
 ## Privacy Boundaries
 
-- `.env` must stay local.
-- Provider API keys must never be exposed to browser code.
+- `.env.local` must stay local.
 - VoxCPM2 must require bearer-token auth.
-- Reference audio, transcripts, run artifacts, and debug manifests should live under `VOICE_LAB_DATA_DIR` outside the repo.
+- Reference audio, transcripts, run artifacts, and manifests should live under `VOICE_LAB_DATA_DIR` outside the repo.
 - Do not attach private audio or transcripts to public issues.
+- Do not log bearer tokens, base64 audio payloads, exact transcripts, or source text.
 
 ## Deployment Warning
 
-The default app is designed for trusted local use. Before exposing it on the public internet, add authentication, upload limits, retention controls, rate limits, and a storage policy.
+The default app is designed for trusted local use. Before exposing it on the public internet, add authentication, upload limits, retention controls, rate limits, HTTPS, and a storage policy.

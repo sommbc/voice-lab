@@ -69,13 +69,13 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const fixturePath = path.join(__dirname, "fixtures", "long-form-essay.md");
 
-test("segmentation keeps Voxtral fallback chunks below the 300-word hard cap", async () => {
+test("segmentation keeps long-form narration chunks below the hard cap", async () => {
   const source = await readFile(fixturePath, "utf8");
   const prepared = prepareTextForSpeech(source);
   const segments = chunkText(prepared.paragraphs);
 
   assert.ok(segments.length > 1, "expected more than one narration section");
-  assert.ok(segments.length >= 7, `expected smaller Mistral-safe sections, got ${segments.length}`);
+  assert.ok(segments.length >= 7, `expected smaller narration sections, got ${segments.length}`);
 
   for (const [index, segment] of segments.entries()) {
     assert.ok(segment.text.trim().length > 0, "segment should not be empty");
@@ -293,7 +293,9 @@ test("default narration delivery is podcast-ready normal MP3 without private voi
   const pageSource = await readFile(path.join(__dirname, "../app/page.tsx"), "utf8");
   assert.match(pageSource, /const DEFAULT_VOLUME_BOOST = "normal"/);
   assert.match(pageSource, /Normal \/ podcast MP3/);
-  assert.match(pageSource, /Uses MISTRAL_VOICE_ID when blank/);
+  assert.match(pageSource, /Generate MP3/);
+  const oldServicePattern = new RegExp(["Mis", "tral", "|Vox", "tral"].join(""));
+  assert.doesNotMatch(pageSource, oldServicePattern);
   assert.doesNotMatch(pageSource, /DEFAULT_VOICE_ID/);
 });
 
@@ -987,7 +989,7 @@ test("multi-take candidate penalties include drift and fallback quality signals"
   assert.ok(penalty.reasons.includes("regenerated-take"));
 });
 
-test("publishability verdict exposes provider take reset kill criteria", () => {
+test("publishability verdict exposes take reset kill criteria", () => {
   const boundaries = buildSegmentBoundaryDiagnostics(
     [
       makeSegmentMetrics({
@@ -1020,20 +1022,21 @@ test("publishability verdict exposes provider take reset kill criteria", () => {
   });
 
   assert.equal(verdict.publishable, false);
-  assert.equal(verdict.reason, "provider_take_reset");
+  assert.equal(verdict.reason, "take_reset");
   assert.ok(verdict.killCriteriaFailures.includes("average_improvement_below_threshold"));
   assert.ok(verdict.killCriteriaFailures.includes("mechanically_clean_tonal_mismatch"));
   assert.ok(verdict.killCriteriaFailures.includes("metrics_improved_but_tonal_mismatch_remains"));
 });
 
-test("segmented route no longer falls back to MP3 intermediates while merging", async () => {
+test("generation route keeps WAV intermediates and MP3 delivery", async () => {
   const routeSource = await readFile(path.join(__dirname, "../app/api/generate/route.ts"), "utf8");
 
-  assert.match(routeSource, /merged-reencoded\.wav/);
-  assert.match(routeSource, /VOICE_LAB_MULTI_TAKE_COUNT/);
-  assert.match(routeSource, /multiTakeOptimization/);
-  assert.doesNotMatch(routeSource, /fallbackFormat\s*=\s*outputFormat\s*===\s*"mp3"/);
-  assert.doesNotMatch(routeSource, /merged-reencoded\.\$\{getFileExtension\(fallbackFormat\)\}/);
+  assert.match(routeSource, /segment-\$\{segmentId\}-raw\.wav/);
+  assert.match(routeSource, /merged-premaster\.wav/);
+  assert.match(routeSource, /DEFAULT_OUTPUT_FORMAT/);
+  assert.match(routeSource, /resolveVoxcpmConfig/);
+  const oldRoutePattern = new RegExp(["Mis", "tral", "|Vox", "tral", "|voiceId|continuousRead"].join(""));
+  assert.doesNotMatch(routeSource, oldRoutePattern);
 });
 
 test("ffmpeg stderr summarizer strips banners and keeps actionable lines", () => {

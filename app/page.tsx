@@ -2,12 +2,10 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 
-const VOICE_STORAGE_KEY = "voice-lab-selected-voice-id";
 const DEFAULT_VOLUME_BOOST = "normal";
 
-type OutputFormat = "mp3" | "wav";
+type OutputFormat = "mp3";
 type VolumeBoost = "normal" | "louder" | "very-loud";
-type Provider = "mistral" | "voxcpm";
 type VoxcpmCloneMode = "reference" | "ultimate";
 type ProgressStage =
   | "cleaning"
@@ -19,8 +17,7 @@ type ProgressStage =
   | "merging"
   | "final-normalization"
   | "done";
-type GenerationStrategy = "continuous-read" | "segmented-fallback" | "segmented-only";
-type CompleteStrategy = GenerationStrategy | "voxcpm-short" | "voxcpm-long-form";
+type CompleteStrategy = "voxcpm-short" | "voxcpm-long-form";
 
 type VoiceReferenceMetadata = {
   id: string;
@@ -63,8 +60,6 @@ type StreamEvent = ProgressEvent | ErrorEvent | CompleteEvent;
 export default function HomePage() {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
-  const [provider, setProvider] = useState<Provider>("mistral");
-  const [voiceId, setVoiceId] = useState("");
   const [voxcpmCloneMode, setVoxcpmCloneMode] = useState<VoxcpmCloneMode>("ultimate");
   const [referenceTranscript, setReferenceTranscript] = useState("");
   const [referenceAudioFile, setReferenceAudioFile] = useState<File | null>(null);
@@ -74,13 +69,8 @@ export default function HomePage() {
   const [referenceErrorMessage, setReferenceErrorMessage] = useState("");
   const [isSavingReference, setIsSavingReference] = useState(false);
   const [isRecordingReference, setIsRecordingReference] = useState(false);
-  const [continuousRead, setContinuousRead] = useState(true);
-  const [fallbackToSegmented, setFallbackToSegmented] = useState(true);
-  const [forceSegmentedMode, setForceSegmentedMode] = useState(false);
   const [normalizationEnabled, setNormalizationEnabled] = useState(true);
   const [volumeBoost, setVolumeBoost] = useState<VolumeBoost>(DEFAULT_VOLUME_BOOST);
-  const [smoothJoins, setSmoothJoins] = useState(true);
-  const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp3");
   const [statusMessage, setStatusMessage] = useState("");
   const [statusDetail, setStatusDetail] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
@@ -92,25 +82,9 @@ export default function HomePage() {
   const recordedChunksRef = useRef<BlobPart[]>([]);
   const recordingStreamRef = useRef<MediaStream | null>(null);
 
-  const segmentedControlsActive = forceSegmentedMode || !continuousRead || fallbackToSegmented;
-  const voxcpmSelected = provider === "voxcpm";
-
-  useEffect(() => {
-    const stored = localStorage.getItem(VOICE_STORAGE_KEY);
-    if (stored) {
-      setVoiceId(stored);
-    }
-  }, []);
-
   useEffect(() => {
     void loadSavedVoiceReference();
   }, []);
-
-  useEffect(() => {
-    if (voxcpmSelected && outputFormat !== "mp3") {
-      setOutputFormat("mp3");
-    }
-  }, [outputFormat, voxcpmSelected]);
 
   useEffect(() => {
     return () => {
@@ -120,15 +94,6 @@ export default function HomePage() {
       recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
-
-  function handleVoiceChange(id: string) {
-    setVoiceId(id);
-    if (id.trim()) {
-      localStorage.setItem(VOICE_STORAGE_KEY, id.trim());
-    } else {
-      localStorage.removeItem(VOICE_STORAGE_KEY);
-    }
-  }
 
   async function loadSavedVoiceReference() {
     try {
@@ -268,14 +233,8 @@ export default function HomePage() {
 
     setTitle("");
     setText("");
-    setProvider("mistral");
-    setContinuousRead(true);
-    setFallbackToSegmented(true);
-    setForceSegmentedMode(false);
     setNormalizationEnabled(true);
     setVolumeBoost(DEFAULT_VOLUME_BOOST);
-    setSmoothJoins(true);
-    setOutputFormat("mp3");
     setDownloadUrl("");
     setDownloadFilename("");
     setErrorMessage("");
@@ -291,8 +250,8 @@ export default function HomePage() {
       return;
     }
 
-    if (voxcpmSelected && !voiceReference) {
-      setErrorMessage("Save reference audio and its exact transcript before using VoxCPM2.");
+    if (!voiceReference) {
+      setErrorMessage("Save reference audio and its exact transcript before generating.");
       return;
     }
 
@@ -309,34 +268,19 @@ export default function HomePage() {
     setStatusMessage("Starting");
 
     try {
-      const response = await fetch(voxcpmSelected ? "/api/voxcpm/generate" : "/api/generate", {
+      const response = await fetch("/api/generate", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify(
-          voxcpmSelected
-            ? {
-                title,
-                text,
-                cloneMode: voxcpmCloneMode,
-                normalizationEnabled,
-                volumeBoost,
-                outputFormat: "mp3"
-              }
-            : {
-                title,
-                text,
-                voiceId,
-                continuousRead,
-                fallbackToSegmented,
-                forceSegmentedMode,
-                normalizationEnabled,
-                volumeBoost,
-                smoothJoins,
-                outputFormat
-              }
-        )
+        body: JSON.stringify({
+          title,
+          text,
+          cloneMode: voxcpmCloneMode,
+          normalizationEnabled,
+          volumeBoost,
+          outputFormat: "mp3" satisfies OutputFormat
+        })
       });
 
       if (!response.ok) {
@@ -429,11 +373,11 @@ export default function HomePage() {
     <main className="app-shell">
       <div className="page">
         <header className="hero">
-          <p className="eyebrow">Open speech lab</p>
+          <p className="eyebrow">Local voice cloning</p>
           <div className="hero-main">
             <h1 className="hero-title">Voice Lab</h1>
             <p className="hero-subtitle">
-              Experiment with long-form TTS, reference voices, seam diagnostics, mastering, and MP3 export.
+              Clone a reference voice with VoxCPM2, narrate long-form text, and export a mastered MP3 from a local or self-hosted setup.
             </p>
           </div>
         </header>
@@ -445,7 +389,7 @@ export default function HomePage() {
                 <p className="panel-kicker">Text Input</p>
                 <h2 className="panel-title">Source text</h2>
               </div>
-              <p className="panel-copy">Paste markdown or plain text. Cleanup still runs before narration.</p>
+              <p className="panel-copy">Long-form text is cleaned, chunked for VoxCPM2, and delivered as one mastered file.</p>
             </div>
 
             <label className="field-label field-label-editor">
@@ -462,71 +406,95 @@ export default function HomePage() {
 
           <aside className="panel panel-rail">
             <div className="panel-head">
-              <p className="panel-kicker">Controls</p>
-              <h2 className="panel-title">Generation setup</h2>
+              <p className="panel-kicker">Workflow</p>
+              <h2 className="panel-title">Reference voice</h2>
               <p className="panel-copy">
-                Defaults are tuned for one podcast-ready MP3. Adjust only what this run needs.
+                Save one clean reference clip and its exact transcript before generating narration.
               </p>
             </div>
 
             <section className="section">
-              <p className="section-heading">Output</p>
+              <p className="section-heading">Reference Voice</p>
+              <div className="toggle-list">
+                <div className="reference-actions">
+                  <button
+                    className="btn-secondary btn-compact"
+                    disabled={isSavingReference}
+                    type="button"
+                    onClick={handleToggleRecording}
+                  >
+                    {isRecordingReference ? "Stop Recording" : "Record"}
+                  </button>
+                  <label className="btn-secondary btn-compact file-button">
+                    Upload
+                    <input
+                      accept="audio/*"
+                      className="file-input"
+                      type="file"
+                      onChange={(event) =>
+                        void handleReferenceUpload(event.target.files?.[0] ?? null)
+                      }
+                    />
+                  </label>
+                </div>
+
+                {(referenceAudioName || voiceReference) && (
+                  <div className="reference-status">
+                    {referenceAudioName
+                      ? `Selected: ${referenceAudioName}`
+                      : `Saved: ${voiceReference?.referenceFilename ?? "reference.wav"}`}
+                  </div>
+                )}
+
+                <label className="field-label">
+                  <span className="field-name">Exact Transcript</span>
+                  <textarea
+                    className="textarea textarea-compact"
+                    placeholder="Paste the exact words spoken in the reference audio."
+                    value={referenceTranscript}
+                    onChange={(event) => setReferenceTranscript(event.target.value)}
+                  />
+                </label>
+
+                <button
+                  className="btn-secondary"
+                  disabled={isSavingReference || isRecordingReference}
+                  type="button"
+                  onClick={handleSaveReference}
+                >
+                  {isSavingReference ? "Saving..." : "Save Reference"}
+                </button>
+
+                {referenceStatusMessage && (
+                  <div className="reference-status">{referenceStatusMessage}</div>
+                )}
+                {referenceErrorMessage && (
+                  <div className="reference-error">{referenceErrorMessage}</div>
+                )}
+              </div>
+            </section>
+
+            <section className="section">
+              <p className="section-heading">Generation Settings</p>
               <div className="field-grid">
                 <label className="field-label">
                   <span className="field-name">File Name</span>
                   <input
                     className="input"
                     name="title"
-                    placeholder="my-article"
+                    placeholder="my-narration"
                     value={title}
                     onChange={(event) => setTitle(event.target.value)}
                   />
                 </label>
 
                 <label className="field-label">
-                  <span className="field-name">Provider</span>
-                  <div className="select-wrap">
-                    <select
-                      className="select"
-                      value={provider}
-                      onChange={(event) => setProvider(event.target.value as Provider)}
-                    >
-                      <option value="mistral">Mistral Voxtral</option>
-                      <option value="voxcpm">VoxCPM2 reference voice</option>
-                    </select>
-                  </div>
-                </label>
-
-                {!voxcpmSelected && (
-                <label className="field-label">
-                  <span className="field-name">Mistral Voice ID</span>
-                  <input
-                    className="input"
-                    name="voiceId"
-                    placeholder="Uses MISTRAL_VOICE_ID when blank"
-                    value={voiceId}
-                    onChange={(event) => handleVoiceChange(event.target.value)}
-                  />
-                </label>
-                )}
-
-                <label className="field-label">
-                  <span className="field-name">Output Format</span>
-                  <div className="select-wrap">
-                    <select
-                      className="select"
-                      disabled={voxcpmSelected}
-                      value={voxcpmSelected ? "mp3" : outputFormat}
-                      onChange={(event) => setOutputFormat(event.target.value as OutputFormat)}
-                    >
-                      <option value="mp3">MP3</option>
-                      <option value="wav">WAV</option>
-                    </select>
-                  </div>
+                  <span className="field-name">Output</span>
+                  <input className="input" disabled readOnly value="Mastered MP3" />
                 </label>
 
                 <label className="field-label">
-                  <span className="field-name">Volume Preset</span>
+                  <span className="field-name">Mastering Preset</span>
                   <div className="select-wrap">
                     <select
                       className="select"
@@ -543,163 +511,30 @@ export default function HomePage() {
               </div>
             </section>
 
-            {voxcpmSelected && (
-              <section className="section">
-                <p className="section-heading">VoxCPM2 Reference</p>
-                <p className="section-note">
-                  Use a clean reference clip with the exact spoken transcript. Voice similarity and long-form continuity vary by model and hardware.
-                </p>
-                <div className="toggle-list">
-                  <label className="field-label">
-                    <span className="field-name">Reference Mode</span>
-                    <div className="select-wrap">
-                      <select
-                        className="select"
-                        value={voxcpmCloneMode}
-                        onChange={(event) =>
-                          setVoxcpmCloneMode(event.target.value as VoxcpmCloneMode)
-                        }
-                      >
-                        <option value="ultimate">Reference plus prompt text</option>
-                        <option value="reference">Reference audio only</option>
-                      </select>
-                    </div>
-                  </label>
-
-                  <div className="reference-actions">
-                    <button
-                      className="btn-secondary btn-compact"
-                      disabled={isSavingReference}
-                      type="button"
-                      onClick={handleToggleRecording}
-                    >
-                      {isRecordingReference ? "Stop Recording" : "Record"}
-                    </button>
-                    <label className="btn-secondary btn-compact file-button">
-                      Upload
-                      <input
-                        accept="audio/*"
-                        className="file-input"
-                        type="file"
-                        onChange={(event) =>
-                          void handleReferenceUpload(event.target.files?.[0] ?? null)
-                        }
-                      />
-                    </label>
-                  </div>
-
-                  {(referenceAudioName || voiceReference) && (
-                    <div className="reference-status">
-                      {referenceAudioName
-                        ? `Selected: ${referenceAudioName}`
-                        : `Saved: ${voiceReference?.referenceFilename ?? "reference.wav"}`}
-                    </div>
-                  )}
-
-                  <label className="field-label">
-                    <span className="field-name">Exact Transcript</span>
-                    <textarea
-                      className="textarea textarea-compact"
-                      placeholder="Paste the exact words spoken in the reference audio."
-                      value={referenceTranscript}
-                      onChange={(event) => setReferenceTranscript(event.target.value)}
-                    />
-                  </label>
-
-                  <button
-                    className="btn-secondary"
-                    disabled={isSavingReference || isRecordingReference}
-                    type="button"
-                    onClick={handleSaveReference}
-                  >
-                    {isSavingReference ? "Saving..." : "Save Reference"}
-                  </button>
-
-                  {referenceStatusMessage && (
-                    <div className="reference-status">{referenceStatusMessage}</div>
-                  )}
-                  {referenceErrorMessage && (
-                    <div className="reference-error">{referenceErrorMessage}</div>
-                  )}
-                </div>
-              </section>
-            )}
-
-            {!voxcpmSelected && (
-            <section className="section">
-              <p className="section-heading">Narration Path</p>
-              <div className="toggle-list">
-                <label className="toggle">
-                  <input
-                    checked={continuousRead}
-                    className="toggle-input"
-                    onChange={(event) => {
-                      setContinuousRead(event.target.checked);
-                      if (event.target.checked) {
-                        setForceSegmentedMode(false);
-                      }
-                    }}
-                    type="checkbox"
-                  />
-                  <span className="toggle-copy">
-                    <span className="toggle-text">Continuous Read</span>
-                    <span className="toggle-note">
-                      Default on. Reads the cleaned document as one continuous pass, then masters
-                      the final file.
-                    </span>
-                  </span>
-                </label>
-
-                <label className="toggle">
-                  <input
-                    checked={fallbackToSegmented}
-                    className="toggle-input"
-                    disabled={!continuousRead || forceSegmentedMode}
-                    onChange={(event) => setFallbackToSegmented(event.target.checked)}
-                    type="checkbox"
-                  />
-                  <span className="toggle-copy">
-                    <span className="toggle-text">Fallback to segmented mode if needed</span>
-                    <span className="toggle-note">
-                      {!continuousRead || forceSegmentedMode
-                        ? "Continuous Read is off, so segmented generation runs directly."
-                        : "If continuous read fails, retry section by section and still return one file."}
-                    </span>
-                  </span>
-                </label>
-              </div>
-            </section>
-            )}
-
-            {!voxcpmSelected && (
             <details className="advanced-panel">
               <summary className="advanced-summary">
                 <span className="advanced-summary-copy">
-                  <span className="advanced-summary-title">Advanced</span>
-                  <span className="advanced-summary-note">Secondary processing controls</span>
+                  <span className="advanced-summary-title">Advanced VoxCPM</span>
+                  <span className="advanced-summary-note">Reference and mastering controls</span>
                 </span>
                 <span aria-hidden="true" className="advanced-summary-icon" />
               </summary>
 
               <div className="advanced-body toggle-list">
-                <label className="toggle">
-                  <input
-                    checked={forceSegmentedMode}
-                    className="toggle-input"
-                    onChange={(event) => {
-                      setForceSegmentedMode(event.target.checked);
-                      if (event.target.checked) {
-                        setContinuousRead(false);
+                <label className="field-label">
+                  <span className="field-name">Reference Mode</span>
+                  <div className="select-wrap">
+                    <select
+                      className="select"
+                      value={voxcpmCloneMode}
+                      onChange={(event) =>
+                        setVoxcpmCloneMode(event.target.value as VoxcpmCloneMode)
                       }
-                    }}
-                    type="checkbox"
-                  />
-                  <span className="toggle-copy">
-                    <span className="toggle-text">Force segmented mode</span>
-                    <span className="toggle-note">
-                      Skip continuous read and generate section by section from the start.
-                    </span>
-                  </span>
+                    >
+                      <option value="ultimate">Reference plus prompt text</option>
+                      <option value="reference">Reference audio only</option>
+                    </select>
+                  </div>
                 </label>
 
                 <label className="toggle">
@@ -714,43 +549,24 @@ export default function HomePage() {
                     <span className="toggle-note">Apply final mastering before delivery.</span>
                   </span>
                 </label>
-
-                {segmentedControlsActive && (
-                  <label className="toggle">
-                    <input
-                      checked={smoothJoins}
-                      className="toggle-input"
-                      disabled={!segmentedControlsActive}
-                      onChange={(event) => setSmoothJoins(event.target.checked)}
-                      type="checkbox"
-                    />
-                    <span className="toggle-copy">
-                      <span className="toggle-text">Smooth joins</span>
-                      <span className="toggle-note">
-                        Only used during segmented generation to soften section boundaries.
-                      </span>
-                    </span>
-                  </label>
-                )}
               </div>
             </details>
-            )}
           </aside>
 
           <section className="action-card">
             <div className="action-copy">
               <p className="action-label">Run</p>
-              <h2 className="action-title">Generate narration</h2>
+              <h2 className="action-title">Generate MP3</h2>
               <p className="action-note">Downloads automatically when the finished file is ready.</p>
             </div>
 
             <div className="actions actions-primary">
               <button
                 className="btn-primary"
-                disabled={isGenerating || (voxcpmSelected && !voiceReference)}
+                disabled={isGenerating || !voiceReference}
                 type="submit"
               >
-                {isGenerating ? "Generating..." : "Generate"}
+                {isGenerating ? "Generating..." : "Generate MP3"}
               </button>
             </div>
           </section>
@@ -809,13 +625,8 @@ function buildCompletionDetail(event: CompleteEvent): string {
         return `VoxCPM2 long-form, ${event.totalSegments} sections`;
       case "voxcpm-short":
         return "VoxCPM2 clone";
-      case "segmented-fallback":
-        return `Segmented fallback, ${event.totalSegments} sections`;
-      case "segmented-only":
-        return `Segmented only, ${event.totalSegments} sections`;
-      case "continuous-read":
       default:
-        return "Continuous read";
+        return "VoxCPM2";
     }
   })();
 

@@ -1,10 +1,10 @@
 # VoxCPM2
 
-Voice Lab supports VoxCPM2 through a separate authenticated FastAPI service in `services/voxcpm/`. The Next.js app never imports Torch or VoxCPM directly.
+Voice Lab uses VoxCPM2 through a separate authenticated FastAPI service in `services/voxcpm/`. The Next.js app never imports Torch or VoxCPM directly.
 
 ## Hardware
 
-CUDA GPU is strongly recommended and usually required for practical generation speed. CPU and Mac-local smoke tests may be useful for wiring checks but should not be treated as a production-quality long-form workflow.
+CUDA GPU is strongly recommended and usually required for practical long-form generation. CPU and Mac-local tests may be useful for wiring checks but should not be treated as the real workflow.
 
 ## Local CUDA Setup
 
@@ -40,9 +40,9 @@ VOXCPM_ENDPOINT_MODE=native-wrapper
 VOXCPM_TIMEOUT_MS=300000
 ```
 
-## Remote GPU Pattern
+## Private GPU Pattern
 
-Bind the VoxCPM2 service privately, then tunnel it:
+Run the service on a private GPU host, RunPod instance, or equivalent machine, then tunnel it:
 
 ```bash
 ssh -N -L 8809:127.0.0.1:8809 root@<gpu-host>
@@ -61,7 +61,7 @@ curl -H "Authorization: Bearer $VOXCPM_API_KEY" http://127.0.0.1:8809/health
 3. Save the reference in the UI.
 4. Generate target narration.
 
-The exact transcript matters. Mismatched words, background noise, heavy compression, and inconsistent microphone distance can degrade the result.
+The exact transcript matters. Mismatched words, background noise, clipping, and inconsistent microphone distance can degrade the result.
 
 ## Security
 
@@ -73,4 +73,4 @@ The exact transcript matters. Mismatched words, background noise, heavy compress
 
 ## Limitations
 
-VoxCPM2 can be useful for reference-voice experiments, but Voice Lab does not claim perfect cloning or seamless long-form continuity. Listen to final output before publishing.
+Voice Lab does not claim perfect cloning or seamless long-form continuity. Listen to final output before publishing.

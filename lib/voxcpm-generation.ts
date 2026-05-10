@@ -4,7 +4,7 @@ import {
   type PreparedParagraph,
   type TextChunk
 } from "./text";
-import type { VoxcpmCloneMode } from "./providers/types";
+import type { VoxcpmCloneMode } from "./voxcpm";
 
 export const VOXCPM_CHUNK_OPTIONS = {
   targetMinWords: 90,

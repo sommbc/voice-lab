@@ -1,18 +1,49 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import type {
-  VoxcpmEndpointMode,
-  VoxcpmGenerateOptions,
-  VoxcpmProviderConfig,
-  VoxcpmRequestPayload
-} from "./types";
+
+export type VoxcpmCloneMode = "reference" | "ultimate";
+
+export type VoxcpmEndpointMode = "native-wrapper" | "vllm-omni";
+
+export type VoxcpmRequestPayload = {
+  text: string;
+  reference_audio?: string;
+  prompt_audio?: string;
+  prompt_text?: string;
+  cfg_value: number;
+  inference_timesteps: number;
+  normalize: boolean;
+  denoise: boolean;
+};
+
+export type VoxcpmGenerateOptions = {
+  text: string;
+  referenceAudioPath: string;
+  promptAudioPath?: string;
+  promptText?: string;
+  cfgValue: number;
+  inferenceTimesteps: number;
+  normalize: boolean;
+  denoise: boolean;
+  endpointUrl?: string;
+  apiKey?: string;
+  endpointMode?: VoxcpmEndpointMode;
+  timeoutMs?: number;
+};
+
+export type VoxcpmConfig = {
+  endpointUrl: string;
+  apiKey: string;
+  endpointMode: VoxcpmEndpointMode;
+  timeoutMs: number;
+};
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CFG_VALUE = 2.0;
 const DEFAULT_INFERENCE_TIMESTEPS = 10;
 const DEFAULT_ENDPOINT_MODE: VoxcpmEndpointMode = "native-wrapper";
 
-export function resolveVoxcpmProviderConfig(): VoxcpmProviderConfig {
+export function resolveVoxcpmConfig(): VoxcpmConfig {
   const endpointUrl = process.env.VOXCPM_ENDPOINT_URL?.trim();
   const apiKey = process.env.VOXCPM_API_KEY?.trim();
 
@@ -62,7 +93,7 @@ export async function generateVoxcpmSpeech(options: VoxcpmGenerateOptions): Prom
           endpointMode: options.endpointMode ?? DEFAULT_ENDPOINT_MODE,
           timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
         }
-      : resolveVoxcpmProviderConfig();
+      : resolveVoxcpmConfig();
 
   const referenceAudioDataUri = await readAudioFileAsDataUri(options.referenceAudioPath);
   const promptAudioDataUri = options.promptAudioPath

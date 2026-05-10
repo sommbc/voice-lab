@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildVoxcpmRequestPayload } from "../lib/providers/voxcpm";
-import type { VoxcpmRequestPayload } from "../lib/providers/types";
+import {
+  buildVoxcpmRequestPayload,
+  resolveVoxcpmConfig,
+  resolveVoxcpmGenerationDefaults
+} from "../lib/voxcpm";
+import type { VoxcpmRequestPayload } from "../lib/voxcpm";
 import {
   DEFAULT_VOICE_REFERENCE_ID,
   getVoiceReferenceStoragePaths,
@@ -18,7 +22,7 @@ import {
   VOXCPM_CHUNK_OPTIONS
 } from "../lib/voxcpm-generation";
 
-test("VoxCPM native payload carries reference and prompt audio without provider-side paths", () => {
+test("VoxCPM native payload carries reference and prompt audio without local paths", () => {
   const payload = buildVoxcpmRequestPayload({
     text: "Generate this narration.",
     referenceAudioDataUri: "data:audio/wav;base64,REFERENCE",
@@ -39,6 +43,39 @@ test("VoxCPM native payload carries reference and prompt audio without provider-
   assert.equal(payload.normalize, true);
   assert.equal(payload.denoise, false);
   assert.equal(JSON.stringify(payload).includes("/Users/"), false);
+});
+
+test("VoxCPM env parsing requires explicit enablement and bearer token", () => {
+  withEnv(
+    {
+      VOXCPM_ENABLED: "true",
+      VOXCPM_ENDPOINT_URL: "http://127.0.0.1:8809/generate",
+      VOXCPM_API_KEY: "local-test-token",
+      VOXCPM_ENDPOINT_MODE: "vllm-omni",
+      VOXCPM_TIMEOUT_MS: "45000",
+      VOXCPM_CFG_VALUE: "2.5",
+      VOXCPM_INFERENCE_TIMESTEPS: "12",
+      VOXCPM_NORMALIZE_TEXT: "false",
+      VOXCPM_DENOISE_REFERENCE: "true"
+    },
+    () => {
+      const config = resolveVoxcpmConfig();
+      const defaults = resolveVoxcpmGenerationDefaults();
+
+      assert.equal(config.endpointUrl, "http://127.0.0.1:8809/generate");
+      assert.equal(config.apiKey, "local-test-token");
+      assert.equal(config.endpointMode, "vllm-omni");
+      assert.equal(config.timeoutMs, 45000);
+      assert.equal(defaults.cfgValue, 2.5);
+      assert.equal(defaults.inferenceTimesteps, 12);
+      assert.equal(defaults.normalize, false);
+      assert.equal(defaults.denoise, true);
+    }
+  );
+
+  withEnv({ VOXCPM_ENABLED: "false", VOXCPM_API_KEY: "x", VOXCPM_ENDPOINT_URL: "x" }, () => {
+    assert.throws(() => resolveVoxcpmConfig(), /VoxCPM2 is disabled/);
+  });
 });
 
 test("reference transcript validation requires real exact transcript text", () => {
@@ -78,14 +115,14 @@ test("VoxCPM long-form prompt plan uses previous generated chunk transcript afte
   ];
   const plan = createVoxcpmSegmentPromptPlan({
     segments,
-    referenceTranscript: "This is the exact reference transcript for provider testing.",
+    referenceTranscript: "This is the exact reference transcript for voice cloning tests.",
     cloneMode: "reference",
     forceFirstPrompt: true
   });
 
   assert.equal(VOXCPM_CHUNK_OPTIONS.hardMaxWords, 170);
   assert.equal(plan[0].promptSource, "reference");
-  assert.equal(plan[0].promptText, "This is the exact reference transcript for provider testing.");
+  assert.equal(plan[0].promptText, "This is the exact reference transcript for voice cloning tests.");
   assert.equal(plan[1].promptSource, "previous-segment");
   assert.equal(plan[1].promptText, "First generated chunk text.");
   assert.equal(plan[2].promptSource, "previous-segment");
@@ -95,7 +132,7 @@ test("VoxCPM long-form prompt plan uses previous generated chunk transcript afte
 test("VoxCPM short reference clone can omit prompt transcript", () => {
   const plan = createVoxcpmSegmentPromptPlan({
     segments: [{ text: "Short cloned generation.", wordCount: 3 }],
-    referenceTranscript: "This is the exact reference transcript for provider testing.",
+    referenceTranscript: "This is the exact reference transcript for voice cloning tests.",
     cloneMode: "reference",
     forceFirstPrompt: false
   });
@@ -117,3 +154,30 @@ test("storage helpers keep reference paths inside the configured data directory"
   assert.equal(sanitizeStorageId(" Reference Voice! ", "fallback"), "reference-voice");
   assert.throws(() => resolveStoragePath(root, "../outside.wav"), /escapes/);
 });
+
+function withEnv(values: Record<string, string | undefined>, run: () => void): void {
+  const previous = new Map<string, string | undefined>();
+
+  for (const key of Object.keys(values)) {
+    previous.set(key, process.env[key]);
+    const value = values[key];
+
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  try {
+    run();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
