@@ -223,10 +223,12 @@ Open [http://localhost:3000](http://localhost:3000). The app stores private arti
 
 ## Voice Reference Workflow
 
-1. Record or upload a clean reference clip.
-2. Paste the exact words spoken in that clip.
-3. Save the reference.
-4. Confirm the UI shows a saved reference before generating.
+1. Create the reference once.
+2. Record or upload 45-90 seconds of clean speech.
+3. Paste the exact words spoken in that clip. The transcript must match the audio.
+4. Save the reference and confirm the UI shows it as ready.
+5. Reuse the saved reference for future MP3 generations.
+6. Replace the reference only when you have a better voice sample.
 
 The transcript should match the audio. Background noise, clipping, compression, mismatched words, or shifting microphone distance can reduce voice similarity.
 

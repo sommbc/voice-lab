@@ -588,6 +588,22 @@ summary:focus-visible {
   gap: 10px;
 }
 
+.replace-reference {
+  display: grid;
+  gap: 13px;
+}
+
+.replace-reference-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.replace-reference-head .section-heading {
+  color: var(--ash-dim);
+}
+
 .file-button {
   position: relative;
   overflow: hidden;
@@ -622,6 +638,62 @@ summary:focus-visible {
 .reference-error {
   border-color: var(--rose);
   color: var(--bone);
+}
+
+.reference-ready {
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--black);
+  padding: 14px;
+}
+
+.reference-ready-copy {
+  display: grid;
+  gap: 6px;
+  color: var(--ash);
+  font-size: 0.84rem;
+  line-height: 1.56;
+}
+
+.reference-ready-title {
+  color: var(--bone);
+  font-size: 0.96rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.reference-meta {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--line);
+}
+
+.reference-meta div {
+  display: grid;
+  grid-template-columns: minmax(5.5rem, 0.62fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.reference-meta dt,
+.reference-meta dd {
+  min-width: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.reference-meta dt {
+  color: var(--ash-dim);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.reference-meta dd {
+  color: var(--bone);
+  overflow-wrap: anywhere;
 }
 
 .feedback-card {

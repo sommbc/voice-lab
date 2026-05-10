@@ -65,6 +65,7 @@ export default function HomePage() {
   const [referenceAudioFile, setReferenceAudioFile] = useState<File | null>(null);
   const [referenceAudioName, setReferenceAudioName] = useState("");
   const [voiceReference, setVoiceReference] = useState<VoiceReferenceMetadata | null>(null);
+  const [isReplacingReference, setIsReplacingReference] = useState(false);
   const [referenceStatusMessage, setReferenceStatusMessage] = useState("");
   const [referenceErrorMessage, setReferenceErrorMessage] = useState("");
   const [isSavingReference, setIsSavingReference] = useState(false);
@@ -108,8 +109,10 @@ export default function HomePage() {
 
       const data = (await response.json()) as { reference?: VoiceReferenceMetadata | null };
       setVoiceReference(data.reference ?? null);
+      setIsReplacingReference(!data.reference);
     } catch {
       setVoiceReference(null);
+      setIsReplacingReference(true);
     }
   }
 
@@ -159,9 +162,11 @@ export default function HomePage() {
 
       const data = (await response.json()) as { reference: VoiceReferenceMetadata };
       setVoiceReference(data.reference);
-      setReferenceStatusMessage("Reference saved");
+      setReferenceStatusMessage("Saved voice reference ready");
       setReferenceAudioFile(null);
       setReferenceAudioName("");
+      setReferenceTranscript("");
+      setIsReplacingReference(false);
     } catch (error) {
       setReferenceStatusMessage("");
       setReferenceErrorMessage(
@@ -240,6 +245,24 @@ export default function HomePage() {
     setErrorMessage("");
     setStatusMessage("");
     setStatusDetail("");
+  }
+
+  function handleStartReplacingReference() {
+    setIsReplacingReference(true);
+    setReferenceErrorMessage("");
+    setReferenceStatusMessage("");
+  }
+
+  function handleCancelReplacingReference() {
+    setIsReplacingReference(false);
+    setReferenceAudioFile(null);
+    setReferenceAudioName("");
+    setReferenceTranscript("");
+    setReferenceErrorMessage("");
+    setReferenceStatusMessage("");
+    if (isRecordingReference) {
+      mediaRecorderRef.current?.stop();
+    }
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -368,6 +391,18 @@ export default function HomePage() {
 
   const showStatus = isGenerating || !!statusMessage;
   const showFeedbackPlaceholder = !showStatus && !errorMessage && !downloadUrl;
+  const showReferenceSetup = !voiceReference || isReplacingReference;
+  const canSaveReference = canSaveVoiceReference({
+    hasNewAudio: !!referenceAudioFile,
+    transcript: referenceTranscript,
+    isSavingReference,
+    isRecordingReference
+  });
+  const canGenerate = canGenerateMp3({
+    hasSavedReference: !!voiceReference,
+    sourceText: text,
+    isGenerating
+  });
 
   return (
     <main className="app-shell">
@@ -409,61 +444,118 @@ export default function HomePage() {
               <p className="panel-kicker">Workflow</p>
               <h2 className="panel-title">Reference voice</h2>
               <p className="panel-copy">
-                Save one clean reference clip and its exact transcript before generating narration.
+                Create this once. Use 45-90 seconds of clean speech. Paste the exact words spoken. Voice Lab reuses the saved reference for future MP3s.
               </p>
             </div>
 
             <section className="section">
               <p className="section-heading">Reference Voice</p>
               <div className="toggle-list">
-                <div className="reference-actions">
-                  <button
-                    className="btn-secondary btn-compact"
-                    disabled={isSavingReference}
-                    type="button"
-                    onClick={handleToggleRecording}
-                  >
-                    {isRecordingReference ? "Stop Recording" : "Record"}
-                  </button>
-                  <label className="btn-secondary btn-compact file-button">
-                    Upload
-                    <input
-                      accept="audio/*"
-                      className="file-input"
-                      type="file"
-                      onChange={(event) =>
-                        void handleReferenceUpload(event.target.files?.[0] ?? null)
-                      }
-                    />
-                  </label>
-                </div>
-
-                {(referenceAudioName || voiceReference) && (
+                {voiceReference ? (
+                  <div className="reference-ready">
+                    <div className="reference-ready-copy">
+                      <div className="reference-ready-title">Saved voice reference ready</div>
+                      <p>Voice Lab will reuse this reference for every generation.</p>
+                      <p>Replace it only when you want to update your voice sample.</p>
+                    </div>
+                    <dl className="reference-meta" aria-label="Saved voice reference details">
+                      <div>
+                        <dt>Audio</dt>
+                        <dd>{voiceReference.referenceFilename || "reference audio saved"}</dd>
+                      </div>
+                      <div>
+                        <dt>Last updated</dt>
+                        <dd>{formatReferenceDate(voiceReference.updatedAt)}</dd>
+                      </div>
+                      <div>
+                        <dt>Transcript</dt>
+                        <dd>{formatCharacterCount(voiceReference.transcriptCharacters)}</dd>
+                      </div>
+                      <div>
+                        <dt>File size</dt>
+                        <dd>{formatFileSize(voiceReference.audioBytes)}</dd>
+                      </div>
+                    </dl>
+                  </div>
+                ) : (
                   <div className="reference-status">
-                    {referenceAudioName
-                      ? `Selected: ${referenceAudioName}`
-                      : `Saved: ${voiceReference?.referenceFilename ?? "reference.wav"}`}
+                    First-time setup: record or upload 45-90 seconds of clean speech, paste the exact transcript, then save it once.
                   </div>
                 )}
 
-                <label className="field-label">
-                  <span className="field-name">Exact Transcript</span>
-                  <textarea
-                    className="textarea textarea-compact"
-                    placeholder="Paste the exact words spoken in the reference audio."
-                    value={referenceTranscript}
-                    onChange={(event) => setReferenceTranscript(event.target.value)}
-                  />
-                </label>
+                {voiceReference && !showReferenceSetup && (
+                  <button
+                    className="btn-secondary"
+                    disabled={isSavingReference}
+                    type="button"
+                    onClick={handleStartReplacingReference}
+                  >
+                    Replace Reference
+                  </button>
+                )}
 
-                <button
-                  className="btn-secondary"
-                  disabled={isSavingReference || isRecordingReference}
-                  type="button"
-                  onClick={handleSaveReference}
-                >
-                  {isSavingReference ? "Saving..." : "Save Reference"}
-                </button>
+                {showReferenceSetup && (
+                  <div className="replace-reference">
+                    {voiceReference && (
+                      <div className="replace-reference-head">
+                        <p className="section-heading">Replace reference</p>
+                        <button
+                          className="btn-secondary btn-compact"
+                          disabled={isSavingReference || isRecordingReference}
+                          type="button"
+                          onClick={handleCancelReplacingReference}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="reference-actions">
+                      <button
+                        className="btn-secondary btn-compact"
+                        disabled={isSavingReference}
+                        type="button"
+                        onClick={handleToggleRecording}
+                      >
+                        {isRecordingReference ? "Stop Recording" : "Record"}
+                      </button>
+                      <label className="btn-secondary btn-compact file-button">
+                        Upload
+                        <input
+                          accept="audio/*"
+                          className="file-input"
+                          type="file"
+                          onChange={(event) =>
+                            void handleReferenceUpload(event.target.files?.[0] ?? null)
+                          }
+                        />
+                      </label>
+                    </div>
+
+                    {referenceAudioName && (
+                      <div className="reference-status">Selected: {referenceAudioName}</div>
+                    )}
+
+                    <label className="field-label">
+                      <span className="field-name">Exact Transcript</span>
+                      <textarea
+                        className="textarea textarea-compact"
+                        placeholder="Paste the exact words spoken in the reference audio."
+                        value={referenceTranscript}
+                        onChange={(event) => setReferenceTranscript(event.target.value)}
+                      />
+                    </label>
+
+                    <button
+                      className="btn-secondary"
+                      disabled={!canSaveReference}
+                      type="button"
+                      onClick={handleSaveReference}
+                    >
+                      {isSavingReference ? "Saving..." : "Save Reference"}
+                    </button>
+                  </div>
+                )}
 
                 {referenceStatusMessage && (
                   <div className="reference-status">{referenceStatusMessage}</div>
@@ -563,7 +655,7 @@ export default function HomePage() {
             <div className="actions actions-primary">
               <button
                 className="btn-primary"
-                disabled={isGenerating || !voiceReference}
+                disabled={!canGenerate}
                 type="submit"
               >
                 {isGenerating ? "Generating..." : "Generate MP3"}
@@ -675,6 +767,73 @@ function sanitizeErrorMessage(message: string): string {
       .join(" "),
     280
   );
+}
+
+export function canSaveVoiceReference({
+  hasNewAudio,
+  transcript,
+  isSavingReference = false,
+  isRecordingReference = false
+}: {
+  hasNewAudio: boolean;
+  transcript: string;
+  isSavingReference?: boolean;
+  isRecordingReference?: boolean;
+}): boolean {
+  return hasNewAudio && transcript.trim().length > 0 && !isSavingReference && !isRecordingReference;
+}
+
+export function canGenerateMp3({
+  hasSavedReference,
+  sourceText,
+  isGenerating = false
+}: {
+  hasSavedReference: boolean;
+  sourceText: string;
+  isGenerating?: boolean;
+}): boolean {
+  return hasSavedReference && sourceText.trim().length > 0 && !isGenerating;
+}
+
+function formatReferenceDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "unknown";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short"
+  }).format(date);
+}
+
+function formatCharacterCount(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 characters";
+  }
+
+  return `${value.toLocaleString()} characters`;
+}
+
+function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "unknown";
+  }
+
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  const units = ["KB", "MB", "GB"];
+  let size = bytes / 1024;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
 function truncate(text: string, maxLength: number): string {
