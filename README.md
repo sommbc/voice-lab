@@ -18,9 +18,10 @@ Current validation status:
 
 ## Features
 
+- Text-first narration workflow: paste source text, choose filename/mastering, generate MP3.
 - VoxCPM2 reference-voice generation through an authenticated FastAPI service.
-- Browser recording or audio upload for the reference clip.
-- Exact transcript storage for reference prompting.
+- One-time browser recording or audio upload for the saved local reference clip.
+- Exact transcript storage for reference prompting outside the repository.
 - Long-form text cleanup, paragraph preservation, and chunk planning.
 - Previous-section prompting for longer narration continuity.
 - WAV intermediates for generation, standardization, leveling, and merging.
@@ -32,6 +33,7 @@ Current validation status:
 
 - It does not use hosted speech inference.
 - It does not include speech-to-text.
+- It does not fine-tune, train, or create a permanent voice model.
 - It does not add provider switching or fallback TTS services.
 - It does not include hosted deployment, user accounts, billing, or public storage.
 - It does not guarantee perfect cloning or seamless long-form continuity.
@@ -95,6 +97,47 @@ To perform setup and runtime checks without starting the servers:
 ```bash
 npm run local:check
 ```
+
+## Normal Use
+
+```bash
+npm run local
+```
+
+Open [http://localhost:3000](http://localhost:3000), paste text into Source text, choose a file name and mastering preset, then generate MP3. When generation finishes, download the mastered MP3 from the Result panel.
+
+Voice Lab reuses the saved local reference automatically. Normal narration does not require touching voice setup.
+
+## One-Time Voice Setup
+
+Voice Lab uses reference-based cloning, not fine-tuning or training. Add a reference once through the UI or by preparing the local folder, then return to normal text-first narration.
+
+UI setup:
+
+1. Open Voice settings.
+2. Record in the browser or upload a clean reference clip.
+3. Paste the exact words spoken in that clip.
+4. Save Reference.
+5. Confirm the app returns to the text-first workflow with `Voice configured`.
+
+Folder drop setup:
+
+```bash
+mkdir -p ~/.voice-lab/references/default
+cp ~/Desktop/my-voice.m4a ~/.voice-lab/references/default/reference.m4a
+cp ~/Desktop/transcript.txt ~/.voice-lab/references/default/transcript.txt
+npm run reference:prepare
+```
+
+The private reference folder defaults to `~/.voice-lab/references/default/` and stays outside the repo:
+
+- `reference.wav`
+- `transcript.txt`
+- `metadata.json`
+
+`npm run reference:prepare` looks in `VOICE_LAB_DATA_DIR/references/default/`, finds `transcript.txt` plus `reference.wav`, `reference.mp3`, `reference.m4a`, `reference.webm`, `reference.ogg`, or `reference.flac`, converts to canonical mono 48 kHz PCM WAV when needed, and writes sanitized metadata. It never prints transcript contents.
+
+Do not commit private reference audio, transcripts, generated files, `.env.local`, caches, or temp artifacts.
 
 ## Quick Start
 
@@ -221,34 +264,9 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000). The app stores private artifacts under `VOICE_LAB_DATA_DIR`, not inside the repo, unless you intentionally point it there.
 
-## Voice Reference Workflow
-
-1. Create the reference once.
-2. Record in the browser or upload 45-90 seconds of clean speech.
-3. Paste the exact words spoken in that clip. The transcript must match the audio.
-4. Save the reference and confirm the UI shows `Saved voice reference ready`.
-5. Reuse the saved reference for future MP3 generations.
-6. Replace the reference only when you have a better voice sample.
+## Reference Storage Details
 
 Reference setup accepts MP3, M4A, MP4 audio, WAV, WebM, OGG, and FLAC. Voice Lab probes the uploaded audio with ffmpeg, converts it internally to mono 48 kHz PCM WAV, and stores the reusable canonical file at `VOICE_LAB_DATA_DIR/references/default/reference.wav`.
-
-The private reference folder defaults to `~/.voice-lab/references/default/` and stays outside the repo. It contains:
-
-- `reference.wav`
-- `transcript.txt`
-- `metadata.json`
-
-Direct local folder workflow:
-
-```bash
-mkdir -p ~/.voice-lab/references/default
-cp ~/Desktop/my-voice.mp3 ~/.voice-lab/references/default/reference.mp3
-cp ~/Desktop/my-transcript.txt ~/.voice-lab/references/default/transcript.txt
-npm run reference:prepare
-npm run local
-```
-
-`npm run reference:prepare` looks in `VOICE_LAB_DATA_DIR/references/default/`, finds `transcript.txt` plus `reference.wav`, `reference.mp3`, `reference.m4a`, `reference.webm`, `reference.ogg`, or `reference.flac`, converts to canonical `reference.wav` when needed, and writes sanitized metadata. It never prints transcript contents.
 
 The transcript should match the audio exactly. Background noise, clipping, compression, mismatched words, or shifting microphone distance can reduce voice similarity.
 

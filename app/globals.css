@@ -623,6 +623,29 @@ summary:focus-visible {
   line-height: 1.58;
 }
 
+.voice-status,
+.first-run-state {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--black);
+  padding: 13px 14px;
+  color: var(--ash);
+  font-size: 0.84rem;
+  line-height: 1.58;
+}
+
+.voice-status-title {
+  color: var(--bone);
+  font-size: 0.96rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.voice-status p,
+.first-run-state p {
+  margin-top: 4px;
+}
+
 .reference-status,
 .reference-error {
   border: 1px solid var(--line);

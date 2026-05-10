@@ -66,6 +66,8 @@ export default function HomePage() {
   const [referenceAudioFile, setReferenceAudioFile] = useState<File | null>(null);
   const [referenceAudioName, setReferenceAudioName] = useState("");
   const [voiceReference, setVoiceReference] = useState<VoiceReferenceMetadata | null>(null);
+  const [isLoadingVoiceReference, setIsLoadingVoiceReference] = useState(true);
+  const [isVoiceSettingsOpen, setIsVoiceSettingsOpen] = useState(false);
   const [isReplacingReference, setIsReplacingReference] = useState(false);
   const [referenceStatusMessage, setReferenceStatusMessage] = useState("");
   const [referenceErrorMessage, setReferenceErrorMessage] = useState("");
@@ -98,6 +100,8 @@ export default function HomePage() {
   }, []);
 
   async function loadSavedVoiceReference() {
+    setIsLoadingVoiceReference(true);
+
     try {
       const response = await fetch("/api/voice-references", {
         method: "GET",
@@ -108,16 +112,22 @@ export default function HomePage() {
         const fallback = await readErrorResponse(response);
         setReferenceErrorMessage(fallback);
         setVoiceReference(null);
-        setIsReplacingReference(true);
+        setIsReplacingReference(false);
+        setIsVoiceSettingsOpen(true);
         return;
       }
 
       const data = (await response.json()) as { reference?: VoiceReferenceMetadata | null };
-      setVoiceReference(data.reference ?? null);
-      setIsReplacingReference(!data.reference);
+      const savedReference = data.reference ?? null;
+      setVoiceReference(savedReference);
+      setIsReplacingReference(false);
+      setIsVoiceSettingsOpen(!savedReference);
     } catch {
       setVoiceReference(null);
-      setIsReplacingReference(true);
+      setIsReplacingReference(false);
+      setIsVoiceSettingsOpen(true);
+    } finally {
+      setIsLoadingVoiceReference(false);
     }
   }
 
@@ -174,6 +184,7 @@ export default function HomePage() {
       setReferenceAudioName("");
       setReferenceTranscript("");
       setIsReplacingReference(false);
+      setIsVoiceSettingsOpen(false);
     } catch (error) {
       setReferenceStatusMessage("");
       setReferenceErrorMessage(
@@ -256,6 +267,7 @@ export default function HomePage() {
 
   function handleStartReplacingReference() {
     setIsReplacingReference(true);
+    setIsVoiceSettingsOpen(true);
     setReferenceErrorMessage("");
     setReferenceStatusMessage("");
   }
@@ -267,6 +279,7 @@ export default function HomePage() {
     setReferenceTranscript("");
     setReferenceErrorMessage("");
     setReferenceStatusMessage("");
+    setIsVoiceSettingsOpen(false);
     if (isRecordingReference) {
       mediaRecorderRef.current?.stop();
     }
@@ -398,7 +411,20 @@ export default function HomePage() {
 
   const showStatus = isGenerating || !!statusMessage;
   const showFeedbackPlaceholder = !showStatus && !errorMessage && !downloadUrl;
-  const showReferenceSetup = !voiceReference || isReplacingReference;
+  const hasSavedReference = !!voiceReference;
+  const showReferenceSetup = shouldShowReferenceSetup({
+    hasSavedReference,
+    isReplacingReference,
+    isLoadingVoiceReference
+  });
+  const voiceStatusLabel = isLoadingVoiceReference
+    ? "Checking voice"
+    : hasSavedReference
+      ? "Voice configured"
+      : "No voice configured";
+  const voiceStatusDetail = hasSavedReference
+    ? "Voice Lab uses your saved local voice reference automatically."
+    : "Add a reference once to enable generation.";
   const canSaveReference = canSaveVoiceReference({
     hasNewAudio: !!referenceAudioFile,
     transcript: referenceTranscript,
@@ -406,7 +432,7 @@ export default function HomePage() {
     isRecordingReference
   });
   const canGenerate = canGenerateMp3({
-    hasSavedReference: !!voiceReference,
+    hasSavedReference,
     sourceText: text,
     isGenerating
   });
@@ -415,11 +441,11 @@ export default function HomePage() {
     <main className="app-shell">
       <div className="page">
         <header className="hero">
-          <p className="eyebrow">Local voice cloning</p>
+          <p className="eyebrow">Local narration</p>
           <div className="hero-main">
             <h1 className="hero-title">Voice Lab</h1>
             <p className="hero-subtitle">
-              Clone a reference voice with VoxCPM2, narrate long-form text, and export a mastered MP3 from a local or self-hosted setup.
+              Paste long-form text, choose an output filename, and generate a mastered MP3. Voice Lab uses your saved local voice reference automatically.
             </p>
           </div>
         </header>
@@ -448,47 +474,101 @@ export default function HomePage() {
 
           <aside className="panel panel-rail">
             <div className="panel-head">
-              <p className="panel-kicker">Workflow</p>
-              <h2 className="panel-title">Reference voice</h2>
+              <p className="panel-kicker">Narration</p>
+              <h2 className="panel-title">Output settings</h2>
               <p className="panel-copy">
-                {voiceReference
-                  ? "Saved voice reference ready. Voice Lab reuses this for every MP3. Replace only if you want a better sample."
-                  : "Create this once. Upload MP3, M4A, WAV, WebM, OGG, or record in the browser. Paste the exact transcript. Voice Lab will convert and save a reusable reference."}
+                Voice Lab uses your saved local voice reference automatically.
               </p>
             </div>
 
             <section className="section">
-              <p className="section-heading">Reference Voice</p>
-              <div className="toggle-list">
-                {voiceReference ? (
-                  <div className="reference-ready">
-                    <div className="reference-ready-copy">
-                      <div className="reference-ready-title">Saved voice reference ready</div>
-                      <p>Voice Lab reuses this for every MP3.</p>
-                      <p>Replace only if you want a better sample.</p>
-                    </div>
-                    <dl className="reference-meta" aria-label="Saved voice reference details">
-                      <div>
-                        <dt>Audio</dt>
-                        <dd>{voiceReference.referenceFilename || "reference audio saved"}</dd>
-                      </div>
-                      <div>
-                        <dt>Last updated</dt>
-                        <dd>{formatReferenceDate(voiceReference.updatedAt)}</dd>
-                      </div>
-                      <div>
-                        <dt>Transcript</dt>
-                        <dd>{formatCharacterCount(voiceReference.transcriptCharacters)}</dd>
-                      </div>
-                      <div>
-                        <dt>File size</dt>
-                        <dd>{formatFileSize(voiceReference.audioBytes)}</dd>
-                      </div>
-                    </dl>
+              <p className="section-heading">Generate</p>
+              <div className="field-grid">
+                <label className="field-label">
+                  <span className="field-name">File Name</span>
+                  <input
+                    className="input"
+                    name="title"
+                    placeholder="my-narration"
+                    value={title}
+                    onChange={(event) => setTitle(event.target.value)}
+                  />
+                </label>
+
+                <label className="field-label">
+                  <span className="field-name">Output</span>
+                  <input className="input" disabled readOnly value="Mastered MP3" />
+                </label>
+
+                <label className="field-label">
+                  <span className="field-name">Mastering Preset</span>
+                  <div className="select-wrap">
+                    <select
+                      className="select"
+                      disabled={!normalizationEnabled}
+                      value={volumeBoost}
+                      onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
+                    >
+                      <option value="normal">Normal / podcast MP3</option>
+                      <option value="louder">Louder</option>
+                      <option value="very-loud">Very Loud</option>
+                    </select>
                   </div>
+                </label>
+              </div>
+            </section>
+
+            <section className="section">
+              <p className="section-heading">Voice</p>
+              <div className="voice-status" aria-live="polite">
+                <div>
+                  <div className="voice-status-title">{voiceStatusLabel}</div>
+                  <p>{voiceStatusDetail}</p>
+                </div>
+              </div>
+            </section>
+
+            <details
+              className="advanced-panel voice-settings"
+              open={isVoiceSettingsOpen}
+              onToggle={(event) => setIsVoiceSettingsOpen(event.currentTarget.open)}
+            >
+              <summary className="advanced-summary">
+                <span className="advanced-summary-copy">
+                  <span className="advanced-summary-title">Voice settings</span>
+                  <span className="advanced-summary-note">
+                    {hasSavedReference
+                      ? "Metadata and reference replacement"
+                      : "Add a reference once to enable generation"}
+                  </span>
+                </span>
+                <span aria-hidden="true" className="advanced-summary-icon" />
+              </summary>
+
+              <div className="advanced-body toggle-list">
+                {voiceReference ? (
+                  <dl className="reference-meta" aria-label="Saved voice reference details">
+                    <div>
+                      <dt>Audio</dt>
+                      <dd>{voiceReference.referenceFilename || "reference audio saved"}</dd>
+                    </div>
+                    <div>
+                      <dt>Last updated</dt>
+                      <dd>{formatReferenceDate(voiceReference.updatedAt)}</dd>
+                    </div>
+                    <div>
+                      <dt>Transcript</dt>
+                      <dd>{formatCharacterCount(voiceReference.transcriptCharacters)}</dd>
+                    </div>
+                    <div>
+                      <dt>File size</dt>
+                      <dd>{formatFileSize(voiceReference.audioBytes)}</dd>
+                    </div>
+                  </dl>
                 ) : (
-                  <div className="reference-status">
-                    Create this once. Upload MP3, M4A, WAV, WebM, OGG, or record in the browser. Paste the exact transcript. Voice Lab will convert and save a reusable reference.
+                  <div className="first-run-state">
+                    <div className="voice-status-title">No voice configured yet</div>
+                    <p>Add a reference once to enable generation.</p>
                   </div>
                 )}
 
@@ -499,7 +579,7 @@ export default function HomePage() {
                     type="button"
                     onClick={handleStartReplacingReference}
                   >
-                    Replace Reference
+                    Replace saved voice reference
                   </button>
                 )}
 
@@ -507,7 +587,7 @@ export default function HomePage() {
                   <div className="replace-reference">
                     {voiceReference && (
                       <div className="replace-reference-head">
-                        <p className="section-heading">Replace reference</p>
+                        <p className="section-heading">Replace saved voice reference</p>
                         <button
                           className="btn-secondary btn-compact"
                           disabled={isSavingReference || isRecordingReference}
@@ -573,50 +653,13 @@ export default function HomePage() {
                   <div className="reference-error">{referenceErrorMessage}</div>
                 )}
               </div>
-            </section>
-
-            <section className="section">
-              <p className="section-heading">Generation Settings</p>
-              <div className="field-grid">
-                <label className="field-label">
-                  <span className="field-name">File Name</span>
-                  <input
-                    className="input"
-                    name="title"
-                    placeholder="my-narration"
-                    value={title}
-                    onChange={(event) => setTitle(event.target.value)}
-                  />
-                </label>
-
-                <label className="field-label">
-                  <span className="field-name">Output</span>
-                  <input className="input" disabled readOnly value="Mastered MP3" />
-                </label>
-
-                <label className="field-label">
-                  <span className="field-name">Mastering Preset</span>
-                  <div className="select-wrap">
-                    <select
-                      className="select"
-                      disabled={!normalizationEnabled}
-                      value={volumeBoost}
-                      onChange={(event) => setVolumeBoost(event.target.value as VolumeBoost)}
-                    >
-                      <option value="normal">Normal / podcast MP3</option>
-                      <option value="louder">Louder</option>
-                      <option value="very-loud">Very Loud</option>
-                    </select>
-                  </div>
-                </label>
-              </div>
-            </section>
+            </details>
 
             <details className="advanced-panel">
               <summary className="advanced-summary">
                 <span className="advanced-summary-copy">
-                  <span className="advanced-summary-title">Advanced VoxCPM</span>
-                  <span className="advanced-summary-note">Reference and mastering controls</span>
+                  <span className="advanced-summary-title">Advanced generation</span>
+                  <span className="advanced-summary-note">Prompting and mastering controls</span>
                 </span>
                 <span aria-hidden="true" className="advanced-summary-icon" />
               </summary>
@@ -802,6 +845,18 @@ export function canGenerateMp3({
   isGenerating?: boolean;
 }): boolean {
   return hasSavedReference && sourceText.trim().length > 0 && !isGenerating;
+}
+
+export function shouldShowReferenceSetup({
+  hasSavedReference,
+  isReplacingReference = false,
+  isLoadingVoiceReference = false
+}: {
+  hasSavedReference: boolean;
+  isReplacingReference?: boolean;
+  isLoadingVoiceReference?: boolean;
+}): boolean {
+  return !isLoadingVoiceReference && (!hasSavedReference || isReplacingReference);
 }
 
 export function getRecordingExtensionForMimeType(mimeType: string): string {

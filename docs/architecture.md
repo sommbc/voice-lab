@@ -22,7 +22,7 @@ There is no hosted speech inference in the default architecture. The Next app ca
 
 ## Boundaries
 
-- Browser: captures or uploads reference audio, captures exact transcript text, submits long-form source text, and receives the final MP3.
+- Browser: submits long-form source text, receives the final MP3, and only captures/uploads reference audio plus exact transcript text during one-time voice setup.
 - Next.js API: validates requests, loads saved reference metadata, cleans and chunks text, calls VoxCPM2, writes WAV intermediates, masters MP3 output, and returns progress events.
 - FastAPI VoxCPM2 service: owns Python, PyTorch, VoxCPM, model loading, and WAV generation.
 - Filesystem storage: stores references, transcripts, run workspaces, WAV intermediates, final MP3s, and sanitized manifests under `VOICE_LAB_DATA_DIR`.
@@ -31,7 +31,7 @@ The Next app never imports Torch, VoxCPM, or Python packages.
 
 ## Important Paths
 
-- `app/page.tsx`: single workflow UI for reference voice, source text, generation settings, progress, and MP3 download.
+- `app/page.tsx`: text-first narration UI for source text, output settings, progress, MP3 download, and collapsed voice settings.
 - `app/api/generate/route.ts`: VoxCPM2 long-form generation, WAV intermediates, merging, mastering, and response streaming.
 - `app/api/voice-references/route.ts`: reference audio/transcript upload route.
 - `lib/voxcpm.ts`: VoxCPM2 HTTP client, payload builder, and environment parsing.
@@ -44,7 +44,7 @@ The Next app never imports Torch, VoxCPM, or Python packages.
 
 ## Generation Flow
 
-1. Save reference audio and exact transcript under `VOICE_LAB_DATA_DIR`.
+1. Load the saved reference audio and exact transcript from `VOICE_LAB_DATA_DIR`.
 2. Clean and segment target text.
 3. Build a VoxCPM2 prompt plan from the reference transcript and previous generated sections.
 4. Call the authenticated VoxCPM2 service for each section.

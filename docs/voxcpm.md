@@ -131,14 +131,25 @@ The health check verifies service/auth wiring. It does not load VoxCPM2, does no
 - First generation may take time while model weights load.
 - The Python service returns WAV audio.
 - The Next app writes WAV intermediates, merges/levels them, and masters the final MP3.
+- VoxCPM2 uses reference-based cloning. Voice Lab does not fine-tune, train, or persist a custom voice model.
 
-## Reference Workflow
+## Normal Narration Workflow
 
-1. Create the reference once.
-2. Record in the browser or upload a clean 45-90 second reference clip.
-3. Paste the exact words spoken in that clip.
-4. Save the reference in the UI and confirm it shows as ready.
-5. Generate target narration without touching the reference panel again.
+1. Run `npm run local`.
+2. Open [http://localhost:3000](http://localhost:3000).
+3. Paste source text.
+4. Choose a file name and mastering preset.
+5. Generate MP3 and download the mastered result.
+
+Voice Lab automatically reuses the saved local reference. The reference controls stay behind Voice settings after a voice is configured.
+
+## One-Time Reference Setup
+
+Create the reference once through Voice settings:
+
+1. Record in the browser or upload a clean 45-90 second reference clip.
+2. Paste the exact words spoken in that clip.
+3. Save Reference and return to the text-first narration workflow.
 
 Supported reference uploads include MP3, M4A, MP4 audio, WAV, WebM, OGG, and FLAC. The Next app uses ffmpeg to decode/probe the input and writes a reusable canonical mono 48 kHz PCM WAV at `VOICE_LAB_DATA_DIR/references/default/reference.wav`.
 
@@ -146,8 +157,8 @@ Direct local setup is also supported:
 
 ```bash
 mkdir -p ~/.voice-lab/references/default
-cp ~/Desktop/my-voice.mp3 ~/.voice-lab/references/default/reference.mp3
-cp ~/Desktop/my-transcript.txt ~/.voice-lab/references/default/transcript.txt
+cp ~/Desktop/my-voice.m4a ~/.voice-lab/references/default/reference.m4a
+cp ~/Desktop/transcript.txt ~/.voice-lab/references/default/transcript.txt
 npm run reference:prepare
 npm run local
 ```
