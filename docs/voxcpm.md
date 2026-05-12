@@ -9,6 +9,7 @@ Voice Lab uses VoxCPM2 through a separate authenticated FastAPI service in `serv
 - VoxCPM package pin: `voxcpm==2.0.2` in `services/voxcpm/requirements.txt`.
 - CUDA is expected to be the fastest practical path.
 - Apple Silicon MPS may work, but long-form workloads still need validation.
+- `VOXCPM_DEVICE` is a requested/diagnostic value for local checks. VoxCPM 2.0.2 does not accept an explicit device argument in `VoxCPM.from_pretrained`; the model runtime selects CUDA when available, otherwise MPS when available, otherwise CPU.
 - Live VoxCPM2 generation is not yet fully proven across hardware targets.
 
 Do not treat import checks or `/health` checks as proof that generation quality, speed, or long-form stability is validated.
@@ -31,7 +32,7 @@ Use `HF_TOKEN` only when needed for model access or rate limits. Keep `HF_HOME` 
 
 ## Apple Silicon Setup
 
-This path is for validation. Apple Silicon MPS support is not yet proven for long-form workloads.
+This path is for validation. Apple Silicon MPS support is not yet proven for long-form workloads. `VOXCPM_DEVICE=mps` is kept as a runner/check signal, not as a forced model-load argument.
 
 ```bash
 uv python install 3.11
@@ -54,7 +55,7 @@ Expected validation work:
 
 ## CUDA/Linux Setup
 
-CUDA is the expected fastest setup for practical generation.
+CUDA is the expected fastest setup for practical generation. `VOXCPM_DEVICE=cuda` is kept as a runner/check signal, not as a forced model-load argument.
 
 ```bash
 uv python install 3.11
@@ -66,7 +67,7 @@ VOXCPM_DEVICE=cuda npm run check:voxcpm
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
 
-The runtime check prints Python version, service imports, Torch/CUDA availability, CUDA device count and device names, `VOXCPM_MODEL`, and `VOXCPM_DEVICE`. It does not print bearer tokens, transcripts, audio paths, or base64 audio.
+The runtime check prints Python version, service imports, Torch CUDA/MPS availability, CUDA device count and device names, `VOXCPM_MODEL`, and the requested `VOXCPM_DEVICE`. It does not print bearer tokens, transcripts, audio paths, or base64 audio.
 
 ## Docker CUDA
 

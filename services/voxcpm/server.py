@@ -61,25 +61,33 @@ def get_model(load_denoiser: bool = False):
     from voxcpm import VoxCPM
 
     model_id = os.environ.get("VOXCPM_MODEL", DEFAULT_MODEL)
-    device = os.environ.get("VOXCPM_DEVICE") or None
     optimize = read_bool_env("VOXCPM_OPTIMIZE", True)
     _denoiser_loaded = read_bool_env("VOXCPM_LOAD_DENOISER", False) or load_denoiser
-
-    _model = VoxCPM.from_pretrained(
-        model_id,
-        device=device,
+    load_kwargs = build_model_load_kwargs(
         optimize=optimize,
         load_denoiser=_denoiser_loaded,
     )
+
+    _model = VoxCPM.from_pretrained(model_id, **load_kwargs)
     return _model
+
+
+def build_model_load_kwargs(*, optimize: bool, load_denoiser: bool) -> dict[str, bool]:
+    return {
+        "optimize": optimize,
+        "load_denoiser": load_denoiser,
+    }
 
 
 @app.get("/health", dependencies=[Depends(require_auth)])
 def health() -> dict[str, object]:
+    requested_device = os.environ.get("VOXCPM_DEVICE", "auto")
+
     return {
         "ready": _model is not None,
         "model": os.environ.get("VOXCPM_MODEL", DEFAULT_MODEL),
-        "device": os.environ.get("VOXCPM_DEVICE", "auto"),
+        "device": resolve_loaded_device(_model) or requested_device,
+        "requested_device": requested_device,
         "denoiser_loaded": _denoiser_loaded,
     }
 
@@ -180,6 +188,25 @@ def resolve_model_sample_rate(model: Any) -> Optional[int]:
         sample_rate = coerce_sample_rate(value)
         if sample_rate:
             return sample_rate
+
+    return None
+
+
+def resolve_loaded_device(model: Any) -> Optional[str]:
+    if model is None:
+        return None
+
+    for attribute_path in (("tts_model", "device"), ("device",)):
+        value = model
+        for attribute in attribute_path:
+            try:
+                value = getattr(value, attribute)
+            except Exception:
+                value = None
+                break
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
 
     return None
 

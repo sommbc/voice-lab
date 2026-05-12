@@ -6,6 +6,8 @@ Native FastAPI wrapper for `openbmb/VoxCPM2`. The Next.js app talks to this serv
 
 The service wrapper, auth, health check, and non-generation tests are in place. Live generation still depends on the local Python/PyTorch/device setup. CUDA is expected to be fastest. Apple Silicon MPS may work but still needs validation for long-form workloads.
 
+`VOXCPM_DEVICE` is a requested/diagnostic value for local checks. VoxCPM 2.0.2 does not accept an explicit device argument in `VoxCPM.from_pretrained`; the model runtime selects CUDA when available, otherwise MPS when available, otherwise CPU.
+
 Target Python version: `3.11`. The service defaults to `openbmb/VoxCPM2` and pins `voxcpm==2.0.2` through `requirements.txt`.
 
 The service does not load the model at startup or during `/health`. Model load happens on the first `/generate` request and may take time. The service returns WAV audio; the Next.js app owns WAV intermediates and final MP3 mastering.
@@ -24,7 +26,7 @@ VOXCPM_DEVICE=mps npm run check:voxcpm
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=mps uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
 
-Treat this as a validation path until short and long-form generation are proven on Apple Silicon.
+Treat this as a validation path until short and long-form generation are proven on Apple Silicon. `VOXCPM_DEVICE=mps` is kept as a runner/check signal, not as a forced model-load argument.
 
 ## Local CUDA Setup
 
@@ -38,7 +40,7 @@ VOXCPM_DEVICE=cuda npm run check:voxcpm
 VOXCPM_API_KEY="replace-me" VOXCPM_DEVICE=cuda uvicorn services.voxcpm.server:app --host 127.0.0.1 --port 8809
 ```
 
-`npm run check:voxcpm` prints Python version, core imports, Torch/CUDA availability, CUDA device count and names, `VOXCPM_MODEL`, and `VOXCPM_DEVICE`. It never prints `VOXCPM_API_KEY`, transcripts, audio paths, or base64 audio.
+`npm run check:voxcpm` prints Python version, core imports, Torch CUDA/MPS availability, CUDA device count and names, `VOXCPM_MODEL`, and the requested `VOXCPM_DEVICE`. It never prints `VOXCPM_API_KEY`, transcripts, audio paths, or base64 audio.
 
 ## Hugging Face Cache
 

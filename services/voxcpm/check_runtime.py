@@ -21,7 +21,8 @@ REQUIRED_MODULES = (
 def main() -> int:
     print(f"python: {platform.python_version()} ({sys.executable})")
     print(f"VOXCPM_MODEL: {os.environ.get('VOXCPM_MODEL', DEFAULT_MODEL)}")
-    print(f"VOXCPM_DEVICE: {os.environ.get('VOXCPM_DEVICE', 'auto')}")
+    print(f"VOXCPM_DEVICE requested: {os.environ.get('VOXCPM_DEVICE', 'auto')}")
+    print("VoxCPM 2.0.2 device selection: internal auto-select, not a from_pretrained argument")
 
     missing: list[str] = []
     imported: dict[str, object] = {}
@@ -44,8 +45,10 @@ def main() -> int:
     else:
         cuda_available = bool(torch.cuda.is_available())
         device_count = int(torch.cuda.device_count())
+        mps_available = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
         print(f"torch cuda available: {cuda_available}")
         print(f"torch cuda device count: {device_count}")
+        print(f"torch mps available: {mps_available}")
         if device_count > 0:
             for index in range(device_count):
                 try:

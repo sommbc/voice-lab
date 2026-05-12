@@ -86,9 +86,9 @@ The local runner verifies Node/npm, installs missing npm dependencies, creates o
 http://localhost:3000
 ```
 
-On Apple Silicon, the runner installs normal PyTorch wheels, sets `VOXCPM_DEVICE=mps`, and sets `VOXCPM_OPTIMIZE=false`. If PyTorch does not report MPS availability, it warns and leaves the selected device unchanged.
+On Apple Silicon, the runner installs normal PyTorch wheels, records `VOXCPM_DEVICE=mps`, and sets `VOXCPM_OPTIMIZE=false`. VoxCPM 2.0.2 does not accept an explicit device argument; the model runtime selects CUDA when available, otherwise MPS when available, otherwise CPU.
 
-On CUDA Linux, the runner reads `nvidia-smi`, chooses the matching PyTorch CUDA wheel index when it can safely detect the CUDA version, sets `VOXCPM_DEVICE=cuda`, and sets `VOXCPM_OPTIMIZE=true`. If it cannot safely detect the wheel, it stops with the exact PyTorch index action to take. Linux without CUDA falls back to `VOXCPM_DEVICE=cpu` with a warning for wiring checks only.
+On CUDA Linux, the runner reads `nvidia-smi`, chooses the matching PyTorch CUDA wheel index when it can safely detect the CUDA version, records `VOXCPM_DEVICE=cuda`, and sets `VOXCPM_OPTIMIZE=true`. If it cannot safely detect the wheel, it stops with the exact PyTorch index action to take. Linux without CUDA records `VOXCPM_DEVICE=cpu` with a warning for wiring checks only.
 
 The runner does not log `VOXCPM_API_KEY`, does not put `.venv` in the repo, and does not run generation. Stop both local processes with `Ctrl+C`.
 
@@ -170,7 +170,7 @@ Copy `.env.example` to `.env.local` and keep `.env.local` private.
 | `VOXCPM_INFERENCE_TIMESTEPS` | No | `10` | Next app | VoxCPM2 inference steps sent to the service. |
 | `VOXCPM_NORMALIZE_TEXT` | No | `true` | Next app | Sends the normalize flag to the service. |
 | `VOXCPM_DENOISE_REFERENCE` | No | `false` | Next app/service | Requests denoising. The service must be started with denoiser support. |
-| `VOXCPM_DEVICE` | No | auto | Service/checks | `cuda`, `mps`, `cpu`, or unset for VoxCPM auto behavior. |
+| `VOXCPM_DEVICE` | No | auto | Runner/checks | Requested device for local setup and diagnostics. VoxCPM 2.0.2 does not accept this as a load argument and selects CUDA/MPS/CPU internally. |
 | `VOXCPM_OPTIMIZE` | No | `true` | Service | Passed to `VoxCPM.from_pretrained`. |
 | `HF_TOKEN` | No | none | Service/model download | Optional Hugging Face token for gated or rate-limited downloads. |
 | `HF_HOME` | No | Hugging Face default | Service/model download | Optional cache root. Keep it outside the repo. |
@@ -192,7 +192,7 @@ VOXCPM_MODEL=openbmb/VoxCPM2
 
 ## Apple Silicon Setup
 
-Apple Silicon support is not yet proven for long-form workloads. Treat this path as validation work, not a production-quality claim.
+Apple Silicon support is not yet proven for long-form workloads. Treat this path as validation work, not a production-quality claim. `VOXCPM_DEVICE=mps` is kept as a runner/check signal; VoxCPM 2.0.2 still selects the actual device internally.
 
 ```bash
 uv python install 3.11
@@ -208,7 +208,7 @@ If MPS fails or produces unstable long-form results, use CUDA/Linux for runtime 
 
 ## CUDA/Linux Setup
 
-CUDA is the expected fastest path for practical VoxCPM2 generation.
+CUDA is the expected fastest path for practical VoxCPM2 generation. `VOXCPM_DEVICE=cuda` is kept as a runner/check signal; VoxCPM 2.0.2 still selects the actual device internally.
 
 ```bash
 uv python install 3.11
@@ -297,7 +297,7 @@ python3 -m py_compile services/voxcpm/check_health.py
 git diff --check
 ```
 
-`npm run check:voxcpm` checks imports and hardware visibility. It does not run generation. `npm run check:voxcpm:health` expects unauthenticated `/health` to return `401` and authenticated `/health` to return `200`.
+`npm run check:voxcpm` checks imports, hardware visibility, and the requested device value. It does not run generation and does not prove that `VOXCPM_DEVICE` forced the model device. `npm run check:voxcpm:health` expects unauthenticated `/health` to return `401` and authenticated `/health` to return `200`.
 
 ## Troubleshooting
 

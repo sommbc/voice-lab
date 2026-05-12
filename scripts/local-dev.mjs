@@ -112,7 +112,7 @@ function detectPlatformPlan() {
       device: "mps",
       optimize: "false",
       torch: { kind: "default" },
-      note: "Apple Silicon detected; using PyTorch default wheels and VOXCPM_DEVICE=mps."
+      note: "Apple Silicon detected; using PyTorch default wheels and recording VOXCPM_DEVICE=mps."
     };
   }
 
@@ -518,7 +518,7 @@ async function runRuntimeCheck(python, envValues) {
     const device = normalizeDevice(envValues.VOXCPM_DEVICE);
     const deviceHelp =
       device === "mps"
-        ? " On Apple Silicon, try VOXCPM_DEVICE=cpu for wiring checks or use CUDA Linux for practical generation."
+        ? " On Apple Silicon, VoxCPM 2.0.2 selects the actual device internally; use CUDA Linux if MPS is not viable."
         : device === "cuda"
           ? " Confirm the NVIDIA driver and PyTorch CUDA wheel match, then rerun npm run local:check."
           : " CPU mode is only for wiring checks; use CUDA Linux for practical generation.";
@@ -534,20 +534,22 @@ async function verifySelectedDevice(python, device, envValues) {
 
   if (device === "cuda" && torch.cudaAvailable !== true) {
     throw new Error(
-      "VOXCPM_DEVICE=cuda is selected, but PyTorch does not report CUDA availability. " +
-        "Fix the CUDA PyTorch install or set VOXCPM_DEVICE=cpu for wiring checks, then rerun npm run local:check."
+      "VOXCPM_DEVICE=cuda is requested, but PyTorch does not report CUDA availability. " +
+        "Fix the CUDA PyTorch install or use VOXCPM_DEVICE=cpu for wiring checks, then rerun npm run local:check."
     );
   }
 
   if (device === "mps" && torch.mpsAvailable !== true) {
     log(
-      "warning: VOXCPM_DEVICE=mps is selected, but PyTorch does not report MPS availability. " +
-        "Try VOXCPM_DEVICE=cpu for wiring checks or use CUDA Linux for practical generation."
+      "warning: VOXCPM_DEVICE=mps is requested, but PyTorch does not report MPS availability. " +
+        "Use CPU for wiring checks or CUDA Linux for practical generation."
     );
   }
 
   if (device === "cpu") {
-    log("warning: VOXCPM_DEVICE=cpu is selected; generation is expected to be slow and is for wiring checks only");
+    log(
+      "warning: VOXCPM_DEVICE=cpu is requested for checks; VoxCPM 2.0.2 may still auto-select an available accelerator"
+    );
   }
 }
 

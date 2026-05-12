@@ -1,4 +1,5 @@
 import path from "node:path";
+import { loadEnvConfig } from "@next/env";
 import {
   DEFAULT_VOICE_REFERENCE_ID,
   getVoiceReferenceStoragePaths
@@ -10,6 +11,8 @@ import {
   prepareVoiceReferenceFromLocalFolder,
   resolveVoiceLabDataDir
 } from "../lib/voice-reference-store";
+
+loadEnvConfig(process.cwd());
 
 void main();
 
