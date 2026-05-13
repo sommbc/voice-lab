@@ -52,13 +52,13 @@ Expected result: no tracked public-surface matches, except documented placeholde
 Suggested repository description:
 
 ```text
-Local-first VoxCPM2 voice cloning app for long-form narration and mastered MP3 export.
+Archived local-first VoxCPM2 voice cloning experiment for long-form narration and MP3 export.
 ```
 
 Suggested topics:
 
 ```text
-tts, voice-cloning, voxcpm2, nextjs, fastapi, local-first, speech, mp3
+archived, tts, voice-cloning, voxcpm2, nextjs, fastapi, local-first, speech, mp3
 ```
 
 Recommended settings before public release:

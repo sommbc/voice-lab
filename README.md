@@ -1,20 +1,22 @@
 # Voice Lab
 
-Voice Lab is a local-first VoxCPM2 voice cloning app for long-form narration and mastered MP3 export.
+> Archived experiment. Voice Lab was a local-first VoxCPM2 voice cloning app for long-form narration, but the generated audio quality did not meet the bar for production use. The repository is preserved as a technical experiment and reference implementation, not an actively maintained production tool.
 
 ## Project Status
 
-Voice Lab is an early release. The Next.js app, FastAPI service wrapper, storage layer, audio pipeline, and non-generation checks are built. Live VoxCPM2 generation depends on your local Python, PyTorch, model cache, and device setup.
+Voice Lab is archived, experimental, not production-ready, and not actively maintained.
+
+The Next.js app, FastAPI service wrapper, storage layer, audio pipeline, and non-generation checks were built. The project stopped because VoxCPM2 output quality was echoey and too low for Brandon's production narration use case. The repository remains useful as a local-first technical reference, but it should not be treated as an active product or a production narration tool.
 
 Voice Lab is local-first and self-hosted. The app does not use hosted speech inference. VoxCPM2 model runtime depends on your Python/PyTorch/device setup. CUDA is expected to be fastest. Apple Silicon MPS may work but still needs validation for long-form workloads.
 
-Current validation status:
+Archive status:
 
-- App tests, TypeScript, production build, Python service unit tests, and Python syntax checks pass in this repo.
-- Service import and health-check scripts are included for target Python/runtime environments.
-- Live VoxCPM2 generation is not yet fully proven across supported hardware.
-- Apple Silicon MPS still needs long-form validation.
-- CUDA/Linux still needs end-to-end runtime validation on real GPU hardware.
+- Archived as a VoxCPM2 voice cloning experiment.
+- Not production-ready.
+- Not actively maintained.
+- Generated audio quality failed the intended production narration use case.
+- Runtime checks and service health checks are not claims of acceptable output quality.
 
 ## Features
 
@@ -31,6 +33,9 @@ Current validation status:
 
 ## What It Does Not Do
 
+- It is not production-ready.
+- It is not actively maintained.
+- It does not meet Brandon's production narration quality bar.
 - It does not use hosted speech inference.
 - It does not include speech-to-text.
 - It does not fine-tune, train, or create a permanent voice model.
@@ -325,6 +330,7 @@ See [docs/privacy.md](docs/privacy.md) and [SECURITY.md](SECURITY.md).
 
 ## Limitations
 
+- The project is archived because generated audio quality did not meet the intended production use case.
 - Live VoxCPM2 generation has not yet been proven across Apple Silicon and CUDA setups.
 - VoxCPM2 generation quality depends on model behavior, reference quality, text length, and GPU performance.
 - Long-form continuity is assisted by chunk prompting and leveling, but final listening review is still required.
@@ -333,12 +339,7 @@ See [docs/privacy.md](docs/privacy.md) and [SECURITY.md](SECURITY.md).
 
 ## Roadmap
 
-- Prove short VoxCPM2 generation on CUDA/Linux.
-- Prove long-form multi-section generation on CUDA/Linux.
-- Validate Apple Silicon MPS behavior and document real limits.
-- Add real screenshots after runtime validation.
-- Harden public deployment guidance only if the project grows beyond trusted local use.
-- Improve audio diagnostics around long-form joins and final mastering.
+There is no active roadmap. Development stopped after the local-first VoxCPM2 path worked technically but failed the production narration quality bar. Future production narration work should use a different voice system or a hosted commercial voice provider rather than extending this archived experiment.
 
 ## Attribution
 

@@ -1,7 +1,7 @@
 {
   "name": "voice-lab",
   "version": "0.1.0",
-  "description": "Local-first VoxCPM2 voice cloning app for long-form narration and mastered MP3 export.",
+  "description": "Archived local-first VoxCPM2 voice cloning experiment.",
   "license": "MIT",
   "scripts": {
     "local": "node scripts/local-dev.mjs",
