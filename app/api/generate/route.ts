@@ -38,45 +38,11 @@ import {
   loadVoiceReference,
   type VoiceLabRunWorkspace
 } from "@/lib/voice-reference-store";
+import type { StreamEvent } from "@/lib/generation-progress";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 300;
-
-type ProgressStage =
-  | "cleaning"
-  | "segmenting"
-  | "single-pass"
-  | "generating"
-  | "normalizing"
-  | "smoothing"
-  | "merging"
-  | "final-normalization"
-  | "done";
-
-type StreamEvent =
-  | {
-      type: "progress";
-      stage: ProgressStage;
-      message: string;
-      currentSegment?: number;
-      totalSegments?: number;
-    }
-  | {
-      type: "complete";
-      filename: string;
-      audioBase64: string;
-      mimeType: string;
-      outputFormat: OutputFormat;
-      normalizationApplied: boolean;
-      normalizationFallbackUsed: boolean;
-      strategy: "voxcpm-short" | "voxcpm-long-form";
-      totalSegments: number;
-    }
-  | {
-      type: "error";
-      message: string;
-    };
 
 type ProcessedVoxcpmSegment = {
   segmentNumber: number;
@@ -138,9 +104,10 @@ export async function POST(request: Request): Promise<Response> {
 
   return new Response(stream, {
     headers: {
-      "Cache-Control": "no-store",
+      "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      "Content-Type": "application/x-ndjson; charset=utf-8"
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "X-Accel-Buffering": "no"
     }
   });
 }
@@ -163,14 +130,22 @@ async function runVoxcpmGeneration({
   outputFormat: OutputFormat;
 }): Promise<void> {
   const encoder = new TextEncoder();
-  const sendEvent = (event: StreamEvent) => {
+  const sendEvent = async (event: StreamEvent) => {
     controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
   };
 
   try {
     if (!text.trim()) {
       throw new Error("Paste some text before generating audio.");
     }
+
+    await sendEvent({
+      type: "progress",
+      stage: "started",
+      message: "Generation started",
+      completedSegments: 0
+    });
 
     const voxcpmConfig = resolveVoxcpmConfig();
     const generationDefaults = resolveVoxcpmGenerationDefaults();
@@ -180,10 +155,11 @@ async function runVoxcpmGeneration({
       throw new Error("Save reference audio and its exact transcript before using VoxCPM2.");
     }
 
-    sendEvent({
+    await sendEvent({
       type: "progress",
       stage: "cleaning",
-      message: "Cleaning text"
+      message: "Cleaning text",
+      completedSegments: 0
     });
 
     const preparedText = prepareTextForSpeech(text);
@@ -207,10 +183,12 @@ async function runVoxcpmGeneration({
       forceFirstPrompt: isLongForm
     });
 
-    sendEvent({
+    await sendEvent({
       type: "progress",
       stage: "segmenting",
-      message: isLongForm ? "Preparing VoxCPM2 long-form generation" : "Preparing VoxCPM2 clone"
+      message: isLongForm ? "Preparing VoxCPM2 long-form generation" : "Preparing VoxCPM2 clone",
+      totalSegments: promptPlan.length,
+      completedSegments: 0
     });
 
     const processedSegments: ProcessedVoxcpmSegment[] = [];
@@ -234,12 +212,13 @@ async function runVoxcpmGeneration({
             ? previousRawPath ?? undefined
             : undefined;
 
-      sendEvent({
+      await sendEvent({
         type: "progress",
-        stage: "generating",
-        message: `Generating VoxCPM2 section ${plan.segmentNumber} of ${promptPlan.length}`,
+        stage: "section-started",
+        message: `Section ${plan.segmentNumber} of ${promptPlan.length} started`,
         currentSegment: plan.segmentNumber,
-        totalSegments: promptPlan.length
+        totalSegments: promptPlan.length,
+        completedSegments: plan.segmentNumber - 1
       });
 
       const audioBuffer = await generateVoxcpmSpeech({
@@ -258,20 +237,32 @@ async function runVoxcpmGeneration({
       });
 
       await writeFile(rawPath, audioBuffer);
-      const rawMetrics = await measureSegmentAudioFile(rawPath);
 
-      sendEvent({
+      await sendEvent({
         type: "progress",
-        stage: "normalizing",
-        message: `Leveling VoxCPM2 section ${plan.segmentNumber} of ${promptPlan.length}`,
+        stage: "section-raw-received",
+        message: `Section ${plan.segmentNumber} of ${promptPlan.length} raw WAV received`,
         currentSegment: plan.segmentNumber,
-        totalSegments: promptPlan.length
+        totalSegments: promptPlan.length,
+        completedSegments: plan.segmentNumber - 1
       });
+
+      const rawMetrics = await measureSegmentAudioFile(rawPath);
 
       await standardizeSegmentAudioFile({
         inputPath: rawPath,
         outputPath: standardizedPath
       });
+
+      await sendEvent({
+        type: "progress",
+        stage: "section-standardized",
+        message: `Section ${plan.segmentNumber} of ${promptPlan.length} standardized`,
+        currentSegment: plan.segmentNumber,
+        totalSegments: promptPlan.length,
+        completedSegments: plan.segmentNumber - 1
+      });
+
       const standardizedMetrics = await measureSegmentAudioFile(standardizedPath);
       await levelSegmentAudioFile({
         inputPath: standardizedPath,
@@ -280,6 +271,15 @@ async function runVoxcpmGeneration({
       });
       const leveledMetrics = await measureSegmentAudioFile(leveledPath, {
         includeEdgeTone: true
+      });
+
+      await sendEvent({
+        type: "progress",
+        stage: "section-leveled",
+        message: `Section ${plan.segmentNumber} of ${promptPlan.length} standardized and leveled`,
+        currentSegment: plan.segmentNumber,
+        totalSegments: promptPlan.length,
+        completedSegments: plan.segmentNumber
       });
 
       processedSegments.push({
@@ -313,6 +313,7 @@ async function runVoxcpmGeneration({
       outputFormat,
       normalizationEnabled,
       volumeBoost,
+      totalSegments: processedSegments.length,
       sendEvent
     });
     const joinPlan = buildSegmentJoinPlan(
@@ -346,13 +347,15 @@ async function runVoxcpmGeneration({
 
     const audioBuffer = await readFile(finalizedOutput.deliverPath);
 
-    sendEvent({
+    await sendEvent({
       type: "progress",
-      stage: "done",
-      message: "Done"
+      stage: "final-ready",
+      message: "Final MP3 ready",
+      totalSegments: processedSegments.length,
+      completedSegments: processedSegments.length
     });
 
-    sendEvent({
+    await sendEvent({
       type: "complete",
       filename,
       audioBase64: audioBuffer.toString("base64"),
@@ -364,9 +367,17 @@ async function runVoxcpmGeneration({
       totalSegments: processedSegments.length
     });
   } catch (error) {
-    sendEvent({
+    const safeMessage = describeSafeError(error);
+
+    await sendEvent({
+      type: "progress",
+      stage: "failed",
+      message: safeMessage
+    });
+
+    await sendEvent({
       type: "error",
-      message: describeSafeError(error)
+      message: safeMessage
     });
   } finally {
     controller.close();
@@ -380,7 +391,7 @@ async function assembleSegments({
 }: {
   processedSegments: ProcessedVoxcpmSegment[];
   runWorkspace: VoiceLabRunWorkspace;
-  sendEvent: (event: StreamEvent) => void;
+  sendEvent: (event: StreamEvent) => Promise<void>;
 }): Promise<string> {
   if (processedSegments.length === 1) {
     return processedSegments[0].leveledPath;
@@ -388,10 +399,12 @@ async function assembleSegments({
 
   const mergedPath = path.join(runWorkspace.runDirectoryPath, "merged-premaster.wav");
 
-  sendEvent({
+  await sendEvent({
     type: "progress",
-    stage: "merging",
-    message: "Merging VoxCPM2 sections"
+    stage: "merge-started",
+    message: "Merge started",
+    totalSegments: processedSegments.length,
+    completedSegments: processedSegments.length
   });
 
   await mergeAudioFiles({
@@ -410,6 +423,7 @@ async function finalizeVoxcpmOutput({
   outputFormat,
   normalizationEnabled,
   volumeBoost,
+  totalSegments,
   sendEvent
 }: {
   assembledPath: string;
@@ -417,7 +431,8 @@ async function finalizeVoxcpmOutput({
   outputFormat: OutputFormat;
   normalizationEnabled: boolean;
   volumeBoost: VolumeBoost;
-  sendEvent: (event: StreamEvent) => void;
+  totalSegments: number;
+  sendEvent: (event: StreamEvent) => Promise<void>;
 }): Promise<{
   deliverPath: string;
   normalizationApplied: boolean;
@@ -441,10 +456,12 @@ async function finalizeVoxcpmOutput({
     };
   }
 
-  sendEvent({
+  await sendEvent({
     type: "progress",
-    stage: "final-normalization",
-    message: "Mastering final VoxCPM2 audio"
+    stage: "mastering-started",
+    message: "Mastering started",
+    totalSegments,
+    completedSegments: totalSegments
   });
 
   try {
@@ -579,7 +596,7 @@ function describeSafeError(error: unknown): string {
 }
 
 function sanitizeErrorMessage(message: string): string {
-  return redactPrivatePaths(message)
+  const sanitized = redactPrivatePaths(message)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
@@ -593,6 +610,8 @@ function sanitizeErrorMessage(message: string): string {
     )
     .join(" ")
     .slice(0, 300);
+
+  return sanitized || "Unexpected error during VoxCPM2 generation.";
 }
 
 function redactPrivatePaths(message: string): string {

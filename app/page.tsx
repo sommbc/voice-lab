@@ -1,24 +1,21 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
+import {
+  buildProgressDetailLines,
+  formatElapsedTime,
+  parseStreamEventLine,
+  type CompleteEvent,
+  type OutputFormat,
+  type ProgressEvent,
+  type StreamEvent
+} from "@/lib/generation-progress";
 
 const DEFAULT_VOLUME_BOOST = "normal";
 const REFERENCE_AUDIO_ACCEPT = ".wav,.mp3,.m4a,.mp4,.webm,.ogg,.flac,audio/*";
 
-type OutputFormat = "mp3";
 type VolumeBoost = "normal" | "louder" | "very-loud";
 type VoxcpmCloneMode = "reference" | "ultimate";
-type ProgressStage =
-  | "cleaning"
-  | "segmenting"
-  | "single-pass"
-  | "generating"
-  | "normalizing"
-  | "smoothing"
-  | "merging"
-  | "final-normalization"
-  | "done";
-type CompleteStrategy = "voxcpm-short" | "voxcpm-long-form";
 
 type VoiceReferenceMetadata = {
   id: string;
@@ -30,33 +27,6 @@ type VoiceReferenceMetadata = {
   audioBytes: number;
   transcriptCharacters: number;
 };
-
-type ProgressEvent = {
-  type: "progress";
-  stage: ProgressStage;
-  message: string;
-  currentSegment?: number;
-  totalSegments?: number;
-};
-
-type ErrorEvent = {
-  type: "error";
-  message: string;
-};
-
-type CompleteEvent = {
-  type: "complete";
-  filename: string;
-  audioBase64: string;
-  mimeType: string;
-  outputFormat: OutputFormat;
-  normalizationApplied: boolean;
-  normalizationFallbackUsed: boolean;
-  strategy: CompleteStrategy;
-  totalSegments: number;
-};
-
-type StreamEvent = ProgressEvent | ErrorEvent | CompleteEvent;
 
 export default function HomePage() {
   const [title, setTitle] = useState("");
@@ -77,6 +47,9 @@ export default function HomePage() {
   const [volumeBoost, setVolumeBoost] = useState<VolumeBoost>(DEFAULT_VOLUME_BOOST);
   const [statusMessage, setStatusMessage] = useState("");
   const [statusDetail, setStatusDetail] = useState("");
+  const [currentProgressEvent, setCurrentProgressEvent] = useState<ProgressEvent | null>(null);
+  const [generationStartedAt, setGenerationStartedAt] = useState<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isGenerating, setIsGenerating] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [downloadUrl, setDownloadUrl] = useState("");
@@ -98,6 +71,21 @@ export default function HomePage() {
       recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
+
+  useEffect(() => {
+    if (!isGenerating || generationStartedAt === null) {
+      return undefined;
+    }
+
+    const updateElapsedSeconds = () => {
+      setElapsedSeconds(Math.floor((Date.now() - generationStartedAt) / 1000));
+    };
+
+    updateElapsedSeconds();
+    const intervalId = window.setInterval(updateElapsedSeconds, 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, [generationStartedAt, isGenerating]);
 
   async function loadSavedVoiceReference() {
     setIsLoadingVoiceReference(true);
@@ -263,6 +251,9 @@ export default function HomePage() {
     setErrorMessage("");
     setStatusMessage("");
     setStatusDetail("");
+    setCurrentProgressEvent(null);
+    setGenerationStartedAt(null);
+    setElapsedSeconds(0);
   }
 
   function handleStartReplacingReference() {
@@ -308,6 +299,9 @@ export default function HomePage() {
     setDownloadUrl("");
     setDownloadFilename("");
     setStatusDetail("");
+    setCurrentProgressEvent(null);
+    setGenerationStartedAt(Date.now());
+    setElapsedSeconds(0);
     setStatusMessage("Starting");
 
     try {
@@ -351,14 +345,20 @@ export default function HomePage() {
             continue;
           }
 
-          const eventPayload = JSON.parse(line) as StreamEvent;
-          await handleStreamEvent(eventPayload);
+          const eventPayload = parseStreamEventLine(line);
+
+          if (eventPayload) {
+            await handleStreamEvent(eventPayload);
+          }
         }
 
         if (done) {
           if (buffered.trim()) {
-            const trailingEvent = JSON.parse(buffered) as StreamEvent;
-            await handleStreamEvent(trailingEvent);
+            const trailingEvent = parseStreamEventLine(buffered);
+
+            if (trailingEvent) {
+              await handleStreamEvent(trailingEvent);
+            }
           }
           break;
         }
@@ -368,6 +368,8 @@ export default function HomePage() {
         sanitizeErrorMessage(error instanceof Error ? error.message : "Generation failed.")
       );
       setStatusDetail("");
+      setCurrentProgressEvent(null);
+      setGenerationStartedAt(null);
       setStatusMessage("");
     } finally {
       setIsGenerating(false);
@@ -381,12 +383,9 @@ export default function HomePage() {
 
     if (event.type === "progress") {
       setStatusMessage(event.message);
-
-      if (event.stage === "generating" && event.currentSegment && event.totalSegments) {
-        setStatusDetail(`section ${event.currentSegment} of ${event.totalSegments}`);
-      } else {
-        setStatusDetail("");
-      }
+      setStatusDetail("");
+      setCurrentProgressEvent(event);
+      await waitForPaint();
 
       return;
     }
@@ -400,6 +399,8 @@ export default function HomePage() {
     downloadUrlRef.current = objectUrl;
     setDownloadUrl(objectUrl);
     setDownloadFilename(event.filename);
+    setCurrentProgressEvent(null);
+    setGenerationStartedAt(null);
     setStatusMessage("Done");
     setStatusDetail(buildCompletionDetail(event));
 
@@ -411,6 +412,13 @@ export default function HomePage() {
 
   const showStatus = isGenerating || !!statusMessage;
   const showFeedbackPlaceholder = !showStatus && !errorMessage && !downloadUrl;
+  const statusDetailLines = currentProgressEvent
+    ? buildProgressDetailLines(currentProgressEvent, elapsedSeconds)
+    : statusDetail
+      ? [statusDetail]
+      : isGenerating
+        ? [`Elapsed: ${formatElapsedTime(elapsedSeconds)}`]
+        : [];
   const hasSavedReference = !!voiceReference;
   const showReferenceSetup = shouldShowReferenceSetup({
     hasSavedReference,
@@ -720,7 +728,11 @@ export default function HomePage() {
               <div aria-live="polite" className="feedback-card status-box" role="status">
                 <div className="status-label">Status</div>
                 <div className="status-message">{statusMessage}</div>
-                {statusDetail && <div className="status-detail">{statusDetail}</div>}
+                {statusDetailLines.map((detail, index) => (
+                  <div className="status-detail" key={`${detail}-${index}`}>
+                    {detail}
+                  </div>
+                ))}
               </div>
             )}
 
@@ -926,4 +938,14 @@ function truncate(text: string, maxLength: number): string {
   }
 
   return `${compact.slice(0, maxLength)}...`;
+}
+
+function waitForPaint(): Promise<void> {
+  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
 }
